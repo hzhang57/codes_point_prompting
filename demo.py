@@ -22,6 +22,7 @@
 
 import argparse
 import sys
+import re
 import cv2
 import numpy as np
 import torch
@@ -116,9 +117,17 @@ def save_video(frames: list, path: str, fps: float = 15.0):
 def parse_point(s: str):
     """解析 'x,y' 格式的命令行查询点字符串，返回 (float, float)。"""
     parts = s.strip().split(",")
-    if len(parts) != 2:
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
         raise ValueError(f"Expected 'x,y', got '{s}'")
-    return float(parts[0]), float(parts[1])
+    return float(parts[0].strip()), float(parts[1].strip())
+
+
+def parse_points(values: list) -> list:
+    """解析命令行查询点，兼容空白参数以及 'x,y x,y' / 'x,y;x,y' 写法。"""
+    tokens = []
+    for value in values:
+        tokens.extend(t for t in re.split(r"[;\s]+", value.strip()) if t)
+    return [parse_point(token) for token in tokens]
 
 
 # --------------------------------------------------------------------------- #
@@ -156,15 +165,20 @@ def main():
     model_type = args.model_type
     model_id   = args.model_id or MODEL_DEFAULTS[model_type]["model_id"]
 
+    try:
+        query_points = parse_points(args.points)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not query_points:
+        parser.error("--points 至少需要一个有效坐标，例如 --points \"320,240\"")
+    print(f"查询点：{query_points}")
+
     # 读取输入视频
     print(f"加载视频：{args.video}")
     frames = load_video(args.video, args.max_frames)
     if not frames:
         sys.exit("错误：无法从视频中读取任何帧。")
     print(f"  {len(frames)} 帧  分辨率 {frames[0].shape[1]}×{frames[0].shape[0]}")
-
-    query_points = [parse_point(p) for p in args.points]
-    print(f"查询点：{query_points}")
 
     # 加载视频扩散模型
     print(f"加载 {model_type} 模型：{model_id}")
