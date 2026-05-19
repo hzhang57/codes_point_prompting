@@ -26,6 +26,7 @@ from model_adapter import (
     CogVideoXAdapter,
     WanAdapter,
     create_adapter,
+    load_wan_pipe,
     _bgr_to_pil,
     _frames_to_tensor,
     _tensor_to_frames,
@@ -958,6 +959,17 @@ class TestCreateAdapter(unittest.TestCase):
         for pipe in [_cogvideox_pipe(), _wan_pipe()]:
             adapter = create_adapter(pipe)
             self.assertIsInstance(adapter, ModelAdapter)
+
+    def test_rejects_vace_pipeline(self):
+        class WanVACEPipeline:
+            pass
+
+        with self.assertRaisesRegex(ValueError, "VACE"):
+            create_adapter(WanVACEPipeline())
+
+    def test_rejects_vace_model_id_before_loading(self):
+        with self.assertRaisesRegex(ValueError, "VACE"):
+            load_wan_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers")
 
 
 if __name__ == "__main__":

@@ -407,6 +407,8 @@ class WanAdapter(ModelAdapter):
 
 _COGVIDEOX_CLASSES = {"CogVideoXImageToVideoPipeline"}
 _WAN_CLASSES       = {"WanImageToVideoPipeline"}
+_WAN_I2V_MODEL_HINTS = ("I2V", "Image-to-Video", "ImageToVideo")
+_WAN_UNSUPPORTED_MODEL_HINTS = ("VACE", "T2V", "Text-to-Video")
 
 
 def create_adapter(pipe) -> ModelAdapter:
@@ -418,6 +420,11 @@ def create_adapter(pipe) -> ModelAdapter:
          encoder_attention_mask；CogVideoX Transformer 则不含这两个参数。
     """
     cls_name = type(pipe).__name__
+    if "VACE" in cls_name:
+        raise ValueError(
+            "Wan VACE pipelines are not supported by this Point Prompting adapter. "
+            "Use a Wan2.1 I2V checkpoint such as Wan-AI/Wan2.1-I2V-14B-480P-Diffusers."
+        )
     if cls_name in _COGVIDEOX_CLASSES:
         return CogVideoXAdapter(pipe)
     if cls_name in _WAN_CLASSES:
@@ -435,8 +442,10 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     """加载 CogVideoX-5B I2V pipeline（float16，启用 CPU offload 节省显存）。"""
     from diffusers import CogVideoXImageToVideoPipeline
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
-    pipe = pipe.to(device)
-    pipe.enable_model_cpu_offload()
+    if str(device).startswith("cuda"):
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(device)
     return pipe
 
 
@@ -445,9 +454,26 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
 
     14B 模型使用 bfloat16（精度更高），1.3B 模型使用 float16（速度更快）。
     """
+    upper_model_id = model_id.upper()
+    if any(hint in upper_model_id for hint in _WAN_UNSUPPORTED_MODEL_HINTS):
+        raise ValueError(
+            f"Unsupported Wan model for this adapter: {model_id}. "
+            "This code expects a Wan2.1 I2V checkpoint, for example "
+            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers or "
+            "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers. "
+            "VACE/T2V checkpoints expose a different transformer interface."
+        )
+    if not any(hint.upper() in upper_model_id for hint in _WAN_I2V_MODEL_HINTS):
+        raise ValueError(
+            f"Unsupported Wan model for this adapter: {model_id}. "
+            "Please pass a Wan2.1 I2V model id."
+        )
+
     from diffusers import WanImageToVideoPipeline
     dtype = torch.bfloat16 if "14B" in model_id else torch.float16
     pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype)
-    pipe = pipe.to(device)
-    pipe.enable_model_cpu_offload()
+    if str(device).startswith("cuda"):
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(device)
     return pipe
