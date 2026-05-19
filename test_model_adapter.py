@@ -208,7 +208,7 @@ class _MockWanTransformer:
 class _MockWanVACETransformer:
     def __init__(self):
         self.dtype = torch.float32
-        self.config = SimpleNamespace(in_channels=LAT_C)
+        self.config = SimpleNamespace(in_channels=LAT_C, text_dim=TEXT_D)
 
     def forward(self, hidden_states, timestep, encoder_hidden_states,
                 control_hidden_states=None, control_hidden_states_scale=1.0,
@@ -988,6 +988,28 @@ class TestWanVACEAdapter(unittest.TestCase):
         torch.testing.assert_close(received["control"], control)
         self.assertEqual(received["scale"], 0.75)
 
+    def test_encode_text_without_text_encoder_returns_zeros_for_empty_prompt(self):
+        pipe = _wan_vace_pipe()
+        pipe.text_encoder = None
+        pipe.tokenizer = None
+        adapter = WanVACEAdapter(pipe)
+
+        out = adapter.encode_text("")
+
+        self.assertEqual(out["embeds"].shape, (1, 512, TEXT_D))
+        self.assertEqual(out["mask"].shape, (1, 512))
+        self.assertEqual(out["embeds"].abs().sum().item(), 0.0)
+        self.assertEqual(out["mask"].sum().item(), 0)
+
+    def test_encode_text_without_text_encoder_rejects_non_empty_prompt(self):
+        pipe = _wan_vace_pipe()
+        pipe.text_encoder = None
+        pipe.tokenizer = None
+        adapter = WanVACEAdapter(pipe)
+
+        with self.assertRaisesRegex(ValueError, "text encoder"):
+            adapter.encode_text("a prompt")
+
 
 # =========================================================================== #
 #  Tests: create_adapter factory                                                #
@@ -1071,10 +1093,11 @@ class TestCreateAdapter(unittest.TestCase):
     def test_loads_vace_pipeline_class(self):
         class LoadableWanVACEPipeline(WanVACEPipeline):
             @classmethod
-            def from_pretrained(cls, model_id, torch_dtype=None):
+            def from_pretrained(cls, model_id, torch_dtype=None, **kwargs):
                 pipe = cls()
                 pipe.model_id = model_id
                 pipe.torch_dtype = torch_dtype
+                pipe.from_pretrained_kwargs = kwargs
                 pipe.to_device = None
                 return pipe
 
@@ -1091,6 +1114,8 @@ class TestCreateAdapter(unittest.TestCase):
 
         self.assertIsInstance(pipe, LoadableWanVACEPipeline)
         self.assertEqual(pipe.model_id, "Wan-AI/Wan2.1-VACE-1.3B-diffusers")
+        self.assertIsNone(pipe.from_pretrained_kwargs["text_encoder"])
+        self.assertIsNone(pipe.from_pretrained_kwargs["tokenizer"])
 
 
 if __name__ == "__main__":

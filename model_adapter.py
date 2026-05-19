@@ -543,9 +543,22 @@ class WanVACEAdapter(ModelAdapter):
         return {"control": torch.cat([condition_latents, mask_latents], dim=1).to(self.dtype), "scale": 1.0}
 
     def encode_text(self, prompt: str):
+        if getattr(self.pipe, "text_encoder", None) is None or getattr(self.pipe, "tokenizer", None) is None:
+            if prompt:
+                raise ValueError(
+                    "Wan VACE was loaded without a text encoder to avoid the incomplete UMT5 checkpoint. "
+                    "Use an empty prompt, or load a complete text encoder before using non-empty prompts."
+                )
+            text_dim = int(getattr(getattr(self.pipe.transformer, "config", None), "text_dim", 4096))
+            seq_len = 512
+            return {
+                "embeds": torch.zeros(1, seq_len, text_dim, device=self.device, dtype=self.dtype),
+                "mask": torch.zeros(1, seq_len, device=self.device, dtype=torch.long),
+            }
+
         tok = self.pipe.tokenizer(
             prompt, return_tensors="pt", padding="max_length",
-            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
+            max_length=min(getattr(self.pipe.tokenizer, "model_max_length", 512), 512), truncation=True,
         ).to(self.device)
         with torch.no_grad():
             enc_out = self.pipe.text_encoder(
@@ -643,6 +656,7 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
             "Please pass a Wan2.1 I2V or VACE model id."
         )
 
+    dtype = torch.bfloat16 if "14B" in model_id else torch.float16
     if is_vace:
         try:
             from diffusers import WanVACEPipeline
@@ -652,11 +666,16 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
                 "Upgrade diffusers/transformers/accelerate, then retry the VACE checkpoint."
             ) from exc
         pipeline_cls = WanVACEPipeline
+        pipe = pipeline_cls.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            text_encoder=None,
+            tokenizer=None,
+        )
     else:
         from diffusers import WanImageToVideoPipeline
         pipeline_cls = WanImageToVideoPipeline
-    dtype = torch.bfloat16 if "14B" in model_id else torch.float16
-    pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=dtype)
+        pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=dtype)
     if str(device).startswith("cuda"):
         pipe.enable_model_cpu_offload()
     else:
