@@ -15,6 +15,7 @@ import sys
 import inspect
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ from model_adapter import (
     ModelAdapter,
     CogVideoXAdapter,
     WanAdapter,
+    WanVACEAdapter,
     create_adapter,
     load_wan_pipe,
     _bgr_to_pil,
@@ -203,6 +205,21 @@ class _MockWanTransformer:
         return self.forward(**kwargs)
 
 
+class _MockWanVACETransformer:
+    def __init__(self):
+        self.dtype = torch.float32
+        self.config = SimpleNamespace(in_channels=LAT_C)
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states,
+                control_hidden_states=None, control_hidden_states_scale=1.0,
+                return_dict=False, **kwargs):
+        vel = torch.zeros_like(hidden_states)
+        return (vel,)
+
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
+
+
 # --------------------------------------------------------------------------- #
 #  Complete mock pipelines                                                      #
 # --------------------------------------------------------------------------- #
@@ -233,12 +250,27 @@ class WanImageToVideoPipeline:
         self.scheduler         = _MockScheduler()
 
 
+class WanVACEPipeline:
+    """Mock Wan VACE pipeline."""
+    def __init__(self):
+        self.device         = torch.device("cpu")
+        self.vae            = _MockVAE()
+        self.transformer    = _MockWanVACETransformer()
+        self.tokenizer      = _MockTokenizer()
+        self.text_encoder   = _MockTextEncoder()
+        self.scheduler      = _MockScheduler()
+
+
 def _cogvideox_pipe(use_rotary=False) -> CogVideoXImageToVideoPipeline:
     return CogVideoXImageToVideoPipeline(use_rotary)
 
 
 def _wan_pipe(use_lhs=True) -> WanImageToVideoPipeline:
     return WanImageToVideoPipeline(use_lhs)
+
+
+def _wan_vace_pipe() -> WanVACEPipeline:
+    return WanVACEPipeline()
 
 
 # --------------------------------------------------------------------------- #
@@ -905,6 +937,59 @@ class TestWanAdapterForwardTransformer(unittest.TestCase):
 
 
 # =========================================================================== #
+#  Tests: WanVACEAdapter                                                       #
+# =========================================================================== #
+
+class TestWanVACEAdapter(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = WanVACEAdapter(_wan_vace_pipe())
+
+    def _make_text(self):
+        return {
+            "embeds": torch.zeros(1, TEXT_LEN, TEXT_D),
+            "mask":   torch.ones(1, TEXT_LEN, dtype=torch.long),
+        }
+
+    def test_encode_video_records_shape_metadata(self):
+        frames = _random_frames(n=T)
+        lat = self.adapter.encode_video(frames)
+        self.assertEqual(lat.shape, (B, LAT_C, T, H, W))
+        self.assertEqual(self.adapter._last_num_frames, T)
+        self.assertEqual(self.adapter._last_height, H)
+        self.assertEqual(self.adapter._last_width, W)
+
+    def test_fallback_image_cond_uses_vace_control_key(self):
+        self.adapter.encode_video(_random_frames(n=T))
+        cond = self.adapter.encode_image_cond(np.zeros((H, W, 3), dtype=np.uint8))
+        self.assertIn("control", cond)
+        self.assertEqual(cond["control"].shape, (B, LAT_C + 1, T, H, W))
+        self.assertEqual(cond["control"][0, 0, 0].max().item(), 0.0)
+        self.assertEqual(cond["control"][0, 0, 1:].min().item(), 1.0)
+
+    def test_forward_transformer_passes_control_hidden_states(self):
+        received = {}
+
+        class _SpyVACE(_MockWanVACETransformer):
+            def __call__(self, **kwargs):
+                received["control"] = kwargs.get("control_hidden_states")
+                received["scale"] = kwargs.get("control_hidden_states_scale")
+                return (torch.zeros_like(kwargs["hidden_states"]),)
+
+        adapter = WanVACEAdapter(_wan_vace_pipe())
+        adapter.pipe.transformer = _SpyVACE()
+        control = torch.ones(1, LAT_C + 1, T, LAT_H, LAT_W)
+        cond = {"control": control, "scale": 0.75}
+
+        noisy = _random_latents(t=T)
+        out = adapter.forward_transformer(noisy, torch.tensor([1]), self._make_text(), cond)
+
+        self.assertEqual(out.shape, noisy.shape)
+        torch.testing.assert_close(received["control"], control)
+        self.assertEqual(received["scale"], 0.75)
+
+
+# =========================================================================== #
 #  Tests: create_adapter factory                                                #
 # =========================================================================== #
 
@@ -919,6 +1004,11 @@ class TestCreateAdapter(unittest.TestCase):
         pipe    = _wan_pipe()
         adapter = create_adapter(pipe)
         self.assertIsInstance(adapter, WanAdapter)
+
+    def test_wan_vace_class_name(self):
+        pipe    = _wan_vace_pipe()
+        adapter = create_adapter(pipe)
+        self.assertIsInstance(adapter, WanVACEAdapter)
 
     def test_heuristic_wan_signature(self):
         """Unknown class but Wan-like transformer signature → WanAdapter."""
@@ -936,6 +1026,24 @@ class TestCreateAdapter(unittest.TestCase):
 
         adapter = create_adapter(SomeUnknownPipeline())
         self.assertIsInstance(adapter, WanAdapter)
+
+    def test_heuristic_wan_vace_signature(self):
+        """Unknown class but VACE-like transformer signature → WanVACEAdapter."""
+        def _vace_fwd(hidden_states, timestep, encoder_hidden_states,
+                      control_hidden_states=None, control_hidden_states_scale=1.0,
+                      return_dict=True):
+            pass
+
+        class _VaceLikeTransformer:
+            forward = _vace_fwd
+            dtype   = torch.float32
+
+        class SomeUnknownPipeline:
+            transformer = _VaceLikeTransformer()
+            scheduler   = _MockScheduler()
+
+        adapter = create_adapter(SomeUnknownPipeline())
+        self.assertIsInstance(adapter, WanVACEAdapter)
 
     def test_heuristic_cogvideox_signature(self):
         """Unknown class with CogVideoX-like transformer signature → CogVideoXAdapter."""
@@ -960,16 +1068,29 @@ class TestCreateAdapter(unittest.TestCase):
             adapter = create_adapter(pipe)
             self.assertIsInstance(adapter, ModelAdapter)
 
-    def test_rejects_vace_pipeline(self):
-        class WanVACEPipeline:
-            pass
+    def test_loads_vace_pipeline_class(self):
+        class LoadableWanVACEPipeline(WanVACEPipeline):
+            @classmethod
+            def from_pretrained(cls, model_id, torch_dtype=None):
+                pipe = cls()
+                pipe.model_id = model_id
+                pipe.torch_dtype = torch_dtype
+                pipe.to_device = None
+                return pipe
 
-        with self.assertRaisesRegex(ValueError, "VACE"):
-            create_adapter(WanVACEPipeline())
+            def to(self, device):
+                self.to_device = device
+                return self
 
-    def test_rejects_vace_model_id_before_loading(self):
-        with self.assertRaisesRegex(ValueError, "VACE"):
-            load_wan_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers")
+            def enable_model_cpu_offload(self):
+                self.cpu_offload = True
+
+        fake_diffusers = SimpleNamespace(WanVACEPipeline=LoadableWanVACEPipeline)
+        with patch.dict(sys.modules, {"diffusers": fake_diffusers}):
+            pipe = load_wan_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers", device="cpu")
+
+        self.assertIsInstance(pipe, LoadableWanVACEPipeline)
+        self.assertEqual(pipe.model_id, "Wan-AI/Wan2.1-VACE-1.3B-diffusers")
 
 
 if __name__ == "__main__":

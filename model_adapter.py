@@ -59,6 +59,19 @@ def _tensor_to_frames(tensor: torch.Tensor) -> list:
     return out
 
 
+def _retrieve_latents(encoder_output, generator=None, sample_mode: str = "sample") -> torch.Tensor:
+    """兼容 diffusers VAE encode 输出，提取 latent tensor。"""
+    if hasattr(encoder_output, "latent_dist"):
+        if sample_mode == "sample":
+            return encoder_output.latent_dist.sample(generator)
+        if sample_mode == "mode" and hasattr(encoder_output.latent_dist, "mode"):
+            return encoder_output.latent_dist.mode()
+        return encoder_output.latent_dist.sample(generator)
+    if hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    return encoder_output[0]
+
+
 # --------------------------------------------------------------------------- #
 #  抽象基类                                                                     #
 # --------------------------------------------------------------------------- #
@@ -402,13 +415,173 @@ class WanAdapter(ModelAdapter):
 
 
 # --------------------------------------------------------------------------- #
+#  Wan2.1-VACE 适配器                                                         #
+# --------------------------------------------------------------------------- #
+
+class WanVACEAdapter(ModelAdapter):
+    """Wan2.1-VACE 适配器。
+
+    VACE 不接收 I2V 的 CLIP image_embeds；它通过
+    control_hidden_states = cat(mask_latents, condition_latents) 接收条件。
+    这里将第 0 帧构造成条件帧，mask 中第 0 帧为黑色（保留/条件），
+    后续帧为白色（生成），从而近似 I2V 的首帧条件用法。
+    """
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+        self._last_num_frames: Optional[int] = None
+        self._last_height: Optional[int] = None
+        self._last_width: Optional[int] = None
+
+    @property
+    def device(self):
+        return getattr(self.pipe, "_execution_device", getattr(self.pipe, "device", torch.device("cpu")))
+
+    @property
+    def dtype(self):
+        return self.pipe.transformer.dtype
+
+    @property
+    def scheduler(self):
+        return self.pipe.scheduler
+
+    def _vae_scale(self, dtype, device) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        config = getattr(self.pipe.vae, "config", None)
+        latents_mean = getattr(config, "latents_mean", None)
+        latents_std = getattr(config, "latents_std", None)
+        if latents_mean is not None and latents_std is not None:
+            mean = torch.tensor(latents_mean, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+            std = 1.0 / torch.tensor(latents_std, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+            return mean, std
+        scale = float(getattr(config, "scaling_factor", 1.0))
+        return None, torch.tensor(scale, device=device, dtype=dtype)
+
+    def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        mean, scale = self._vae_scale(latents.dtype, latents.device)
+        if mean is None:
+            return latents * scale
+        return (latents - mean) * scale
+
+    def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        mean, scale = self._vae_scale(latents.dtype, latents.device)
+        if mean is None:
+            return latents / scale
+        return latents / scale + mean
+
+    def encode_video(self, frames_bgr: list) -> torch.Tensor:
+        self._last_num_frames = len(frames_bgr)
+        self._last_height, self._last_width = frames_bgr[0].shape[:2]
+        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)
+        with torch.no_grad():
+            lat = _retrieve_latents(self.pipe.vae.encode(t), sample_mode="mode")
+        return self._normalize_latents(lat.to(device=self.device, dtype=self.dtype))
+
+    def decode_latents(self, latents: torch.Tensor) -> list:
+        lat = self._denormalize_latents(latents)
+        with torch.no_grad():
+            decoded = self.pipe.vae.decode(lat).sample
+        if decoded.ndim == 5 and decoded.shape[1] != 3 and decoded.shape[2] == 3:
+            decoded = decoded.permute(0, 2, 1, 3, 4)
+        return _tensor_to_frames(decoded)
+
+    def _fallback_control_cond(self, frame_bgr: np.ndarray) -> dict:
+        num_frames = self._last_num_frames or 1
+        frames = [frame_bgr]
+        if num_frames > 1:
+            gray = np.full_like(frame_bgr, 127, dtype=np.uint8)
+            frames.extend([gray] * (num_frames - 1))
+        cond_lat = self.encode_video(frames)
+        mask = torch.ones(
+            cond_lat.shape[0], 1, cond_lat.shape[2], cond_lat.shape[3], cond_lat.shape[4],
+            device=cond_lat.device, dtype=cond_lat.dtype,
+        )
+        mask[:, :, 0] = 0.0
+        return {"control": torch.cat([mask, cond_lat], dim=1), "scale": 1.0}
+
+    def encode_image_cond(self, frame_bgr: np.ndarray):
+        """构造 VACE control_hidden_states 条件。"""
+        if not all(
+            hasattr(self.pipe, name)
+            for name in ("preprocess_conditions", "prepare_video_latents", "prepare_masks")
+        ):
+            return self._fallback_control_cond(frame_bgr)
+
+        num_frames = self._last_num_frames or 1
+        height = self._last_height or frame_bgr.shape[0]
+        width = self._last_width or frame_bgr.shape[1]
+        first = _bgr_to_pil(frame_bgr)
+        gray = Image.new("RGB", (width, height), (127, 127, 127))
+        video = [first] + [gray] * max(0, num_frames - 1)
+
+        mask_first = Image.new("L", (width, height), 0)
+        mask_generate = Image.new("L", (width, height), 255)
+        mask = [mask_first] + [mask_generate] * max(0, num_frames - 1)
+
+        condition, mask, reference_images = self.pipe.preprocess_conditions(
+            video=video,
+            mask=mask,
+            reference_images=None,
+            batch_size=1,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        condition_latents = self.pipe.prepare_video_latents(
+            condition,
+            mask,
+            reference_images,
+            None,
+            self.device,
+        )
+        mask_latents = self.pipe.prepare_masks(
+            mask,
+            reference_images,
+            None,
+        )
+        return {"control": torch.cat([condition_latents, mask_latents], dim=1).to(self.dtype), "scale": 1.0}
+
+    def encode_text(self, prompt: str):
+        tok = self.pipe.tokenizer(
+            prompt, return_tensors="pt", padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
+        ).to(self.device)
+        with torch.no_grad():
+            enc_out = self.pipe.text_encoder(
+                input_ids=tok.input_ids,
+                attention_mask=tok.attention_mask,
+            )
+        return {"embeds": enc_out.last_hidden_state.to(self.dtype), "mask": tok.attention_mask.to(self.device)}
+
+    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
+        t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
+        kwargs = {
+            "hidden_states": noisy_latents,
+            "timestep": t_b,
+            "encoder_hidden_states": text_cond["embeds"],
+            "control_hidden_states": image_cond["control"],
+            "control_hidden_states_scale": image_cond.get("scale", 1.0),
+            "return_dict": False,
+        }
+        import inspect
+        sig = inspect.signature(self.pipe.transformer.forward)
+        if "encoder_attention_mask" in sig.parameters:
+            kwargs["encoder_attention_mask"] = text_cond["mask"]
+        out = self.pipe.transformer(**kwargs)
+        return out[0]
+
+
+# --------------------------------------------------------------------------- #
 #  工厂函数                                                                     #
 # --------------------------------------------------------------------------- #
 
 _COGVIDEOX_CLASSES = {"CogVideoXImageToVideoPipeline"}
 _WAN_CLASSES       = {"WanImageToVideoPipeline"}
+_WAN_VACE_CLASSES  = {"WanVACEPipeline"}
 _WAN_I2V_MODEL_HINTS = ("I2V", "Image-to-Video", "ImageToVideo")
-_WAN_UNSUPPORTED_MODEL_HINTS = ("VACE", "T2V", "Text-to-Video")
+_WAN_VACE_MODEL_HINTS = ("VACE",)
+_WAN_UNSUPPORTED_MODEL_HINTS = ("T2V", "Text-to-Video")
 
 
 def create_adapter(pipe) -> ModelAdapter:
@@ -420,19 +593,18 @@ def create_adapter(pipe) -> ModelAdapter:
          encoder_attention_mask；CogVideoX Transformer 则不含这两个参数。
     """
     cls_name = type(pipe).__name__
-    if "VACE" in cls_name:
-        raise ValueError(
-            "Wan VACE pipelines are not supported by this Point Prompting adapter. "
-            "Use a Wan2.1 I2V checkpoint such as Wan-AI/Wan2.1-I2V-14B-480P-Diffusers."
-        )
     if cls_name in _COGVIDEOX_CLASSES:
         return CogVideoXAdapter(pipe)
+    if cls_name in _WAN_VACE_CLASSES or "VACE" in cls_name:
+        return WanVACEAdapter(pipe)
     if cls_name in _WAN_CLASSES:
         return WanAdapter(pipe)
 
     # 启发式回退：检查 Transformer forward 签名
     import inspect
     sig = inspect.signature(pipe.transformer.forward)
+    if "control_hidden_states" in sig.parameters:
+        return WanVACEAdapter(pipe)
     if "image_embeds" in sig.parameters and "encoder_attention_mask" in sig.parameters:
         return WanAdapter(pipe)    # Wan 特有参数
     return CogVideoXAdapter(pipe)  # 默认为 CogVideoX
@@ -450,7 +622,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
 
 
 def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "cuda"):
-    """加载 Wan2.1 I2V pipeline。
+    """加载 Wan2.1 I2V 或 VACE pipeline。
 
     14B 模型使用 bfloat16（精度更高），1.3B 模型使用 float16（速度更快）。
     """
@@ -458,20 +630,33 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
     if any(hint in upper_model_id for hint in _WAN_UNSUPPORTED_MODEL_HINTS):
         raise ValueError(
             f"Unsupported Wan model for this adapter: {model_id}. "
-            "This code expects a Wan2.1 I2V checkpoint, for example "
+            "This code expects a Wan2.1 I2V/VACE checkpoint, for example "
             "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers or "
             "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers. "
-            "VACE/T2V checkpoints expose a different transformer interface."
+            "T2V checkpoints do not provide the required image/video conditioning."
         )
-    if not any(hint.upper() in upper_model_id for hint in _WAN_I2V_MODEL_HINTS):
+    is_vace = any(hint in upper_model_id for hint in _WAN_VACE_MODEL_HINTS)
+    is_i2v = any(hint.upper() in upper_model_id for hint in _WAN_I2V_MODEL_HINTS)
+    if not (is_vace or is_i2v):
         raise ValueError(
             f"Unsupported Wan model for this adapter: {model_id}. "
-            "Please pass a Wan2.1 I2V model id."
+            "Please pass a Wan2.1 I2V or VACE model id."
         )
 
-    from diffusers import WanImageToVideoPipeline
+    if is_vace:
+        try:
+            from diffusers import WanVACEPipeline
+        except ImportError as exc:
+            raise ImportError(
+                "Your installed diffusers package does not expose WanVACEPipeline. "
+                "Upgrade diffusers/transformers/accelerate, then retry the VACE checkpoint."
+            ) from exc
+        pipeline_cls = WanVACEPipeline
+    else:
+        from diffusers import WanImageToVideoPipeline
+        pipeline_cls = WanImageToVideoPipeline
     dtype = torch.bfloat16 if "14B" in model_id else torch.float16
-    pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=dtype)
     if str(device).startswith("cuda"):
         pipe.enable_model_cpu_offload()
     else:
