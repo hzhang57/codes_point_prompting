@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import cv2
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -45,6 +46,30 @@ class PointPrompterConfig:
     refine_gamma: float = 0.3      # 精细化阶段的加噪比例（< gamma）
     prompt: str = ""               # 文本提示（论文零样本设置为空字符串）
     seed: Optional[int] = None     # 随机种子，None 表示不固定
+    model_width: int = 832          # 扩散模型输入的最大宽度，防止高分辨率视频 OOM
+    model_height: int = 480         # 扩散模型输入的最大高度，防止高分辨率视频 OOM
+    model_stride: int = 16          # 模型输入尺寸对齐倍数
+
+
+def _aligned_size(width: int, height: int, max_width: int, max_height: int, stride: int) -> Tuple[int, int]:
+    """按比例缩放到最大尺寸内，并将宽高向下对齐到 stride 倍数。"""
+    if max_width <= 0 or max_height <= 0:
+        return width, height
+    scale = min(max_width / width, max_height / height, 1.0)
+    out_w = int(width * scale)
+    out_h = int(height * scale)
+    if stride > 1:
+        out_w = max(stride, (out_w // stride) * stride)
+        out_h = max(stride, (out_h // stride) * stride)
+    return out_w, out_h
+
+
+def _resize_frames(frames_bgr: list, size: Tuple[int, int]) -> list:
+    """Resize BGR frames to (width, height), preserving list layout."""
+    width, height = size
+    if not frames_bgr or (frames_bgr[0].shape[1] == width and frames_bgr[0].shape[0] == height):
+        return frames_bgr
+    return [cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA) for frame in frames_bgr]
 
 
 class PointPrompter:
@@ -89,13 +114,20 @@ class PointPrompter:
         cfg = self.config
         # 固定随机种子以便复现
         gen = torch.Generator().manual_seed(cfg.seed) if cfg.seed is not None else None
+        orig_h, orig_w = frames_bgr[0].shape[:2]
+        model_w, model_h = _aligned_size(orig_w, orig_h, cfg.model_width, cfg.model_height, cfg.model_stride)
+        frames_model = _resize_frames(frames_bgr, (model_w, model_h))
+        sx = model_w / orig_w
+        sy = model_h / orig_h
+        query_model = (query_point[0] * sx, query_point[1] * sy)
+        marker_radius = max(2, int(round(cfg.marker_radius * min(sx, sy))))
 
         # ---- 步骤 1：颜色重平衡，抑制自然红色 ----
-        frames_rb = rebalance_video(frames_bgr)
+        frames_rb = rebalance_video(frames_model)
 
         # ---- 步骤 2：在第 0 帧插入红色标记 ----
         frame0_original = frames_rb[0]
-        frame0_marked   = insert_marker(frame0_original, query_point, cfg.marker_radius)
+        frame0_marked   = insert_marker(frame0_original, query_model, marker_radius)
         frames_edited   = [frame0_marked] + frames_rb[1:]  # 仅第 0 帧含标记
 
         # ---- 步骤 3：反事实 SDEdit 生成含标记轨迹的视频 ----
@@ -111,7 +143,7 @@ class PointPrompter:
         )
 
         # ---- 步骤 4：在生成帧中逐帧检测标记质心 ----
-        tracks, visible = track_marker_sequence(generated, query_point)
+        tracks, visible = track_marker_sequence(generated, query_model)
 
         # ---- 步骤 5：可选 inpainting 精细化 ----
         if cfg.do_refine:
@@ -126,8 +158,13 @@ class PointPrompter:
                 generator=gen,
             )
             # 在精细化后的帧上重新检测，得到更准确的坐标
-            tracks, visible = track_marker_sequence(refined, query_point)
+            tracks, visible = track_marker_sequence(refined, query_model)
             generated = refined
+
+        if sx != 1.0 or sy != 1.0:
+            tracks = tracks.copy()
+            tracks[:, 0] /= sx
+            tracks[:, 1] /= sy
 
         return TrackResult(tracks=tracks, visible=visible, generated_frames=generated)
 

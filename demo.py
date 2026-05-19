@@ -105,6 +105,24 @@ def load_video(path: str, max_frames: int = 50) -> list:
     return frames
 
 
+def resize_video(frames: list, width: int, height: int) -> list:
+    """将视频帧统一缩放到固定分辨率。"""
+    if width <= 0 or height <= 0:
+        return frames
+    if not frames or (frames[0].shape[1] == width and frames[0].shape[0] == height):
+        return frames
+    return [cv2.resize(f, (width, height), interpolation=cv2.INTER_AREA) for f in frames]
+
+
+def scale_points(points: list, src_size: tuple, dst_size: tuple) -> list:
+    """将点坐标从源分辨率映射到目标分辨率。"""
+    src_w, src_h = src_size
+    dst_w, dst_h = dst_size
+    sx = dst_w / src_w
+    sy = dst_h / src_h
+    return [(x * sx, y * sy) for x, y in points]
+
+
 def save_video(frames: list, path: str, fps: float = 15.0):
     """将帧列表写入 MP4 视频文件。"""
     H, W = frames[0].shape[:2]
@@ -157,6 +175,16 @@ def main():
                         help="随机种子（默认：42）")
     parser.add_argument("--max-frames", type=int, default=50,
                         help="最多处理的帧数（默认：50）")
+    parser.add_argument("--preprocess-width", type=int, default=832,
+                        help="跟踪前先将视频缩放到此宽度，0 表示不预处理缩放（默认：832）")
+    parser.add_argument("--preprocess-height", type=int, default=480,
+                        help="跟踪前先将视频缩放到此高度，0 表示不预处理缩放（默认：480）")
+    parser.add_argument("--model-width", type=int, default=832,
+                        help="送入扩散模型的最大宽度，0 表示不缩放（默认：832）")
+    parser.add_argument("--model-height", type=int, default=480,
+                        help="送入扩散模型的最大高度，0 表示不缩放（默认：480）")
+    parser.add_argument("--model-stride", type=int, default=16,
+                        help="模型输入宽高对齐倍数（默认：16）")
     parser.add_argument("--device",  default="cuda",
                         help="计算设备（默认：cuda）")
     args = parser.parse_args()
@@ -178,7 +206,19 @@ def main():
     frames = load_video(args.video, args.max_frames)
     if not frames:
         sys.exit("错误：无法从视频中读取任何帧。")
-    print(f"  {len(frames)} 帧  分辨率 {frames[0].shape[1]}×{frames[0].shape[0]}")
+    orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
+    print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}")
+
+    # 预处理视频到固定分辨率，降低 VAE 编码显存占用；查询点同步缩放到预处理坐标系。
+    if args.preprocess_width > 0 and args.preprocess_height > 0:
+        frames = resize_video(frames, args.preprocess_width, args.preprocess_height)
+        query_points = scale_points(
+            query_points,
+            src_size=(orig_w, orig_h),
+            dst_size=(args.preprocess_width, args.preprocess_height),
+        )
+        print(f"  已预处理到 {args.preprocess_width}×{args.preprocess_height}")
+        print(f"  预处理后查询点：{query_points}")
 
     # 加载视频扩散模型
     print(f"加载 {model_type} 模型：{model_id}")
@@ -197,6 +237,9 @@ def main():
         num_inference_steps=args.steps,
         do_refine=not args.no_refine,
         seed=args.seed,
+        model_width=args.model_width,
+        model_height=args.model_height,
+        model_stride=args.model_stride,
     )
     tracker = PointPrompter(adapter, cfg)
 
