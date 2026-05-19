@@ -1,0 +1,453 @@
+"""
+Point Prompting 的模型适配层。
+
+支持两种图像条件视频扩散模型：
+  - CogVideoX-5B-I2V：图像条件 = VAE 潜变量沿通道轴拼接
+  - Wan2.1-I2V 1.3B / 14B：图像条件 = SigLIP/CLIP 嵌入向量（交叉注意力）
+
+两者均基于 Flow Matching，去噪器预测的是速度场（velocity），而非 DDPM 中的噪声。
+
+核心区别
+--------
+CogVideoX-I2V  ：VAE 编码第 0 帧 → 潜变量 → cat([video, img], dim=1)
+                 Transformer 输入通道数翻倍（2C），已在 I2V 版本预训练好。
+Wan-I2V        ：SigLIP/CLIP 编码第 0 帧 → image_embeds（交叉注意力）
+                 同时将 VAE 编码的图像帧沿时序轴前置于视频潜变量之前。
+"""
+
+from __future__ import annotations
+
+import torch
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import Any, Optional, Tuple
+from PIL import Image
+
+
+# --------------------------------------------------------------------------- #
+#  共用张量转换工具                                                             #
+# --------------------------------------------------------------------------- #
+
+def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
+    """BGR numpy 数组 → RGB PIL 图像（cv2 与 PIL 的通道顺序相反）。"""
+    return Image.fromarray(arr[..., ::-1].copy())
+
+
+def _frames_to_tensor(frames_bgr: list, device, dtype) -> torch.Tensor:
+    """BGR uint8 帧列表 → (1, C, T, H, W) float 张量，值域 [-1, 1]。
+
+    同时完成 BGR→RGB 通道转换和归一化：pixel/127.5 - 1.0
+    """
+    t = torch.stack([
+        torch.from_numpy(f[..., ::-1].copy()).permute(2, 0, 1).float() / 127.5 - 1.0
+        for f in frames_bgr
+    ])  # (T, C, H, W)
+    # permute(1,0,2,3) → (C, T, H, W)，unsqueeze(0) → (1, C, T, H, W)
+    return t.permute(1, 0, 2, 3).unsqueeze(0).to(device=device, dtype=dtype)
+
+
+def _tensor_to_frames(tensor: torch.Tensor) -> list:
+    """(1, C, T, H, W) float [-1,1] → BGR uint8 帧列表。
+
+    执行逆操作：(val+1)*127.5 clamp→uint8，RGB→BGR。
+    """
+    t = tensor.squeeze(0).permute(1, 0, 2, 3)  # (T, C, H, W)
+    out = []
+    for i in range(t.shape[0]):
+        arr = ((t[i].permute(1, 2, 0).float().cpu().numpy() + 1.0) * 127.5)
+        out.append(arr.clip(0, 255).astype(np.uint8)[..., ::-1].copy())  # RGB→BGR
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  抽象基类                                                                     #
+# --------------------------------------------------------------------------- #
+
+class ModelAdapter(ABC):
+    """I2V 扩散模型的统一接口，供 Point Prompting 各模块调用。"""
+
+    @property
+    @abstractmethod
+    def device(self) -> torch.device: ...
+
+    @property
+    @abstractmethod
+    def dtype(self) -> torch.dtype: ...
+
+    @property
+    @abstractmethod
+    def scheduler(self): ...
+
+    # -- 编码 / 解码 --------------------------------------------------------- #
+
+    @abstractmethod
+    def encode_video(self, frames_bgr: list) -> torch.Tensor:
+        """将 BGR 帧列表编码为缩放后的潜变量，返回 (1, C, T, H, W)。"""
+        ...
+
+    @abstractmethod
+    def decode_latents(self, latents: torch.Tensor) -> list:
+        """(1, C, T, H, W) 潜变量 → BGR uint8 帧列表。"""
+        ...
+
+    @abstractmethod
+    def encode_image_cond(self, frame_bgr: np.ndarray) -> Any:
+        """将单帧 BGR 图像编码为模型特定的图像条件表示。"""
+        ...
+
+    @abstractmethod
+    def encode_text(self, prompt: str) -> Any:
+        """编码文本提示，返回模型特定的格式。"""
+        ...
+
+    # -- 去噪器 -------------------------------------------------------------- #
+
+    @abstractmethod
+    def forward_transformer(
+        self,
+        noisy_latents: torch.Tensor,   # (1, C, T, H, W)
+        timestep: torch.Tensor,        # scalar 或 (1,)
+        text_cond: Any,
+        image_cond: Any,
+    ) -> torch.Tensor:
+        """单步去噪器前向传播，返回速度场 (1, C, T, H, W)。"""
+        ...
+
+    # -- 反事实引导（所有子类共享） ------------------------------------------ #
+
+    @torch.no_grad()
+    def predict_with_guidance(
+        self,
+        noisy_latents: torch.Tensor,
+        timestep: torch.Tensor,
+        text_cond: Any,
+        image_cond_edited: Any,
+        image_cond_original: Any,
+        lam: float = 8.0,
+    ) -> torch.Tensor:
+        """反事实增强引导（论文公式 3）。
+
+        v̂ = (λ+1) · v(c_edited) - λ · v(c_original)
+
+        用原始帧作为"负向图像提示"，放大标记条件的影响，
+        使生成视频中标记更加清晰可见。
+        """
+        v_e = self.forward_transformer(noisy_latents, timestep, text_cond, image_cond_edited)
+        v_o = self.forward_transformer(noisy_latents, timestep, text_cond, image_cond_original)
+        return (lam + 1.0) * v_e - lam * v_o
+
+    # -- 调度器封装（所有子类共享） ------------------------------------------ #
+
+    def set_timesteps(self, n_steps: int) -> None:
+        """设置去噪调度器的时间步序列。"""
+        self.scheduler.set_timesteps(n_steps, device=self.device)
+
+    @property
+    def timesteps(self) -> torch.Tensor:
+        """返回调度器的时间步张量（从大到小）。"""
+        return self.scheduler.timesteps
+
+    def scheduler_step(
+        self, velocity: torch.Tensor, t: torch.Tensor, latents: torch.Tensor
+    ) -> torch.Tensor:
+        """执行一步调度器去噪，返回 x_{t-1}。"""
+        return self.scheduler.step(velocity, t, latents).prev_sample
+
+    def add_noise(
+        self, latents: torch.Tensor, noise: torch.Tensor, gamma: float
+    ) -> torch.Tensor:
+        """Flow Matching SDEdit 前向过程：x_t = (1-γ)·x_0 + γ·ε。"""
+        return (1.0 - gamma) * latents + gamma * noise
+
+
+# --------------------------------------------------------------------------- #
+#  CogVideoX-I2V 适配器                                                        #
+# --------------------------------------------------------------------------- #
+
+class CogVideoXAdapter(ModelAdapter):
+    """CogVideoX-I2V 适配器。
+
+    图像条件方式：VAE 编码第 0 帧 → 潜变量 →
+    沿通道轴（dim=1）与视频潜变量拼接 → 输入通道数翻倍。
+    CogVideoX-I2V 的 Transformer 已在 doubled in_channels 上预训练。
+    """
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+
+    @property
+    def device(self):
+        return self.pipe.device
+
+    @property
+    def dtype(self):
+        return self.pipe.transformer.dtype
+
+    @property
+    def scheduler(self):
+        return self.pipe.scheduler
+
+    # -- 编码 / 解码 --------------------------------------------------------- #
+
+    def encode_video(self, frames_bgr: list) -> torch.Tensor:
+        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W)
+        with torch.no_grad():
+            lat = self.pipe.vae.encode(t).latent_dist.sample()
+        return lat * self.pipe.vae.config.scaling_factor  # 按 VAE 缩放因子归一化
+
+    def decode_latents(self, latents: torch.Tensor) -> list:
+        lat = latents / self.pipe.vae.config.scaling_factor  # 反归一化
+        with torch.no_grad():
+            decoded = self.pipe.vae.decode(lat).sample
+        # VAE 可能输出 (1,C,T,H,W) 或 (1,T,C,H,W) 两种布局
+        # 通过判断 dim[1]!=3（RGB 通道数）且 dim[2]==3 来识别 BTCHW 格式
+        if decoded.ndim == 5 and decoded.shape[1] != 3 and decoded.shape[2] == 3:
+            decoded = decoded.permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
+        return _tensor_to_frames(decoded)
+
+    def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
+        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) 图像潜变量。"""
+        img_pil = _bgr_to_pil(frame_bgr)
+        if hasattr(self.pipe, "video_processor"):
+            # 使用 pipeline 自带的预处理器（尺寸、归一化等与训练一致）
+            img_t = self.pipe.video_processor.preprocess(img_pil)  # (1,C,H,W) in [-1,1]
+        else:
+            arr   = np.array(img_pil).astype(np.float32) / 127.5 - 1.0
+            img_t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+        # 添加时序维度 T=1
+        img_t = img_t.unsqueeze(2).to(device=self.device, dtype=self.dtype)  # (1,C,1,H,W)
+        with torch.no_grad():
+            lat = self.pipe.vae.encode(img_t).latent_dist.sample()
+        return lat * self.pipe.vae.config.scaling_factor  # (1, C_lat, 1, lH, lW)
+
+    def encode_text(self, prompt: str) -> torch.Tensor:
+        """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
+        tok = self.pipe.tokenizer(
+            prompt, return_tensors="pt", padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
+        ).to(self.device)
+        with torch.no_grad():
+            emb = self.pipe.text_encoder(**tok).last_hidden_state
+        return emb.to(self.dtype)
+
+    # -- 去噪器 -------------------------------------------------------------- #
+
+    def _rotary_emb(self, latent_shape: Tuple) -> Optional[Any]:
+        """计算旋转位置编码（RoPE），若模型不使用则返回 None。"""
+        if not getattr(self.pipe.transformer.config, "use_rotary_positional_embeddings", False):
+            return None
+        _, _, T, H, W = latent_shape
+        if hasattr(self.pipe, "_prepare_rotary_positional_embeddings"):
+            p = self.pipe.vae_scale_factor_spatial if hasattr(self.pipe, "vae_scale_factor_spatial") else 8
+            return self.pipe._prepare_rotary_positional_embeddings(H * p, W * p, T, self.device)
+        return None
+
+    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
+        T = noisy_latents.shape[2]
+        # 将单帧图像潜变量扩展到全部 T 帧，然后沿通道轴拼接
+        img_expanded = image_cond.expand(-1, -1, T, -1, -1)           # (1,C,T,lH,lW)
+        model_input  = torch.cat([noisy_latents, img_expanded], dim=1) # (1,2C,T,lH,lW)
+
+        ipe = self._rotary_emb(noisy_latents.shape)
+        # 确保时间步有批次维
+        t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
+
+        out = self.pipe.transformer(
+            hidden_states=model_input,
+            encoder_hidden_states=text_cond,
+            timestep=t_b,
+            image_rotary_emb=ipe,
+            return_dict=False,
+        )
+        return out[0]   # 速度场，形状 (1, C, T, lH, lW)
+
+
+# --------------------------------------------------------------------------- #
+#  Wan2.1-I2V 适配器                                                           #
+# --------------------------------------------------------------------------- #
+
+class WanAdapter(ModelAdapter):
+    """Wan2.1-I2V 适配器。
+
+    图像条件方式（双路）：
+      1. SigLIP/CLIP 编码第 0 帧 → image_embeds → Transformer 交叉注意力
+      2. VAE 编码第 0 帧 → 图像潜变量 → 前置于视频潜变量时序维之前
+    """
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+        # 前置图像帧的数量（通常为 1）
+        self._img_lat_frames: int = 1
+
+    @property
+    def device(self):
+        return self.pipe.device
+
+    @property
+    def dtype(self):
+        return self.pipe.transformer.dtype
+
+    @property
+    def scheduler(self):
+        return self.pipe.scheduler
+
+    # -- 编码 / 解码 --------------------------------------------------------- #
+
+    def _vae_scale(self) -> float:
+        """读取 Wan VAE 的缩放因子，不存在时默认为 1.0。"""
+        return float(getattr(self.pipe.vae.config, "scaling_factor", 1.0))
+
+    def encode_video(self, frames_bgr: list) -> torch.Tensor:
+        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W)
+        with torch.no_grad():
+            lat = self.pipe.vae.encode(t).latent_dist.sample()
+        return lat * self._vae_scale()
+
+    def decode_latents(self, latents: torch.Tensor) -> list:
+        # 去掉前置的图像帧潜变量，只解码视频部分
+        video_lat = latents[:, :, self._img_lat_frames:, :, :]
+        lat = video_lat / self._vae_scale()
+        with torch.no_grad():
+            decoded = self.pipe.vae.decode(lat).sample
+        return _tensor_to_frames(decoded)
+
+    def encode_image_cond(self, frame_bgr: np.ndarray):
+        """双路编码：返回包含 clip_emb 和 vae_latent 的字典。
+
+        clip_emb   : (1, N_tokens, D) — 用于 Transformer 交叉注意力
+        vae_latent : (1, C, 1, lH, lW) — 用于前置到视频潜变量时序维
+        """
+        img_pil = _bgr_to_pil(frame_bgr)
+
+        # ---- 路径1：SigLIP/CLIP 语义嵌入 ----
+        feat_inputs = self.pipe.feature_extractor(images=img_pil, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            clip_out = self.pipe.image_encoder(**feat_inputs)
+        # 兼容不同编码器：部分输出 last_hidden_state，部分输出 image_embeds
+        if hasattr(clip_out, "last_hidden_state"):
+            clip_emb = clip_out.last_hidden_state.to(self.dtype)
+        else:
+            clip_emb = clip_out.image_embeds.unsqueeze(1).to(self.dtype)
+
+        # ---- 路径2：VAE 空间潜变量（T=1 单帧）----
+        if hasattr(self.pipe, "video_processor"):
+            img_t = self.pipe.video_processor.preprocess(img_pil)
+        else:
+            arr   = np.array(img_pil).astype(np.float32) / 127.5 - 1.0
+            img_t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+        img_t = img_t.unsqueeze(2).to(device=self.device, dtype=self.dtype)  # (1,C,1,H,W)
+        with torch.no_grad():
+            vae_lat = self.pipe.vae.encode(img_t).latent_dist.sample()
+        vae_lat = vae_lat * self._vae_scale()
+
+        return {"clip_emb": clip_emb, "vae_latent": vae_lat}
+
+    def encode_text(self, prompt: str):
+        """UMT5 文本编码，返回包含 embeds 和 attention_mask 的字典。"""
+        tok = self.pipe.tokenizer(
+            prompt, return_tensors="pt", padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
+        ).to(self.device)
+        with torch.no_grad():
+            enc_out = self.pipe.text_encoder(
+                input_ids=tok.input_ids,
+                attention_mask=tok.attention_mask,
+            )
+        return {
+            "embeds": enc_out.last_hidden_state.to(self.dtype),
+            "mask":   tok.attention_mask.to(self.device),
+        }
+
+    # -- 去噪器 -------------------------------------------------------------- #
+
+    def _prepend_image_latent(
+        self, noisy_latents: torch.Tensor, image_cond: dict
+    ) -> torch.Tensor:
+        """将图像帧潜变量前置到视频潜变量的时序维，返回 (1, C, 1+T, lH, lW)。
+
+        若空间分辨率不匹配（帧被缩放过），先做双线性插值对齐。
+        """
+        img_lat = image_cond["vae_latent"]  # (1, C, 1, lH_img, lW_img)
+        if img_lat.shape[3:] != noisy_latents.shape[3:]:
+            # 空间尺寸不一致时，将图像潜变量插值到视频潜变量的分辨率
+            img_lat = torch.nn.functional.interpolate(
+                img_lat.squeeze(2), size=noisy_latents.shape[3:],
+                mode="bilinear", align_corners=False
+            ).unsqueeze(2)
+        return torch.cat([img_lat, noisy_latents], dim=2)  # 沿时序轴前置
+
+    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
+        # 将图像帧潜变量作为第 0 帧前置，使 Transformer 在时序上感知图像条件
+        lat_input = self._prepend_image_latent(noisy_latents, image_cond)
+
+        t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
+
+        out = self.pipe.transformer(
+            hidden_states=lat_input,               # (1, C, 1+T, lH, lW)
+            timestep=t_b,
+            encoder_hidden_states=text_cond["embeds"],
+            encoder_attention_mask=text_cond["mask"],
+            image_embeds=image_cond["clip_emb"],   # CLIP 嵌入通过交叉注意力注入
+            return_dict=False,
+        )
+        vel_full = out[0]  # (1, C, 1+T, lH, lW)
+
+        # 只返回视频帧部分的速度场，去掉前置图像帧对应的输出
+        return vel_full[:, :, self._img_lat_frames:, :, :]
+
+    def encode_video_with_image(self, frames_bgr: list, image_cond: dict) -> torch.Tensor:
+        """编码视频并前置图像帧潜变量，得到 Wan 完整输入序列。"""
+        video_lat = self.encode_video(frames_bgr)
+        return self._prepend_image_latent(video_lat, image_cond)
+
+
+# --------------------------------------------------------------------------- #
+#  工厂函数                                                                     #
+# --------------------------------------------------------------------------- #
+
+_COGVIDEOX_CLASSES = {"CogVideoXImageToVideoPipeline"}
+_WAN_CLASSES       = {"WanImageToVideoPipeline"}
+
+
+def create_adapter(pipe) -> ModelAdapter:
+    """根据 pipeline 类型自动创建对应的 ModelAdapter。
+
+    检测顺序：
+      1. 类名精确匹配（CogVideoXImageToVideoPipeline / WanImageToVideoPipeline）
+      2. 启发式推断：Wan Transformer 的 forward 签名包含 image_embeds 和
+         encoder_attention_mask；CogVideoX Transformer 则不含这两个参数。
+    """
+    cls_name = type(pipe).__name__
+    if cls_name in _COGVIDEOX_CLASSES:
+        return CogVideoXAdapter(pipe)
+    if cls_name in _WAN_CLASSES:
+        return WanAdapter(pipe)
+
+    # 启发式回退：检查 Transformer forward 签名
+    import inspect
+    sig = inspect.signature(pipe.transformer.forward)
+    if "image_embeds" in sig.parameters and "encoder_attention_mask" in sig.parameters:
+        return WanAdapter(pipe)    # Wan 特有参数
+    return CogVideoXAdapter(pipe)  # 默认为 CogVideoX
+
+
+def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):
+    """加载 CogVideoX-5B I2V pipeline（float16，启用 CPU offload 节省显存）。"""
+    from diffusers import CogVideoXImageToVideoPipeline
+    pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+    pipe = pipe.to(device)
+    pipe.enable_model_cpu_offload()
+    return pipe
+
+
+def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "cuda"):
+    """加载 Wan2.1 I2V pipeline。
+
+    14B 模型使用 bfloat16（精度更高），1.3B 模型使用 float16（速度更快）。
+    """
+    from diffusers import WanImageToVideoPipeline
+    dtype = torch.bfloat16 if "14B" in model_id else torch.float16
+    pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    pipe = pipe.to(device)
+    pipe.enable_model_cpu_offload()
+    return pipe
