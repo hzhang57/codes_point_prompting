@@ -23,6 +23,7 @@
 import argparse
 import sys
 import re
+from typing import Optional
 import cv2
 import numpy as np
 import torch
@@ -123,6 +124,37 @@ def scale_points(points: list, src_size: tuple, dst_size: tuple) -> list:
     return [(x * sx, y * sy) for x, y in points]
 
 
+def cuda_preflight_error(device: str) -> Optional[str]:
+    """检查 CUDA 是否真的可执行 kernel；不可用时返回面向用户的错误信息。"""
+    if not str(device).startswith("cuda"):
+        return None
+    if not torch.cuda.is_available():
+        return "错误：指定了 --device cuda，但当前环境中 torch.cuda.is_available() 为 False。"
+
+    try:
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        name = torch.cuda.get_device_name(index)
+        capability = torch.cuda.get_device_capability(index)
+        x = torch.ones(1, device=device)
+        _ = x + 1
+        torch.cuda.synchronize(index)
+    except Exception as exc:
+        return (
+            "错误：当前 PyTorch/CUDA 版本不能在这张 GPU 上执行 CUDA kernel。\n"
+            f"  设备：{device}\n"
+            f"  异常：{type(exc).__name__}: {exc}\n"
+            "这通常是 torch wheel 不包含该 GPU 的计算架构导致的，例如 Kaggle 分配到较老 GPU，"
+            "但环境安装了较新的 CUDA/PyTorch wheel。\n"
+            "处理方式：在 Kaggle 切换到 T4/L4/A100 等较新的 GPU，或安装与当前 GPU 架构匹配的 PyTorch CUDA 版本；"
+            "否则只能用 --device cpu 运行。"
+        )
+
+    print(f"CUDA 预检通过：{name} sm_{capability[0]}{capability[1]}")
+    return None
+
+
 def save_video(frames: list, path: str, fps: float = 15.0):
     """将帧列表写入 MP4 视频文件。"""
     H, W = frames[0].shape[:2]
@@ -219,6 +251,10 @@ def main():
         )
         print(f"  已预处理到 {args.preprocess_width}×{args.preprocess_height}")
         print(f"  预处理后查询点：{query_points}")
+
+    device_error = cuda_preflight_error(args.device)
+    if device_error is not None:
+        sys.exit(device_error)
 
     # 加载视频扩散模型
     print(f"加载 {model_type} 模型：{model_id}")

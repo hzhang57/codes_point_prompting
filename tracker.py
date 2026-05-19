@@ -174,4 +174,9 @@ class PointPrompter:
         query_points: List[Tuple[float, float]],
     ) -> List[TrackResult]:
         """独立跟踪多个查询点（每个点单独运行完整流水线）。"""
-        return [self.track(frames_bgr, qp) for qp in query_points]
+        results = []
+        for qp in query_points:
+            results.append(self.track(frames_bgr, qp))
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return results

@@ -432,6 +432,7 @@ class WanVACEAdapter(ModelAdapter):
         self._last_num_frames: Optional[int] = None
         self._last_height: Optional[int] = None
         self._last_width: Optional[int] = None
+        self._last_latent_frames: Optional[int] = None
 
     @property
     def device(self):
@@ -474,7 +475,9 @@ class WanVACEAdapter(ModelAdapter):
         t = _frames_to_tensor(frames_bgr, self.device, self.dtype)
         with torch.no_grad():
             lat = _retrieve_latents(self.pipe.vae.encode(t), sample_mode="mode")
-        return self._normalize_latents(lat.to(device=self.device, dtype=self.dtype))
+        lat = self._normalize_latents(lat.to(device=self.device, dtype=self.dtype))
+        self._last_latent_frames = lat.shape[2]
+        return lat
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         lat = self._denormalize_latents(latents)
@@ -485,27 +488,32 @@ class WanVACEAdapter(ModelAdapter):
         return _tensor_to_frames(decoded)
 
     def _fallback_control_cond(self, frame_bgr: np.ndarray) -> dict:
-        num_frames = self._last_num_frames or 1
-        frames = [frame_bgr]
-        if num_frames > 1:
-            gray = np.full_like(frame_bgr, 127, dtype=np.uint8)
-            frames.extend([gray] * (num_frames - 1))
-        cond_lat = self.encode_video(frames)
+        num_frames = self._last_latent_frames or self._last_num_frames or 1
+        t = _frames_to_tensor([frame_bgr], self.device, self.dtype)
+        with torch.no_grad():
+            first_lat = _retrieve_latents(self.pipe.vae.encode(t), sample_mode="mode")
+        first_lat = self._normalize_latents(first_lat.to(device=self.device, dtype=self.dtype))
+        cond_lat = torch.zeros(
+            first_lat.shape[0], first_lat.shape[1], num_frames, first_lat.shape[3], first_lat.shape[4],
+            device=first_lat.device, dtype=first_lat.dtype,
+        )
+        cond_lat[:, :, 0:1] = first_lat
         mask = torch.ones(
             cond_lat.shape[0], 1, cond_lat.shape[2], cond_lat.shape[3], cond_lat.shape[4],
             device=cond_lat.device, dtype=cond_lat.dtype,
         )
         mask[:, :, 0] = 0.0
-        return {"control": torch.cat([mask, cond_lat], dim=1), "scale": 1.0}
+        return {"control": torch.cat([cond_lat, mask], dim=1), "scale": 1.0}
 
     def encode_image_cond(self, frame_bgr: np.ndarray):
         """构造 VACE control_hidden_states 条件。"""
-        if not all(
-            hasattr(self.pipe, name)
-            for name in ("preprocess_conditions", "prepare_video_latents", "prepare_masks")
-        ):
-            return self._fallback_control_cond(frame_bgr)
+        # 官方 prepare_video_latents 会对整段 control video 再跑一次 Wan VAE。
+        # 在 14-16GB GPU 上这一步容易 OOM；这里只编码第 0 帧并构造轻量 VACE control。
+        if getattr(self, "use_pipeline_conditioning", False):
+            return self._pipeline_control_cond(frame_bgr)
+        return self._fallback_control_cond(frame_bgr)
 
+    def _pipeline_control_cond(self, frame_bgr: np.ndarray):
         num_frames = self._last_num_frames or 1
         height = self._last_height or frame_bgr.shape[0]
         width = self._last_width or frame_bgr.shape[1]

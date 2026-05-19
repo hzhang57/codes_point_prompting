@@ -958,14 +958,16 @@ class TestWanVACEAdapter(unittest.TestCase):
         self.assertEqual(self.adapter._last_num_frames, T)
         self.assertEqual(self.adapter._last_height, H)
         self.assertEqual(self.adapter._last_width, W)
+        self.assertEqual(self.adapter._last_latent_frames, T)
 
     def test_fallback_image_cond_uses_vace_control_key(self):
         self.adapter.encode_video(_random_frames(n=T))
         cond = self.adapter.encode_image_cond(np.zeros((H, W, 3), dtype=np.uint8))
         self.assertIn("control", cond)
         self.assertEqual(cond["control"].shape, (B, LAT_C + 1, T, H, W))
-        self.assertEqual(cond["control"][0, 0, 0].max().item(), 0.0)
-        self.assertEqual(cond["control"][0, 0, 1:].min().item(), 1.0)
+        mask = cond["control"][:, LAT_C:]
+        self.assertEqual(mask[0, 0, 0].max().item(), 0.0)
+        self.assertEqual(mask[0, 0, 1:].min().item(), 1.0)
 
     def test_forward_transformer_passes_control_hidden_states(self):
         received = {}
