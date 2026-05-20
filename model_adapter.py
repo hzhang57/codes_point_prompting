@@ -577,12 +577,19 @@ class WanVACEAdapter(ModelAdapter):
 
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
+        control_scale = image_cond.get("scale", 1.0)
+        if not torch.is_tensor(control_scale):
+            control_scale = torch.tensor([control_scale], device=noisy_latents.device, dtype=noisy_latents.dtype)
+        else:
+            control_scale = control_scale.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
+            if control_scale.ndim == 0:
+                control_scale = control_scale.unsqueeze(0)
         kwargs = {
             "hidden_states": noisy_latents,
             "timestep": t_b,
             "encoder_hidden_states": text_cond["embeds"],
             "control_hidden_states": image_cond["control"],
-            "control_hidden_states_scale": image_cond.get("scale", 1.0),
+            "control_hidden_states_scale": control_scale,
             "return_dict": False,
         }
         import inspect

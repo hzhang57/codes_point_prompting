@@ -988,7 +988,8 @@ class TestWanVACEAdapter(unittest.TestCase):
 
         self.assertEqual(out.shape, noisy.shape)
         torch.testing.assert_close(received["control"], control)
-        self.assertEqual(received["scale"], 0.75)
+        self.assertTrue(torch.is_tensor(received["scale"]))
+        torch.testing.assert_close(received["scale"], torch.tensor([0.75]))
 
     def test_encode_text_without_text_encoder_returns_zeros_for_empty_prompt(self):
         pipe = _wan_vace_pipe()
