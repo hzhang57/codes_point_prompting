@@ -584,11 +584,16 @@ class WanVACEAdapter(ModelAdapter):
             control_scale = control_scale.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
             if control_scale.ndim == 0:
                 control_scale = control_scale.unsqueeze(0)
-        num_layers = getattr(getattr(self.pipe.transformer, "config", None), "num_layers", None)
-        if num_layers is None:
-            num_layers = len(getattr(self.pipe.transformer, "transformer_blocks", []))
-        if num_layers and control_scale.numel() == 1:
-            control_scale = control_scale.expand(num_layers).contiguous()
+        transformer = self.pipe.transformer
+        num_vace = (
+            len(getattr(transformer, "vace_blocks", None) or [])
+            or len(getattr(transformer, "vace_layers", None) or [])
+            or getattr(getattr(transformer, "config", None), "vace_num_layers", 0)
+            or (getattr(getattr(transformer, "config", None), "num_layers", 0) // 2)
+            or 1
+        )
+        if control_scale.numel() == 1:
+            control_scale = control_scale.expand(num_vace).contiguous()
         kwargs = {
             "hidden_states": noisy_latents,
             "timestep": t_b,
