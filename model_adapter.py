@@ -72,6 +72,34 @@ def _retrieve_latents(encoder_output, generator=None, sample_mode: str = "sample
     return encoder_output[0]
 
 
+def _pipe_device(pipe) -> torch.device:
+    """Return the primary compute device of a pipeline.
+
+    Works whether the pipeline was loaded with .to(device),
+    enable_model_cpu_offload(), or device_map="auto".
+    """
+    d = getattr(pipe, "_execution_device", None)
+    if d is not None:
+        return d
+    for attr in ("vae", "transformer", "unet"):
+        mod = getattr(pipe, attr, None)
+        if mod is not None:
+            try:
+                return next(mod.parameters()).device
+            except StopIteration:
+                pass
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def _max_memory_per_gpu() -> dict:
+    """Build a max_memory dict covering all visible CUDA GPUs (no CPU entry)."""
+    n = torch.cuda.device_count()
+    return {
+        i: f"{torch.cuda.get_device_properties(i).total_memory // 1024**3 - 1}GiB"
+        for i in range(n)
+    }
+
+
 # --------------------------------------------------------------------------- #
 #  抽象基类                                                                     #
 # --------------------------------------------------------------------------- #
@@ -190,7 +218,7 @@ class CogVideoXAdapter(ModelAdapter):
 
     @property
     def device(self):
-        return self.pipe.device
+        return _pipe_device(self.pipe)
 
     @property
     def dtype(self):
@@ -294,7 +322,7 @@ class WanAdapter(ModelAdapter):
 
     @property
     def device(self):
-        return self.pipe.device
+        return _pipe_device(self.pipe)
 
     @property
     def dtype(self):
@@ -436,7 +464,7 @@ class WanVACEAdapter(ModelAdapter):
 
     @property
     def device(self):
-        return getattr(self.pipe, "_execution_device", getattr(self.pipe, "device", torch.device("cpu")))
+        return _pipe_device(self.pipe)
 
     @property
     def dtype(self):
@@ -667,13 +695,20 @@ def create_adapter(pipe) -> ModelAdapter:
 
 
 def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):
-    """加载 CogVideoX-5B I2V pipeline（float16，启用 CPU offload 节省显存）。"""
+    """加载 CogVideoX-5B I2V pipeline（float16）。"""
     from diffusers import CogVideoXImageToVideoPipeline
-    pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
-    if str(device).startswith("cuda"):
-        pipe.enable_model_cpu_offload()
+    n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
+    if n_gpus >= 2:
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+            model_id, torch_dtype=torch.float16,
+            device_map="auto", max_memory=_max_memory_per_gpu(),
+        )
     else:
-        pipe = pipe.to(device)
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+        if str(device).startswith("cuda"):
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(device)
     return pipe
 
 
@@ -709,18 +744,22 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
                 "Upgrade diffusers/transformers/accelerate, then retry the VACE checkpoint."
             ) from exc
         pipeline_cls = WanVACEPipeline
-        pipe = pipeline_cls.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
-            text_encoder=None,
-            tokenizer=None,
-        )
+        pipe_kwargs = dict(torch_dtype=dtype, text_encoder=None, tokenizer=None)
     else:
         from diffusers import WanImageToVideoPipeline
         pipeline_cls = WanImageToVideoPipeline
-        pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=dtype)
-    if str(device).startswith("cuda"):
-        pipe.enable_model_cpu_offload()
+        pipe_kwargs = dict(torch_dtype=dtype)
+
+    n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
+    if n_gpus >= 2:
+        pipe = pipeline_cls.from_pretrained(
+            model_id, **pipe_kwargs,
+            device_map="auto", max_memory=_max_memory_per_gpu(),
+        )
     else:
-        pipe = pipe.to(device)
+        pipe = pipeline_cls.from_pretrained(model_id, **pipe_kwargs)
+        if str(device).startswith("cuda"):
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(device)
     return pipe
