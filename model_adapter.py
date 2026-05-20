@@ -701,7 +701,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     if n_gpus >= 2:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
-            device_map="auto", max_memory=_max_memory_per_gpu(),
+            device_map="balanced", max_memory=_max_memory_per_gpu(),
         )
     else:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
@@ -754,7 +754,7 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
     if n_gpus >= 2:
         pipe = pipeline_cls.from_pretrained(
             model_id, **pipe_kwargs,
-            device_map="auto", max_memory=_max_memory_per_gpu(),
+            device_map="balanced", max_memory=_max_memory_per_gpu(),
         )
     else:
         pipe = pipeline_cls.from_pretrained(model_id, **pipe_kwargs)
