@@ -126,7 +126,9 @@ class PointPrompter:
         marker_radius = max(2, int(round(cfg.marker_radius * min(sx, sy))))
 
         # ---- 步骤 1：颜色重平衡，抑制自然红色 ----
-        frames_rb = rebalance_video(frames_model)
+        # 保护查询点周围区域不被截断：若该点原本是红色，截断会使正负向条件差异消失
+        protect_r = marker_radius * 4  # 留出足够余量覆盖标记及其邻域
+        frames_rb = rebalance_video(frames_model, protect_point=query_model, protect_radius=protect_r)
 
         # ---- 步骤 2：在第 0 帧插入红色标记 ----
         frame0_original = frames_rb[0]

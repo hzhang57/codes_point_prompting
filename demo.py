@@ -184,6 +184,28 @@ def parse_points(values: list) -> list:
 #  主函数                                                                        #
 # --------------------------------------------------------------------------- #
 
+def _diag_generated(results, query_points, radius: int = 30):
+    """打印生成帧中查询点附近区域的红色像素诊断信息。"""
+    for i, (r, qp) in enumerate(zip(results, query_points)):
+        print(f"\n[诊断] 点 {i} {qp}  生成帧数={len(r.generated_frames)}")
+        for t, frame in enumerate(r.generated_frames[:5]):  # 只看前 5 帧
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            cx, cy = int(round(r.tracks[t, 0])), int(round(r.tracks[t, 1]))
+            h_img, w_img = frame.shape[:2]
+            x1 = max(0, cx - radius); x2 = min(w_img, cx + radius)
+            y1 = max(0, cy - radius); y2 = min(h_img, cy + radius)
+            crop_hsv = hsv[y1:y2, x1:x2]
+            hue = crop_hsv[:, :, 0].astype(int)
+            sat = crop_hsv[:, :, 1].astype(int)
+            is_red = ((hue <= 10) | (hue >= 170)) & (sat >= 80)
+            is_red_strict = ((hue <= 10) | (hue >= 170)) & (sat >= 100)
+            bgr_at = frame[cy, cx] if 0 <= cy < h_img and 0 <= cx < w_img else [0, 0, 0]
+            print(f"  t={t:02d}  BGR@center={bgr_at}  "
+                  f"red_px(sat≥80)={is_red.sum():4d}  "
+                  f"red_px(sat≥100)={is_red_strict.sum():4d}  "
+                  f"sat_max={sat.max():3d}  hue_at_center={hue[radius, radius] if radius < hue.shape[0] and radius < hue.shape[1] else -1}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Point Prompting 点跟踪演示")
     parser.add_argument("--video",   required=True, help="输入视频文件路径")
@@ -282,6 +304,9 @@ def main():
     # 执行跟踪（每个查询点独立运行完整流水线）
     print("正在跟踪…")
     results = tracker.track_multiple(frames, query_points)
+
+    # 诊断：打印每个点生成帧中查询点附近的 HSV 红色像素信息
+    _diag_generated(results, query_points, radius=30)
 
     # 可视化轨迹并保存输出视频
     annotated = draw_tracks(frames, [r.tracks for r in results], [r.visible for r in results])

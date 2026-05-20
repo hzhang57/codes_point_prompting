@@ -12,14 +12,14 @@ from typing import Optional, Tuple
 
 # ---- 标记外观参数 ----
 MARKER_RADIUS = 2             # 标记圆的半径（像素）；论文消融最优值为 2px
-MARKER_COLOR_BGR = (0, 0, 220)  # 红色（BGR 格式：B=0, G=0, R=220）
+MARKER_COLOR_BGR = (0, 0, 255)  # 纯红（BGR 格式：B=0, G=0, R=255）
 MARKER_THICKNESS = -1         # -1 表示填充实心圆
 
 # ---- HSV 红色检测阈值 ----
 # OpenCV 中色相范围为 [0, 180]，红色横跨 0°/180° 边界，因此需要两段范围
 _HUE_LO1, _HUE_HI1 = 0, 10      # 红色区间1：色相 0–10°
 _HUE_LO2, _HUE_HI2 = 170, 180   # 红色区间2：色相 170–180°（环绕）
-_SAT_LO, _SAT_HI = 150, 255     # 饱和度范围：论文指定 150–255
+_SAT_LO, _SAT_HI = 100, 255     # 饱和度范围：论文 150，放宽至 100 以兼容生成帧中褪色的标记
 _VAL_LO, _VAL_HI = 80, 255      # 亮度范围：排除过暗像素
 
 # ---- 搜索窗口参数 ----
