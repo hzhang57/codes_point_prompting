@@ -42,18 +42,18 @@ def _make_pixel_mask(H: int, W: int, points: np.ndarray, radius: int = INPAINT_R
     return mask
 
 
-def _downsample_mask(mask_px: np.ndarray, lH: int, lW: int, device, dtype) -> torch.Tensor:
-    """将像素级掩码 (T, H, W) 下采样到潜变量空间分辨率 (1, 1, T, lH, lW)。
+def _downsample_mask(mask_px: np.ndarray, lT: int, lH: int, lW: int, device, dtype) -> torch.Tensor:
+    """将像素级掩码 (T, H, W) 下采样到潜变量空间分辨率 (1, 1, lT, lH, lW)。
 
-    形状中的 "1, 1" 分别对应批次维和通道维，便于与潜变量张量直接广播相乘。
-    使用双线性插值保证掩码边界平滑过渡。
+    同时进行时序和空间下采样以匹配 VAE 压缩后的潜变量形状。
     """
     T = mask_px.shape[0]
-    # 添加通道维 → (T, 1, H, W) 以满足 F.interpolate 的要求
     t = torch.from_numpy(mask_px).view(T, 1, *mask_px.shape[1:])
     t = F.interpolate(t, size=(lH, lW), mode="bilinear", align_corners=False)  # (T,1,lH,lW)
-    # 调整为 (1, 1, T, lH, lW)：批次=1，通道=1（广播到 C 维）
-    return t.permute(1, 0, 2, 3).unsqueeze(0).to(device=device, dtype=dtype)
+    t = t.permute(1, 0, 2, 3).unsqueeze(0)  # (1,1,T,lH,lW)
+    if T != lT:
+        t = F.interpolate(t, size=(lT, lH, lW), mode="trilinear", align_corners=False)
+    return t.to(device=device, dtype=dtype)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,8 +104,8 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 2：构建像素级和潜变量级时空掩码                                 #
     # ------------------------------------------------------------------ #
-    mask_px  = _make_pixel_mask(H, W, tracks, INPAINT_RADIUS)    # (T, H, W)
-    mask_lat = _downsample_mask(mask_px, lH, lW, device, dtype)  # (1,1,T,lH,lW)
+    mask_px  = _make_pixel_mask(H, W, tracks, INPAINT_RADIUS)       # (T_video, H, W)
+    mask_lat = _downsample_mask(mask_px, T, lH, lW, device, dtype)  # (1,1,T,lH,lW)
 
     # ------------------------------------------------------------------ #
     # 步骤 3：掩码内区域加噪，掩码外保留原始干净潜变量                     #
