@@ -9,9 +9,12 @@ from tracker import PointPrompter, PointPrompterConfig, _aligned_size
 
 
 class _DummyAdapter(ModelAdapter):
+    def __init__(self, device="cpu"):
+        self._device = torch.device(device)
+
     @property
     def device(self):
-        return torch.device("cpu")
+        return self._device
 
     @property
     def dtype(self):
@@ -66,6 +69,30 @@ class TestTrackerResize(unittest.TestCase):
 
         self.assertEqual(received["shape"], (448, 832))
         np.testing.assert_allclose(result.tracks[0], np.array([320.0, 240.0]), atol=1e-4)
+
+    def test_seeded_generator_uses_adapter_device(self):
+        frames = [np.zeros((32, 32, 3), dtype=np.uint8)]
+        cfg = PointPrompterConfig(seed=123, do_refine=False, model_width=0, model_height=0)
+        tracker = PointPrompter(_DummyAdapter(device="cuda"), cfg)
+        received = {}
+
+        class _FakeGenerator:
+            def __init__(self, device=None):
+                received["device"] = device
+
+            def manual_seed(self, seed):
+                received["seed"] = seed
+                return self
+
+        def _fake_sdedit(adapter, frames_bgr_edited, frame_bgr_original, **kwargs):
+            return frames_bgr_edited
+
+        with patch("tracker.torch.Generator", _FakeGenerator):
+            with patch("tracker.run_sdedit", side_effect=_fake_sdedit):
+                tracker.track(frames, (8.0, 8.0))
+
+        self.assertEqual(str(received["device"]), "cuda")
+        self.assertEqual(received["seed"], 123)
 
 
 if __name__ == "__main__":

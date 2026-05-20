@@ -113,7 +113,10 @@ class PointPrompter:
         """
         cfg = self.config
         # 固定随机种子以便复现
-        gen = torch.Generator().manual_seed(cfg.seed) if cfg.seed is not None else None
+        gen = None
+        if cfg.seed is not None:
+            gen_device = self.adapter.device if str(self.adapter.device).startswith("cuda") else "cpu"
+            gen = torch.Generator(device=gen_device).manual_seed(cfg.seed)
         orig_h, orig_w = frames_bgr[0].shape[:2]
         model_w, model_h = _aligned_size(orig_w, orig_h, cfg.model_width, cfg.model_height, cfg.model_stride)
         frames_model = _resize_frames(frames_bgr, (model_w, model_h))
