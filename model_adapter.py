@@ -487,6 +487,21 @@ class WanVACEAdapter(ModelAdapter):
             decoded = decoded.permute(0, 2, 1, 3, 4)
         return _tensor_to_frames(decoded)
 
+    def _vace_in_channels(self) -> int:
+        cfg = getattr(self.pipe.transformer, "config", None)
+        return int(getattr(cfg, "vace_in_channels", 0) or 0)
+
+    def _pad_control(self, ctrl: torch.Tensor) -> torch.Tensor:
+        """Zero-pad the channel dimension to vace_in_channels if needed."""
+        target = self._vace_in_channels()
+        if target and ctrl.shape[1] < target:
+            pad = torch.zeros(
+                ctrl.shape[0], target - ctrl.shape[1], *ctrl.shape[2:],
+                device=ctrl.device, dtype=ctrl.dtype,
+            )
+            ctrl = torch.cat([ctrl, pad], dim=1)
+        return ctrl
+
     def _fallback_control_cond(self, frame_bgr: np.ndarray) -> dict:
         num_frames = self._last_latent_frames or self._last_num_frames or 1
         t = _frames_to_tensor([frame_bgr], self.device, self.dtype)
@@ -503,7 +518,8 @@ class WanVACEAdapter(ModelAdapter):
             device=cond_lat.device, dtype=cond_lat.dtype,
         )
         mask[:, :, 0] = 0.0
-        return {"control": torch.cat([cond_lat, mask], dim=1), "scale": 1.0}
+        ctrl = self._pad_control(torch.cat([cond_lat, mask], dim=1))
+        return {"control": ctrl, "scale": 1.0}
 
     def encode_image_cond(self, frame_bgr: np.ndarray):
         """构造 VACE control_hidden_states 条件。"""
@@ -543,12 +559,14 @@ class WanVACEAdapter(ModelAdapter):
             None,
             self.device,
         )
-        mask_latents = self.pipe.prepare_masks(
-            mask,
-            reference_images,
-            None,
-        )
-        return {"control": torch.cat([condition_latents, mask_latents], dim=1).to(self.dtype), "scale": 1.0}
+        vace_ch = self._vace_in_channels()
+        if vace_ch and condition_latents.shape[1] >= vace_ch:
+            ctrl = condition_latents[:, :vace_ch]
+        else:
+            mask_latents = self.pipe.prepare_masks(mask, reference_images, None)
+            ctrl = torch.cat([condition_latents, mask_latents], dim=1)
+            ctrl = self._pad_control(ctrl)
+        return {"control": ctrl.to(self.dtype), "scale": 1.0}
 
     def encode_text(self, prompt: str):
         if getattr(self.pipe, "text_encoder", None) is None or getattr(self.pipe, "tokenizer", None) is None:
