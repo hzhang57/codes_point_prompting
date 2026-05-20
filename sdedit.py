@@ -81,10 +81,10 @@ def run_sdedit(
     t_start_idx    = max(0, int((1.0 - gamma) * num_inference_steps))
     timesteps_run  = timesteps[t_start_idx:]
 
-    # 从调度器实际时间步推算加噪比例，对齐 Flow Matching 的噪声水平
+    # 加噪比例 = 起始时间步 / 最大时间步 ≈ gamma（对非均匀调度器更鲁棒）
     t_val  = timesteps[t_start_idx].float()
     t_max  = timesteps[0].float()
-    t_frac = (t_val / t_max).item() * gamma   # 等比映射到 [0, gamma]
+    t_frac = (t_val / t_max).item()           # ≈ gamma，直接作为插值系数
     latents = adapter.add_noise(latents_clean, noise, t_frac)
 
     # ------------------------------------------------------------------ #

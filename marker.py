@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 
 # ---- 标记外观参数 ----
-MARKER_RADIUS = 8             # 标记圆的半径（像素）
+MARKER_RADIUS = 2             # 标记圆的半径（像素）；论文消融最优值为 2px
 MARKER_COLOR_BGR = (0, 0, 220)  # 红色（BGR 格式：B=0, G=0, R=220）
 MARKER_THICKNESS = -1         # -1 表示填充实心圆
 
@@ -19,12 +19,13 @@ MARKER_THICKNESS = -1         # -1 表示填充实心圆
 # OpenCV 中色相范围为 [0, 180]，红色横跨 0°/180° 边界，因此需要两段范围
 _HUE_LO1, _HUE_HI1 = 0, 10      # 红色区间1：色相 0–10°
 _HUE_LO2, _HUE_HI2 = 170, 180   # 红色区间2：色相 170–180°（环绕）
-_SAT_LO, _SAT_HI = 120, 255     # 饱和度范围：只检测高饱和度红色
+_SAT_LO, _SAT_HI = 150, 255     # 饱和度范围：论文指定 150–255
 _VAL_LO, _VAL_HI = 80, 255      # 亮度范围：排除过暗像素
 
 # ---- 搜索窗口参数 ----
 DEFAULT_SEARCH_RADIUS = 90   # 默认以上一帧位置为中心的搜索半径（像素）
 MAX_SEARCH_RADIUS = 150      # 连续丢失帧时搜索半径的最大扩展值
+_REFINE_RADIUS = 20          # 质心精炼：仅聚合距最近红色像素 20px 以内的像素
 
 
 def insert_marker(frame: np.ndarray, point: Tuple[int, int], radius: int = MARKER_RADIUS) -> np.ndarray:
@@ -83,9 +84,18 @@ def detect_marker(
     if len(xs) == 0:
         return None  # 窗口内无红色像素，标记丢失
 
-    # 以所有红色像素的平均坐标作为质心，并还原到原图坐标系
-    cx = float(xs.mean()) + x1
-    cy = float(ys.mean()) + y1
+    # 找距上一帧位置最近的红色像素作为锚点（裁剪坐标系）
+    crop_px, crop_py = px - x1, py - y1
+    dists = np.sqrt((xs - crop_px) ** 2 + (ys - crop_py) ** 2)
+    anchor_idx = int(np.argmin(dists))
+    anchor_x, anchor_y = xs[anchor_idx], ys[anchor_idx]
+
+    # 仅聚合锚点 _REFINE_RADIUS 范围内的红色像素，抑制离群点
+    near = np.sqrt((xs - anchor_x) ** 2 + (ys - anchor_y) ** 2) <= _REFINE_RADIUS
+    if not near.any():
+        near = np.ones(len(xs), dtype=bool)
+    cx = float(xs[near].mean()) + x1
+    cy = float(ys[near].mean()) + y1
     return (cx, cy)
 
 

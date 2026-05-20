@@ -1,58 +1,47 @@
 """
-颜色重平衡模块：对输入帧中的自然红色像素进行去饱和处理，
-防止其被误识别为合成标记，从而干扰标记检测器。
+颜色重平衡模块：对输入帧中靠近红色色相的像素进行硬性饱和度截断，
+防止自然红色被误识别为合成标记，同时尽量保留原始色彩信息。
 
-原理：越接近红色色相（0°/180°）的像素，饱和度降低越多；
-远离红色的像素（绿、蓝等）饱和度保持不变。
+论文做法（Appendix B.1）：HSV 色相在 [-30°, 10°] 范围内的像素，
+将其饱和度截断至最大 80（OpenCV 0-255 范围），其余像素不变。
 """
 
 import cv2
 import numpy as np
 
 
-# OpenCV HSV 色相范围为 [0, 180]；红色分布在约 [0,10] 和 [170,180]
-_RED_HUE_MARGIN = 15   # 抑制边界宽度：距离红色 15 个色相单位以内开始衰减
+# 饱和度截断上限（论文指定 80，对应 OpenCV 0-255 范围）
+_MAX_SAT_RED = 80
 
-
-def _red_proximity_weight(hue: np.ndarray) -> np.ndarray:
-    """计算每个像素的"远红色"权重，取值 ∈ [0, 1]。
-
-    权重 = 0：色相恰好是红色（hue=0 或 hue=180）
-    权重 = 1：色相远离红色（如绿色 hue=60、蓝色 hue=120）
-
-    `hue` 为 OpenCV 约定的整数数组，范围 [0, 180]。
-    """
-    # 分别计算到 0° 和 180° 的距离，取较小值（处理色相环绕）
-    dist_to_zero = hue.astype(np.float32)
-    dist_to_180  = (180 - hue).astype(np.float32)
-    dist         = np.minimum(dist_to_zero, dist_to_180)
-
-    # 线性映射：[0, _RED_HUE_MARGIN] → [0, 1]，超出范围截断到 1
-    weight = np.clip(dist / _RED_HUE_MARGIN, 0.0, 1.0)
-    return weight
+# 红色色相邻域范围（OpenCV 色相单位，0-180）
+# 标准 HSV [-30°, 10°] 对应 OpenCV [150, 180] ∪ [0, 5]，
+# 此处取更保守的 [165, 180] ∪ [0, 10]（约 ±30° 覆盖）
+_RED_HUE_MARGIN = 15   # 距离 0 或 180 在此范围内视为红色
 
 
 def rebalance_frame(frame_bgr: np.ndarray) -> np.ndarray:
-    """对单帧 BGR 图像中的红色像素进行去饱和处理。
+    """对单帧 BGR 图像中红色色相区域进行饱和度硬截断。
 
     处理步骤：
       1. BGR → HSV
-      2. 对接近红色色相的像素按权重降低饱和度
-      3. HSV → BGR 输出
+      2. 标记红色区域（hue ≤ _RED_HUE_MARGIN 或 hue ≥ 180-_RED_HUE_MARGIN）
+      3. 对该区域的饱和度截断至最大 _MAX_SAT_RED
+      4. HSV → BGR 输出
 
     返回与输入相同 shape/dtype 的 BGR 帧（不修改原图）。
     """
-    # 转换到 HSV 空间，用 float 防止运算溢出
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV).copy()
+    h = hsv[:, :, 0].astype(np.int32)
 
-    # 计算每像素的去饱和权重（红色附近权重趋向 0）
-    weight = _red_proximity_weight(h.astype(np.int32))
-    s_new  = s * weight   # 红色区域饱和度被压低，其余区域不变
+    # 红色区域掩码（距色相 0° 或 180° 不超过 _RED_HUE_MARGIN）
+    is_red = (h <= _RED_HUE_MARGIN) | (h >= 180 - _RED_HUE_MARGIN)
 
-    hsv[..., 1] = s_new
-    hsv_u8 = np.clip(hsv, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(hsv_u8, cv2.COLOR_HSV2BGR)
+    # 硬截断：饱和度超过 _MAX_SAT_RED 的红色像素降至上限
+    s = hsv[:, :, 1].astype(np.int32)
+    s[is_red] = np.minimum(s[is_red], _MAX_SAT_RED)
+    hsv[:, :, 1] = s.astype(np.uint8)
+
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
 def rebalance_video(frames_bgr: list) -> list:
