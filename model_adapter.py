@@ -235,13 +235,26 @@ class CogVideoXAdapter(ModelAdapter):
         return float(getattr(self.pipe, "vae_scale_factor",
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
+    def _enable_vae_slicing(self):
+        """启用 VAE 时序切片以降低显存峰值（CogVideoX VAE 专用）。"""
+        vae = self.pipe.vae
+        if hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
+        self._enable_vae_slicing()
         t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W)
         with torch.no_grad():
             lat = self.pipe.vae.encode(t).latent_dist.sample()
+        del t
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return lat * self._video_scale()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
+        self._enable_vae_slicing()
         lat = latents / self._video_scale()
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
@@ -726,6 +739,9 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
+    # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
     return pipe
 
 
