@@ -4,16 +4,12 @@
 支持 CogVideoX-I2V 和 Wan2.1-I2V / VACE 两种模型。
 
 使用示例：
-    # Wan 2.1 VACE 1.3B（约 10 GB 显存）
-    python demo.py --video input.mp4 --points "1157,635" \\
-                   --model-type wan --model-id Wan-AI/Wan2.1-VACE-1.3B-diffusers
-
     # Wan 2.1 14B（论文主要模型，质量最佳，需约 40 GB 显存）
     python demo.py --video input.mp4 --points "320,240" "640,360" \\
                    --model-type wan --model-id Wan-AI/Wan2.1-I2V-14B-480P
 
     # CogVideoX 5B I2V
-    python demo.py --video input.mp4 --points "320,240" \\
+    python demo.py --video input.mp4 --points "1157,635" \\
                    --model-type cogvideox --model-id THUDM/CogVideoX-5b-I2V
 
 依赖安装：
