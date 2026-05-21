@@ -36,10 +36,17 @@ MODEL_DEFAULTS = {
     "wan": {
         "model_id": "Wan-AI/Wan2.1-I2V-14B-480P",   # 默认使用 14B 版本
         "dtype": "bfloat16",
+        "width": 832,
+        "height": 480,
+        "max_frames": 50,
     },
     "cogvideox": {
         "model_id": "THUDM/CogVideoX-5b-I2V",
         "dtype": "float16",
+        # CogVideoX-5b-I2V 硬编码只接受 720×480，不支持其他分辨率；训练帧数为 49
+        "width": 720,
+        "height": 480,
+        "max_frames": 49,
     },
 }
 
@@ -227,25 +234,31 @@ def main():
                         help="跳过 inpainting 精细化步骤（速度更快但精度略低）")
     parser.add_argument("--seed",    type=int,   default=42,
                         help="随机种子（默认：42）")
-    parser.add_argument("--max-frames", type=int, default=50,
-                        help="最多处理的帧数（默认：50）")
-    parser.add_argument("--preprocess-width", type=int, default=832,
-                        help="跟踪前先将视频缩放到此宽度，0 表示不预处理缩放（默认：832）")
-    parser.add_argument("--preprocess-height", type=int, default=480,
-                        help="跟踪前先将视频缩放到此高度，0 表示不预处理缩放（默认：480）")
-    parser.add_argument("--model-width", type=int, default=832,
-                        help="送入扩散模型的最大宽度，0 表示不缩放（默认：832）")
-    parser.add_argument("--model-height", type=int, default=480,
-                        help="送入扩散模型的最大高度，0 表示不缩放（默认：480）")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="最多处理的帧数（默认：由模型类型决定，cogvideox=49 wan=50）")
+    parser.add_argument("--preprocess-width", type=int, default=None,
+                        help="跟踪前先将视频缩放到此宽度，0 表示不预处理缩放（默认：由模型类型决定）")
+    parser.add_argument("--preprocess-height", type=int, default=None,
+                        help="跟踪前先将视频缩放到此高度，0 表示不预处理缩放（默认：由模型类型决定）")
+    parser.add_argument("--model-width", type=int, default=None,
+                        help="送入扩散模型的最大宽度，0 表示不缩放（默认：由模型类型决定）")
+    parser.add_argument("--model-height", type=int, default=None,
+                        help="送入扩散模型的最大高度，0 表示不缩放（默认：由模型类型决定）")
     parser.add_argument("--model-stride", type=int, default=16,
                         help="模型输入宽高对齐倍数（默认：16）")
     parser.add_argument("--device",  default="cuda",
                         help="计算设备（默认：cuda）")
     args = parser.parse_args()
 
-    # 确定模型 ID（命令行参数优先，否则使用该类型的默认值）
+    # 确定模型 ID 和分辨率（命令行参数优先，否则使用该类型的默认值）
     model_type = args.model_type
     model_id   = args.model_id or MODEL_DEFAULTS[model_type]["model_id"]
+    _mdef = MODEL_DEFAULTS[model_type]
+    if args.preprocess_width  is None: args.preprocess_width  = _mdef["width"]
+    if args.preprocess_height is None: args.preprocess_height = _mdef["height"]
+    if args.model_width       is None: args.model_width       = _mdef["width"]
+    if args.model_height      is None: args.model_height      = _mdef["height"]
+    if args.max_frames        is None: args.max_frames        = _mdef["max_frames"]
 
     try:
         query_points = parse_points(args.points)
