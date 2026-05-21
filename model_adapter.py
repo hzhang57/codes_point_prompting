@@ -254,11 +254,14 @@ class CogVideoXAdapter(ModelAdapter):
         return lat * self._video_scale()
 
     def _offload_transformer(self):
-        """将 transformer 移到 CPU，为 VAE decode 释放 VRAM（仅 device_map 模式有效）。"""
+        """将 transformer 参数移到 CPU，为 VAE decode 释放 VRAM。"""
         if not torch.cuda.is_available():
             return
+        import warnings
         try:
-            self.pipe.transformer.to("cpu")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.pipe.transformer.to("cpu")
         except Exception:
             pass
         torch.cuda.empty_cache()

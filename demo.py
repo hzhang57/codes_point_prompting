@@ -326,7 +326,9 @@ def main():
 
     # 可视化轨迹并保存输出视频
     # 用原始分辨率帧绘制，tracks 已被 tracker 反算回原始坐标系
-    annotated = draw_tracks(frames_orig, [r.tracks for r in results], [r.visible for r in results])
+    # VAE 时序压缩可能使生成帧数略少于输入帧数，截断对齐
+    n_gen = len(results[0].tracks) if results else len(frames_orig)
+    annotated = draw_tracks(frames_orig[:n_gen], [r.tracks for r in results], [r.visible for r in results])
     save_video(annotated, args.output, src_fps)
     print(f"已保存至 {args.output}")
 
