@@ -246,14 +246,13 @@ class CogVideoXAdapter(ModelAdapter):
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
         t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W) BCTHW
+        print(f"[DBG] encode_video input shape: {t.shape}")
         with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()  # VAE 返回 BTCHW
+            lat = self.pipe.vae.encode(t).latent_dist.sample()
+        print(f"[DBG] encode_video raw latent shape: {lat.shape}")
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        # CogVideoX VAE encode 输出 (1,T_lat,C_lat,lH,lW)；转为 BCTHW 统一内部格式
-        if lat.ndim == 5 and lat.shape[2] != lat.shape[1] and lat.shape[1] < lat.shape[2]:
-            lat = lat.permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
         return lat * self._video_scale()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
@@ -285,15 +284,13 @@ class CogVideoXAdapter(ModelAdapter):
 
         vae = self.pipe.vae
         with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()  # VAE 返回 BTCHW: (1,1,C_lat,lH,lW)
+            lat = vae.encode(img_t).latent_dist.sample()
+        print(f"[DBG] encode_image_cond raw latent shape: {lat.shape}")
 
         # 官方 pipeline 用 vae_scaling_factor_image 缩放图像条件潜变量
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
         lat = lat * scale
-        # 转为 BCTHW: (1,C_lat,1,lH,lW)
-        if lat.ndim == 5 and lat.shape[1] == 1:
-            lat = lat.permute(0, 2, 1, 3, 4)  # (1,1,C_lat,lH,lW) → (1,C_lat,1,lH,lW)
         return lat
 
     def encode_text(self, prompt: str) -> torch.Tensor:
@@ -319,6 +316,7 @@ class CogVideoXAdapter(ModelAdapter):
         return None
 
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
+        print(f"[DBG] forward_transformer noisy_latents: {noisy_latents.shape}  image_cond: {image_cond.shape}")
         # 官方 CogVideoX-I2V pipeline：图像潜变量沿通道轴（dim=1）拼接。
         # image_cond: (1, C, 1, lH, lW)  —  只有第 0 帧有内容
         # 其余帧用零填充，得到 (1, C, T, lH, lW)，再沿 dim=1 拼接：
@@ -327,6 +325,7 @@ class CogVideoXAdapter(ModelAdapter):
         img_pad = torch.zeros_like(noisy_latents)           # (1, C, T, lH, lW)
         img_pad[:, :, :image_cond.shape[2], :, :] = image_cond  # 写入第 0 帧
         model_input = torch.cat([noisy_latents, img_pad], dim=1)  # (1, 2C, T, lH, lW)
+        print(f"[DBG] model_input: {model_input.shape}")
 
         ipe = self._rotary_emb(model_input.shape)
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
