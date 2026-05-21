@@ -284,13 +284,11 @@ class CogVideoXAdapter(ModelAdapter):
         return None
 
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
-        T = noisy_latents.shape[2]
-        # 将单帧图像潜变量扩展到全部 T 帧，然后沿通道轴拼接
-        img_expanded = image_cond.expand(-1, -1, T, -1, -1)           # (1,C,T,lH,lW)
-        model_input  = torch.cat([noisy_latents, img_expanded], dim=1) # (1,2C,T,lH,lW)
+        # 官方 CogVideoX-I2V pipeline：沿时序轴（dim=2）拼接图像潜变量
+        # model_input shape: (1, C, 1+T, lH, lW)
+        model_input = torch.cat([image_cond, noisy_latents], dim=2)
 
-        ipe = self._rotary_emb(noisy_latents.shape)
-        # 确保时间步有批次维
+        ipe = self._rotary_emb(model_input.shape)
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
         out = self.pipe.transformer(
@@ -300,7 +298,8 @@ class CogVideoXAdapter(ModelAdapter):
             image_rotary_emb=ipe,
             return_dict=False,
         )
-        return out[0]   # 速度场，形状 (1, C, T, lH, lW)
+        # 输出对应 (1, C, 1+T, lH, lW)，去掉前置图像帧，只返回视频部分
+        return out[0][:, :, 1:, :, :]
 
 
 # --------------------------------------------------------------------------- #
