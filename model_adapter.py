@@ -246,10 +246,8 @@ class CogVideoXAdapter(ModelAdapter):
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
         t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W) BCTHW
-        print(f"[DBG] encode_video input shape: {t.shape}")
         with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()
-        print(f"[DBG] encode_video raw latent shape: {lat.shape}")
+            lat = self.pipe.vae.encode(t).latent_dist.sample()      # (1,C,T_lat,lH,lW) BCTHW
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -257,14 +255,9 @@ class CogVideoXAdapter(ModelAdapter):
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._enable_vae_slicing()
-        lat = latents / self._video_scale()
-        # VAE decode 需要 BTCHW 格式；内部 latents 是 BCTHW，先转换
-        lat_bt = lat.permute(0, 2, 1, 3, 4)  # BCTHW → BTCHW
+        lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat_bt).sample  # 输出 BTCHW: (1,T,3,H,W)
-        # 转为 BCTHW 供 _tensor_to_frames 使用
-        if decoded.ndim == 5 and decoded.shape[2] == 3:
-            decoded = decoded.permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
+            decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
@@ -284,8 +277,7 @@ class CogVideoXAdapter(ModelAdapter):
 
         vae = self.pipe.vae
         with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()
-        print(f"[DBG] encode_image_cond raw latent shape: {lat.shape}")
+            lat = vae.encode(img_t).latent_dist.sample()  # (1,C,1,lH,lW) BCTHW
 
         # 官方 pipeline 用 vae_scaling_factor_image 缩放图像条件潜变量
         scale = getattr(self.pipe, "vae_scaling_factor_image",
@@ -305,29 +297,27 @@ class CogVideoXAdapter(ModelAdapter):
 
     # -- 去噪器 -------------------------------------------------------------- #
 
-    def _rotary_emb(self, latent_shape: Tuple) -> Optional[Any]:
+    def _rotary_emb(self, T: int, H: int, W: int) -> Optional[Any]:
         """计算旋转位置编码（RoPE），若模型不使用则返回 None。"""
         if not getattr(self.pipe.transformer.config, "use_rotary_positional_embeddings", False):
             return None
-        _, _, T, H, W = latent_shape
         if hasattr(self.pipe, "_prepare_rotary_positional_embeddings"):
             p = self.pipe.vae_scale_factor_spatial if hasattr(self.pipe, "vae_scale_factor_spatial") else 8
             return self.pipe._prepare_rotary_positional_embeddings(H * p, W * p, T, self.device)
         return None
 
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
-        print(f"[DBG] forward_transformer noisy_latents: {noisy_latents.shape}  image_cond: {image_cond.shape}")
-        # 官方 CogVideoX-I2V pipeline：图像潜变量沿通道轴（dim=1）拼接。
-        # image_cond: (1, C, 1, lH, lW)  —  只有第 0 帧有内容
-        # 其余帧用零填充，得到 (1, C, T, lH, lW)，再沿 dim=1 拼接：
-        # model_input: (1, 2C, T, lH, lW)
-        T = noisy_latents.shape[2]
-        img_pad = torch.zeros_like(noisy_latents)           # (1, C, T, lH, lW)
-        img_pad[:, :, :image_cond.shape[2], :, :] = image_cond  # 写入第 0 帧
-        model_input = torch.cat([noisy_latents, img_pad], dim=1)  # (1, 2C, T, lH, lW)
-        print(f"[DBG] model_input: {model_input.shape}")
+        # noisy_latents: (1, C, T, lH, lW) BCTHW（内部统一格式）
+        # image_cond:    (1, C, 1, lH, lW) BCTHW
+        # CogVideoX transformer 期望 BTCHW 输入，通道轴拼接后再转换格式
+        _, C, T, lH, lW = noisy_latents.shape
+        img_pad = torch.zeros_like(noisy_latents)                      # (1, C, T, lH, lW)
+        img_pad[:, :, :image_cond.shape[2], :, :] = image_cond        # 写入第 0 帧
+        # 沿通道轴拼接：(1, 2C, T, lH, lW)，然后转为 BTCHW：(1, T, 2C, lH, lW)
+        model_input = torch.cat([noisy_latents, img_pad], dim=1)       # (1, 2C, T, lH, lW)
+        model_input = model_input.permute(0, 2, 1, 3, 4)              # (1, T, 2C, lH, lW)
 
-        ipe = self._rotary_emb(model_input.shape)
+        ipe = self._rotary_emb(T, lH, lW)
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
         out = self.pipe.transformer(
@@ -337,8 +327,8 @@ class CogVideoXAdapter(ModelAdapter):
             image_rotary_emb=ipe,
             return_dict=False,
         )
-        # transformer 输出形状 (1, C, T, lH, lW)，直接返回
-        return out[0]
+        # 输出为 BTCHW: (1, T, C, lH, lW)，转回 BCTHW: (1, C, T, lH, lW)
+        return out[0].permute(0, 2, 1, 3, 4)
 
 
 # --------------------------------------------------------------------------- #
