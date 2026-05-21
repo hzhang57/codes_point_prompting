@@ -315,9 +315,14 @@ class CogVideoXAdapter(ModelAdapter):
         return None
 
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
-        # 官方 CogVideoX-I2V pipeline：沿时序轴（dim=2）拼接图像潜变量
-        # model_input shape: (1, C, 1+T, lH, lW)
-        model_input = torch.cat([image_cond, noisy_latents], dim=2)
+        # 官方 CogVideoX-I2V pipeline：图像潜变量沿通道轴（dim=1）拼接。
+        # image_cond: (1, C, 1, lH, lW)  —  只有第 0 帧有内容
+        # 其余帧用零填充，得到 (1, C, T, lH, lW)，再沿 dim=1 拼接：
+        # model_input: (1, 2C, T, lH, lW)
+        T = noisy_latents.shape[2]
+        img_pad = torch.zeros_like(noisy_latents)           # (1, C, T, lH, lW)
+        img_pad[:, :, :image_cond.shape[2], :, :] = image_cond  # 写入第 0 帧
+        model_input = torch.cat([noisy_latents, img_pad], dim=1)  # (1, 2C, T, lH, lW)
 
         ipe = self._rotary_emb(model_input.shape)
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
@@ -329,8 +334,8 @@ class CogVideoXAdapter(ModelAdapter):
             image_rotary_emb=ipe,
             return_dict=False,
         )
-        # 输出对应 (1, C, 1+T, lH, lW)，去掉前置图像帧，只返回视频部分
-        return out[0][:, :, 1:, :, :]
+        # transformer 输出形状 (1, C, T, lH, lW)，直接返回
+        return out[0]
 
 
 # --------------------------------------------------------------------------- #
