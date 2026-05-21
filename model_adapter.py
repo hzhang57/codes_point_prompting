@@ -253,10 +253,19 @@ class CogVideoXAdapter(ModelAdapter):
             torch.cuda.empty_cache()
         return lat * self._video_scale()
 
+    def _offload_transformer(self):
+        """将 transformer 移到 CPU，为 VAE decode 释放 VRAM（仅 device_map 模式有效）。"""
+        if not torch.cuda.is_available():
+            return
+        try:
+            self.pipe.transformer.to("cpu")
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+
     def decode_latents(self, latents: torch.Tensor) -> list:
+        self._offload_transformer()
         self._enable_vae_slicing()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
@@ -727,13 +736,18 @@ def create_adapter(pipe) -> ModelAdapter:
 def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):
     """加载 CogVideoX-5B I2V pipeline（float16）。"""
     from diffusers import CogVideoXImageToVideoPipeline
-    pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
-    if str(device).startswith("cuda"):
-        # enable_model_cpu_offload 将各子模块按需搬到 GPU，避免 transformer+VAE 同时驻留 VRAM
-        # 对双 T4（共 30GB）也适用；device_map="balanced" 会让 transformer 永久占满 VRAM
-        pipe.enable_model_cpu_offload()
+    n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
+    if n_gpus >= 2:
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+            model_id, torch_dtype=torch.float16,
+            device_map="balanced", max_memory=_max_memory_per_gpu(),
+        )
     else:
-        pipe = pipe.to(device)
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+        if str(device).startswith("cuda"):
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(device)
     # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
