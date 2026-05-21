@@ -275,29 +275,18 @@ class CogVideoXAdapter(ModelAdapter):
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
-        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。"""
-        img_pil = _bgr_to_pil(frame_bgr)
+        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
 
-        # 用 image_processor 预处理（CogVideoX 图像条件专用）
-        if hasattr(self.pipe, "image_processor"):
-            img_t = self.pipe.image_processor.preprocess(img_pil)  # (1,C,H,W)
-        elif hasattr(self.pipe, "video_processor"):
-            img_t = self.pipe.video_processor.preprocess(img_pil)  # (1,C,H,W)
-        else:
-            arr   = np.array(img_pil).astype(np.float32) / 127.5 - 1.0
-            img_t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-
-        img_t = img_t.unsqueeze(2).to(device=self.device, dtype=self.dtype)  # (1,C,1,H,W)
-
+        与 encode_video 走完全相同的预处理路径，保证空间尺寸与视频 latent 一致。
+        """
+        # 单帧走和视频完全相同的路径：BGR → (1,C,1,H,W) → VAE → latent
+        img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
         vae = self.pipe.vae
         with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()  # (1,C,1,lH,lW) BCTHW
-
-        # 官方 pipeline 用 vae_scaling_factor_image 缩放图像条件潜变量
+            lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
-        lat = lat * scale
-        return lat
+        return lat * scale
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
