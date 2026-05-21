@@ -1,16 +1,16 @@
 """
 演示脚本：使用 Point Prompting 跟踪视频中的用户指定点，并将轨迹可视化写入输出视频。
 
-支持 CogVideoX-I2V 和 Wan2.1-I2V 两种模型。
+支持 CogVideoX-I2V 和 Wan2.1-I2V / VACE 两种模型。
 
 使用示例：
+    # Wan 2.1 VACE 1.3B（约 10 GB 显存）
+    python demo.py --video input.mp4 --points "1157,635" \\
+                   --model-type wan --model-id Wan-AI/Wan2.1-VACE-1.3B-diffusers
+
     # Wan 2.1 14B（论文主要模型，质量最佳，需约 40 GB 显存）
     python demo.py --video input.mp4 --points "320,240" "640,360" \\
                    --model-type wan --model-id Wan-AI/Wan2.1-I2V-14B-480P
-
-    # Wan 2.1 1.3B（速度更快，约 10 GB 显存）
-    python demo.py --video input.mp4 --points "320,240" \\
-                   --model-type wan --model-id Wan-AI/Wan2.1-I2V-1.3B-480P
 
     # CogVideoX 5B I2V
     python demo.py --video input.mp4 --points "320,240" \\
@@ -93,9 +93,13 @@ def draw_tracks(frames: list, tracks_list: list, visible_list: list) -> list:
 #  视频 I/O 工具                                                                 #
 # --------------------------------------------------------------------------- #
 
-def load_video(path: str, max_frames: int = 50) -> list:
-    """从文件读取视频帧（BGR），最多读取 max_frames 帧。"""
+def load_video(path: str, max_frames: int = 50):
+    """从文件读取视频帧（BGR），最多读取 max_frames 帧。
+
+    返回 (frames, fps)：帧列表和原始视频帧率。
+    """
     cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
     frames = []
     while len(frames) < max_frames:
         ret, f = cap.read()
@@ -103,7 +107,7 @@ def load_video(path: str, max_frames: int = 50) -> list:
             break
         frames.append(f)
     cap.release()
-    return frames
+    return frames, fps
 
 
 def resize_video(frames: list, width: int, height: int) -> list:
@@ -155,7 +159,7 @@ def cuda_preflight_error(device: str) -> Optional[str]:
     return None
 
 
-def save_video(frames: list, path: str, fps: float = 15.0):
+def save_video(frames: list, path: str, fps: float):
     """将帧列表写入 MP4 视频文件。"""
     H, W = frames[0].shape[:2]
     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
@@ -257,11 +261,14 @@ def main():
 
     # 读取输入视频
     print(f"加载视频：{args.video}")
-    frames = load_video(args.video, args.max_frames)
+    frames, src_fps = load_video(args.video, args.max_frames)
     if not frames:
         sys.exit("错误：无法从视频中读取任何帧。")
     orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
-    print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}")
+    print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}  fps={src_fps:.2f}")
+
+    # 保留原始帧用于最终可视化（轨迹坐标会被 tracker 反算回原始分辨率）
+    frames_orig = frames
 
     # 预处理视频到固定分辨率，降低 VAE 编码显存占用；查询点同步缩放到预处理坐标系。
     if args.preprocess_width > 0 and args.preprocess_height > 0:
@@ -309,8 +316,9 @@ def main():
     _diag_generated(results, query_points, radius=30)
 
     # 可视化轨迹并保存输出视频
-    annotated = draw_tracks(frames, [r.tracks for r in results], [r.visible for r in results])
-    save_video(annotated, args.output)
+    # 用原始分辨率帧绘制，tracks 已被 tracker 反算回原始坐标系
+    annotated = draw_tracks(frames_orig, [r.tracks for r in results], [r.visible for r in results])
+    save_video(annotated, args.output, src_fps)
     print(f"已保存至 {args.output}")
 
     # 打印每个点的可见帧比例统计
