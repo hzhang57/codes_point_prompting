@@ -245,29 +245,31 @@ class CogVideoXAdapter(ModelAdapter):
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
-        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W)
+        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W) BCTHW
         with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()
+            lat = self.pipe.vae.encode(t).latent_dist.sample()  # VAE 返回 BTCHW
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # CogVideoX VAE encode 输出 (1,T_lat,C_lat,lH,lW)；转为 BCTHW 统一内部格式
+        if lat.ndim == 5 and lat.shape[2] != lat.shape[1] and lat.shape[1] < lat.shape[2]:
+            lat = lat.permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
         return lat * self._video_scale()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._enable_vae_slicing()
         lat = latents / self._video_scale()
+        # VAE decode 需要 BTCHW 格式；内部 latents 是 BCTHW，先转换
+        lat_bt = lat.permute(0, 2, 1, 3, 4)  # BCTHW → BTCHW
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample
-        if decoded.ndim == 5 and decoded.shape[1] != 3 and decoded.shape[2] == 3:
+            decoded = self.pipe.vae.decode(lat_bt).sample  # 输出 BTCHW: (1,T,3,H,W)
+        # 转为 BCTHW 供 _tensor_to_frames 使用
+        if decoded.ndim == 5 and decoded.shape[2] == 3:
             decoded = decoded.permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
-        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) 图像潜变量。
-
-        CogVideoX VAE 有因果时序卷积，需要用 pipeline 的 image_processor
-        预处理并用 vae_scaling_factor_image 缩放（与视频缩放因子不同）。
-        """
+        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。"""
         img_pil = _bgr_to_pil(frame_bgr)
 
         # 用 image_processor 预处理（CogVideoX 图像条件专用）
@@ -281,16 +283,18 @@ class CogVideoXAdapter(ModelAdapter):
 
         img_t = img_t.unsqueeze(2).to(device=self.device, dtype=self.dtype)  # (1,C,1,H,W)
 
-        # CogVideoX VAE 因果卷积：T=1 时需要关闭 tiling 以避免 padding 问题
         vae = self.pipe.vae
-        was_tiling = getattr(vae, '_tiling_enabled', False) or getattr(vae, 'enable_tiling', None) is not None
         with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()
+            lat = vae.encode(img_t).latent_dist.sample()  # VAE 返回 BTCHW: (1,1,C_lat,lH,lW)
 
         # 官方 pipeline 用 vae_scaling_factor_image 缩放图像条件潜变量
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
-        return lat * scale  # (1, C_lat, 1, lH, lW)
+        lat = lat * scale
+        # 转为 BCTHW: (1,C_lat,1,lH,lW)
+        if lat.ndim == 5 and lat.shape[1] == 1:
+            lat = lat.permute(0, 2, 1, 3, 4)  # (1,1,C_lat,lH,lW) → (1,C_lat,1,lH,lW)
+        return lat
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
