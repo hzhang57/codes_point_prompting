@@ -61,7 +61,8 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
     # ------------------------------------------------------------------ #
-    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0])  # 正向条件
+    # 正向条件：直接从已编码的 latent 切第 0 帧，避免重复 encode
+    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
     cond_original = adapter.encode_image_cond(frame_bgr_original)    # 负向条件
 
     # ------------------------------------------------------------------ #
