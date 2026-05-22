@@ -1,6 +1,19 @@
 # Point Prompting: Counterfactual Tracking with Video Diffusion Models
 
+**v1.0** — 2026-05-23
+
 A zero-shot point tracker based on pre-trained image-conditioned video diffusion models. This is an implementation of the method from the paper [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://arxiv.org/abs/2510.11715).
+
+## Changelog
+
+### v1.0 (2026-05-23)
+- Full pipeline working end-to-end: color rebalance → marker insert → counterfactual SDEdit → marker detection → inpainting refinement
+- Supports **CogVideoX-5B-I2V** and **Wan2.1-I2V / VACE** backbones via unified `ModelAdapter`
+- Dual-GPU support (2× T4 15 GiB): transformer loaded with `device_map="balanced"`; CogVideoX VAE pinned to cuda:0 via asymmetric `max_memory` to avoid OOM
+- Per-stage progress prints: `[阶段 1/2]` SDEdit, `[阶段 2/2]` refinement
+- Input video preprocessing: auto-resize to model resolution (720×480 for CogVideoX, 832×480 for Wan) with stride alignment; tracks returned in original-frame coordinates
+- `--no-refine` flag to skip refinement and halve runtime
+- `--max-frames` flag to limit frame count and VRAM usage
 
 ## Overview
 
@@ -155,10 +168,17 @@ Metrics follow the TAP-Vid protocol (Doersch et al., 2022):
 
 ## Multi-GPU Setup
 
-`load_wan_pipe` and `load_cogvideox_pipe` automatically detect the number of available GPUs:
+`load_wan_pipe` and `load_cogvideox_pipe` automatically detect the number of available GPUs.
 
-- **2+ GPUs**: loads with `device_map="balanced"` (model layers spread evenly across all GPUs via accelerate)
-- **1 GPU**: loads then calls `enable_model_cpu_offload()` to fit within VRAM
+**Wan:**
+- **2+ GPUs**: `device_map="balanced"` spreads transformer layers across all GPUs
+- **1 GPU**: `enable_model_cpu_offload()`
+
+**CogVideoX (dual T4 15 GiB):**
+- Asymmetric `max_memory`: cuda:0 gets `total-5 GiB`, cuda:1 gets `total-1 GiB`
+- This forces most transformer layers onto cuda:1, leaving ~5 GiB free on cuda:0
+- VAE accelerate hooks are removed after load; VAE is pinned entirely to cuda:0 at fp16
+- Result: VAE encode/decode runs on GPU (10–20× faster than CPU fallback); transformer pipeline-parallel across both GPUs
 
 No extra configuration needed — just make sure `accelerate` is installed.
 
