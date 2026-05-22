@@ -91,29 +91,13 @@ def _pipe_device(pipe) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def _max_memory_per_gpu(reserve_gib: int = 3) -> dict:
-    """Build a max_memory dict leaving reserve_gib free on each GPU for VAE decode."""
+def _max_memory_per_gpu() -> dict:
+    """Build a max_memory dict covering all visible CUDA GPUs (no CPU entry)."""
     n = torch.cuda.device_count()
     return {
-        i: f"{max(1, torch.cuda.get_device_properties(i).total_memory // 1024**3 - reserve_gib)}GiB"
+        i: f"{torch.cuda.get_device_properties(i).total_memory // 1024**3 - 1}GiB"
         for i in range(n)
     }
-
-
-def _cogvideox_max_memory() -> dict:
-    """双卡加载时的非对称内存限制：cuda:0 多留 4 GiB 给 VAE encode/decode。
-
-    CogVideoX VAE 权重 ~400 MiB，encode 激活峰值 ~844 MiB，合计约 1.3 GiB。
-    cuda:0 限制 transformer 只用到 total-4GiB，cuda:1 限制 total-1GiB。
-    transformer 参数 ~9 GiB（fp16），两卡总配额 (10.5+13.5)=24 GiB 足够。
-    """
-    n = torch.cuda.device_count()
-    result = {}
-    for i in range(n):
-        total_gib = torch.cuda.get_device_properties(i).total_memory // 1024**3
-        reserve = 4 if i == 0 else 1  # cuda:0 多留给 VAE，cuda:1 只留系统余量
-        result[i] = f"{max(1, total_gib - reserve)}GiB"
-    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +132,7 @@ class ModelAdapter(ABC):
         ...
 
     @abstractmethod
-    def encode_image_cond(self, frame_bgr: np.ndarray, video_latent=None) -> Any:
+    def encode_image_cond(self, frame_bgr: np.ndarray) -> Any:
         """将单帧 BGR 图像编码为模型特定的图像条件表示。"""
         ...
 
@@ -252,70 +236,57 @@ class CogVideoXAdapter(ModelAdapter):
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
     def _enable_vae_slicing(self):
-        """启用 VAE 时序切片（仅 slicing，不开 tiling）。
-
-        tiling 会改变 VAE 的空间输出尺寸，导致 latent 与 transformer 期望尺寸不符。
-        slicing 仅在时序方向分块，不影响空间尺寸，是安全的。
-        """
+        """启用 VAE 时序切片以降低显存峰值（CogVideoX VAE 专用）。"""
         vae = self.pipe.vae
         if hasattr(vae, "enable_slicing"):
             vae.enable_slicing()
-        # 不调用 enable_tiling()，保持空间尺寸与模型预期一致
-
-    @staticmethod
-    def _gc():
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    @property
-    def _vae_device(self):
-        """VAE 所在设备：加载后被固定到 cuda:0（双卡时）。"""
-        return next(self.pipe.vae.parameters()).device
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
-        vae_dev = self._vae_device
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
+        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W) BCTHW
         with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()
+            lat = self.pipe.vae.encode(t).latent_dist.sample()      # (1,C,T_lat,lH,lW) BCTHW
         del t
-        self._gc()
-        return (lat * self._video_scale()).to(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return lat * self._video_scale()
+
+    def _offload_transformer(self):
+        """将 transformer 参数移到 CPU，为 VAE decode 释放 VRAM。"""
+        if not torch.cuda.is_available():
+            return
+        import warnings
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.pipe.transformer.to("cpu")
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
+        self._offload_transformer()
         self._enable_vae_slicing()
-        self._gc()
-        vae_dev = self._vae_device
-        lat = (latents / self._video_scale()).to(vae_dev)
+        lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample
+            decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
         return _tensor_to_frames(decoded)
 
-    def encode_image_cond(self, frame_bgr: np.ndarray,
-                          video_latent: torch.Tensor = None) -> torch.Tensor:
-        """返回 (1, C_lat, 1, lH, lW) BCTHW 图像条件潜变量。
+    def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
+        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
 
-        若传入 video_latent，直接切第 0 帧——保证与视频 latent 空间尺寸完全一致，
-        避免因 tiling 差异导致单帧编码和视频编码的输出尺寸不同。
-        否则单独编码 frame_bgr（用于无对应 video_latent 的场景）。
+        与 encode_video 走完全相同的预处理路径，保证空间尺寸与视频 latent 一致。
         """
-        if video_latent is not None:
-            # 直接复用已有的 video latent 第 0 帧，空间尺寸严格一致
-            return video_latent[:, :, :1, :, :].clone()  # (1,C,1,lH,lW)
-
-        self._enable_vae_slicing()
+        # 单帧走和视频完全相同的路径：BGR → (1,C,1,H,W) → VAE → latent
+        img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
         vae = self.pipe.vae
-        vae_dev = self._vae_device
-        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)  # (1,C,1,H,W)
         with torch.no_grad():
             lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
-        del img_t
-        self._gc()
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
-        return (lat * scale).to(self.device)
+        return lat * scale
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
@@ -412,7 +383,7 @@ class WanAdapter(ModelAdapter):
             decoded = self.pipe.vae.decode(lat).sample
         return _tensor_to_frames(decoded)
 
-    def encode_image_cond(self, frame_bgr: np.ndarray, video_latent=None):
+    def encode_image_cond(self, frame_bgr: np.ndarray):
         """双路编码：返回包含 clip_emb 和 vae_latent 的字典。
 
         clip_emb   : (1, N_tokens, D) — 用于 Transformer 交叉注意力
@@ -609,7 +580,7 @@ class WanVACEAdapter(ModelAdapter):
         ctrl = self._pad_control(torch.cat([cond_lat, mask], dim=1))
         return {"control": ctrl, "scale": 1.0}
 
-    def encode_image_cond(self, frame_bgr: np.ndarray, video_latent=None):
+    def encode_image_cond(self, frame_bgr: np.ndarray):
         """构造 VACE control_hidden_states 条件。"""
         # 官方 prepare_video_latents 会对整段 control video 再跑一次 Wan VAE。
         # 在 14-16GB GPU 上这一步容易 OOM；这里只编码第 0 帧并构造轻量 VACE control。
@@ -759,30 +730,19 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     from diffusers import CogVideoXImageToVideoPipeline
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
-        # 策略：transformer 用 balanced 跨双卡，VAE 单独加载到 cuda:0。
-        # 先只加载 transformer（排除 VAE），再手动把 VAE 加到 cuda:0。
-        # max_memory 只限制 transformer 的分配，给 cuda:0 留 2 GiB 给 VAE 权重 + 激活。
-        mem = {
-            0: f"{max(1, torch.cuda.get_device_properties(0).total_memory // 1024**3 - 2)}GiB",
-            1: f"{max(1, torch.cuda.get_device_properties(1).total_memory // 1024**3 - 1)}GiB",
-        }
-        # 先加载 transformer + text encoder（排除 vae）
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
-            device_map="balanced", max_memory=mem,
+            device_map="balanced", max_memory=_max_memory_per_gpu(),
         )
-        # VAE 已被 accelerate 分配到某设备；把 hooks 摘掉、整体移到 cuda:0
-        from accelerate.hooks import remove_hook_from_module
-        remove_hook_from_module(pipe.vae, recurse=True)
-        pipe.vae = pipe.vae.to("cuda:0", dtype=torch.float16)
     else:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         if str(device).startswith("cuda"):
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
-    # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸，不启用
+    # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
     pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
     return pipe
 
 
