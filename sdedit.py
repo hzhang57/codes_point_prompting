@@ -60,11 +60,9 @@ def run_sdedit(
 
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
-    # 直接从已编码的 video latent 切第 0 帧作为正向条件，保证空间尺寸严格一致。
-    # 负向条件单独编码原始帧（无标记），使用与 encode_video 相同路径。
     # ------------------------------------------------------------------ #
-    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
-    cond_original = adapter.encode_image_cond(frame_bgr_original)
+    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0])  # 正向条件
+    cond_original = adapter.encode_image_cond(frame_bgr_original)    # 负向条件
 
     # ------------------------------------------------------------------ #
     # 步骤 3：编码文本提示                                                  #

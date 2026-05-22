@@ -119,7 +119,7 @@ def refine_tracks(
     # 步骤 4：编码条件信息                                                  #
     # ------------------------------------------------------------------ #
     text_cond  = adapter.encode_text(prompt)
-    image_cond = adapter.encode_image_cond(frames_bgr_generated[0], lat_gen)  # 以生成帧第 0 帧为条件
+    image_cond = adapter.encode_image_cond(frames_bgr_generated[0])  # 以生成帧第 0 帧为条件
 
     # ------------------------------------------------------------------ #
     # 步骤 5：仅运行后 γ 比例的去噪步骤（跳过前面已完成的步骤）           #
