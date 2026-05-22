@@ -91,11 +91,11 @@ def _pipe_device(pipe) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def _max_memory_per_gpu() -> dict:
-    """Build a max_memory dict covering all visible CUDA GPUs (no CPU entry)."""
+def _max_memory_per_gpu(reserve_gib: int = 3) -> dict:
+    """Build a max_memory dict leaving reserve_gib free on each GPU for VAE decode."""
     n = torch.cuda.device_count()
     return {
-        i: f"{torch.cuda.get_device_properties(i).total_memory // 1024**3 - 1}GiB"
+        i: f"{max(1, torch.cuda.get_device_properties(i).total_memory // 1024**3 - reserve_gib)}GiB"
         for i in range(n)
     }
 
@@ -255,14 +255,12 @@ class CogVideoXAdapter(ModelAdapter):
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._enable_vae_slicing()
+        import gc; gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
-        # 将 VAE 和 latent 移到 CPU decode，避免与 transformer 争 VRAM
-        vae_cpu = self.pipe.vae.to("cpu")
-        lat_cpu = lat.to(dtype=torch.float32, device="cpu")
         with torch.no_grad():
-            decoded = vae_cpu.decode(lat_cpu).sample  # (1,3,T,H,W)
+            decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
