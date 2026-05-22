@@ -731,42 +731,6 @@ def create_adapter(pipe) -> ModelAdapter:
     return CogVideoXAdapter(pipe)  # 默认为 CogVideoX
 
 
-def _silence_tqdm():
-    """Monkey-patch tqdm so all bars are no-ops during model loading."""
-    import tqdm as _tqdm_mod
-    import tqdm.auto as _tqdm_auto
-    class _SilentTqdm:
-        def __init__(self, *a, **kw): pass
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-        def update(self, *a, **kw): pass
-        def set_description(self, *a, **kw): pass
-        def set_postfix(self, *a, **kw): pass
-        def close(self): pass
-        def __iter__(self): return iter([])
-    _tqdm_mod.tqdm = _SilentTqdm
-    _tqdm_auto.tqdm = _SilentTqdm
-    try:
-        import tqdm.std as _tqdm_std
-        _tqdm_std.tqdm = _SilentTqdm
-    except ImportError:
-        pass
-
-
-def _restore_tqdm():
-    """Restore original tqdm after model loading."""
-    import importlib
-    import tqdm as _tqdm_mod
-    import tqdm.auto as _tqdm_auto
-    importlib.reload(_tqdm_mod)
-    importlib.reload(_tqdm_auto)
-    try:
-        import tqdm.std as _tqdm_std
-        importlib.reload(_tqdm_std)
-    except ImportError:
-        pass
-
-
 def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):  # noqa: C901
     """加载 CogVideoX-5B I2V pipeline（float16）。
 
@@ -782,7 +746,6 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     from accelerate import dispatch_model, infer_auto_device_map
     from accelerate.hooks import remove_hook_from_module
     os.environ["TQDM_DISABLE"] = "1"
-    _silence_tqdm()
     # 始终先加载到 CPU（meta device），再手动分配到 GPU
     # device_map 直接传给 from_pretrained 在部分 diffusers 版本中对 CogVideoX 无效
     pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
@@ -823,7 +786,6 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     if hasattr(pipe.vae, "disable_tiling"):
         pipe.vae.disable_tiling()
     os.environ.pop("TQDM_DISABLE", None)
-    _restore_tqdm()
     return pipe
 
 
@@ -867,7 +829,6 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
 
     import os
     os.environ["TQDM_DISABLE"] = "1"
-    _silence_tqdm()
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
         pipe = pipeline_cls.from_pretrained(
@@ -881,5 +842,4 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
         else:
             pipe = pipe.to(device)
     os.environ.pop("TQDM_DISABLE", None)
-    _restore_tqdm()
     return pipe
