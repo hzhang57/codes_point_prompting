@@ -132,7 +132,7 @@ class ModelAdapter(ABC):
         ...
 
     @abstractmethod
-    def encode_image_cond(self, frame_bgr: np.ndarray) -> Any:
+    def encode_image_cond(self, frame_bgr: np.ndarray, video_latent=None) -> Any:
         """将单帧 BGR 图像编码为模型特定的图像条件表示。"""
         ...
 
@@ -277,13 +277,19 @@ class CogVideoXAdapter(ModelAdapter):
             decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
         return _tensor_to_frames(decoded)
 
-    def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
-        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
+    def encode_image_cond(self, frame_bgr: np.ndarray,
+                          video_latent: torch.Tensor = None) -> torch.Tensor:
+        """返回 (1, C_lat, 1, lH, lW) BCTHW 图像条件潜变量。
 
-        与 encode_video 走完全相同的预处理路径，保证空间尺寸与视频 latent 一致。
+        若传入 video_latent，直接切第 0 帧——保证与视频 latent 空间尺寸完全一致，
+        避免因 tiling 差异导致单帧编码和视频编码的输出尺寸不同。
+        否则单独编码 frame_bgr（用于无对应 video_latent 的场景）。
         """
+        if video_latent is not None:
+            # 直接复用已有的 video latent 第 0 帧，空间尺寸严格一致
+            return video_latent[:, :, :1, :, :].clone()  # (1,C,1,lH,lW)
+
         self._enable_vae_slicing()
-        # 单帧走和视频完全相同的路径：BGR → (1,C,1,H,W) → VAE → latent
         img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
         vae = self.pipe.vae
         with torch.no_grad():
@@ -389,7 +395,7 @@ class WanAdapter(ModelAdapter):
             decoded = self.pipe.vae.decode(lat).sample
         return _tensor_to_frames(decoded)
 
-    def encode_image_cond(self, frame_bgr: np.ndarray):
+    def encode_image_cond(self, frame_bgr: np.ndarray, video_latent=None):
         """双路编码：返回包含 clip_emb 和 vae_latent 的字典。
 
         clip_emb   : (1, N_tokens, D) — 用于 Transformer 交叉注意力
@@ -586,7 +592,7 @@ class WanVACEAdapter(ModelAdapter):
         ctrl = self._pad_control(torch.cat([cond_lat, mask], dim=1))
         return {"control": ctrl, "scale": 1.0}
 
-    def encode_image_cond(self, frame_bgr: np.ndarray):
+    def encode_image_cond(self, frame_bgr: np.ndarray, video_latent=None):
         """构造 VACE control_hidden_states 条件。"""
         # 官方 prepare_video_latents 会对整段 control video 再跑一次 Wan VAE。
         # 在 14-16GB GPU 上这一步容易 OOM；这里只编码第 0 帧并构造轻量 VACE control。
