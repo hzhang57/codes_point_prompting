@@ -253,19 +253,26 @@ class CogVideoXAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @property
+    def _vae_device(self):
+        """VAE 所在设备：加载后被固定到 cuda:0（双卡时）。"""
+        return next(self.pipe.vae.parameters()).device
+
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
-        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)
+        vae_dev = self._vae_device
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
         with torch.no_grad():
             lat = self.pipe.vae.encode(t).latent_dist.sample()
         del t
         self._gc()
-        return lat * self._video_scale()
+        return (lat * self._video_scale()).to(self.device)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._enable_vae_slicing()
         self._gc()
-        lat = latents / self._video_scale()
+        vae_dev = self._vae_device
+        lat = (latents / self._video_scale()).to(vae_dev)
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
         return _tensor_to_frames(decoded)
@@ -284,14 +291,15 @@ class CogVideoXAdapter(ModelAdapter):
 
         self._enable_vae_slicing()
         vae = self.pipe.vae
-        img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
+        vae_dev = self._vae_device
+        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)  # (1,C,1,H,W)
         with torch.no_grad():
             lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
         del img_t
         self._gc()
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
-        return lat * scale
+        return (lat * scale).to(self.device)
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
@@ -735,10 +743,17 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     from diffusers import CogVideoXImageToVideoPipeline
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
+        # VAE 固定在 cuda:0，transformer 跨双卡 balanced 分配。
+        # device_map="balanced" 会把 VAE 也均匀分到两卡，导致 GPU 1 被
+        # transformer 占满后 VAE 激活无法分配，故改用显式 device_map。
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
             device_map="balanced", max_memory=_max_memory_per_gpu(),
         )
+        # 将 VAE 整体迁移到 cuda:0，为 GPU 1 上的 transformer 层腾出空间
+        from accelerate.hooks import remove_hook_from_module
+        remove_hook_from_module(pipe.vae, recurse=True)
+        pipe.vae.to("cuda:0")
     else:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         if str(device).startswith("cuda"):
