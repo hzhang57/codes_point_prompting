@@ -266,6 +266,18 @@ class CogVideoXAdapter(ModelAdapter):
             pass
         torch.cuda.empty_cache()
 
+    def _reload_transformer(self):
+        """将 transformer 移回 GPU（_offload_transformer 的逆操作）。"""
+        if not torch.cuda.is_available():
+            return
+        import warnings
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.pipe.transformer.to(self.device)
+        except Exception:
+            pass
+
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._offload_transformer()
         self._enable_vae_slicing()
@@ -313,6 +325,7 @@ class CogVideoXAdapter(ModelAdapter):
         # noisy_latents: (1, C, T, lH, lW) BCTHW（内部统一格式）
         # image_cond:    (1, C, 1, lH, lW) BCTHW
         # CogVideoX transformer 期望 BTCHW 输入，通道轴拼接后再转换格式
+        self._reload_transformer()  # decode 后可能被卸载到 CPU，先移回 GPU
         _, C, T, lH, lW = noisy_latents.shape
         img_pad = torch.zeros_like(noisy_latents)                      # (1, C, T, lH, lW)
         img_pad[:, :, :image_cond.shape[2], :, :] = image_cond        # 写入第 0 帧
