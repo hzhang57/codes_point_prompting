@@ -253,37 +253,16 @@ class CogVideoXAdapter(ModelAdapter):
             torch.cuda.empty_cache()
         return lat * self._video_scale()
 
-    def _offload_transformer(self):
-        """将 transformer 参数移到 CPU，为 VAE decode 释放 VRAM。"""
-        if not torch.cuda.is_available():
-            return
-        import warnings
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                self.pipe.transformer.to("cpu")
-        except Exception:
-            pass
-        torch.cuda.empty_cache()
-
-    def _reload_transformer(self):
-        """将 transformer 移回 GPU（_offload_transformer 的逆操作）。"""
-        if not torch.cuda.is_available():
-            return
-        import warnings
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                self.pipe.transformer.to(self.device)
-        except Exception:
-            pass
-
     def decode_latents(self, latents: torch.Tensor) -> list:
-        self._offload_transformer()
         self._enable_vae_slicing()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
+        # 将 VAE 和 latent 移到 CPU decode，避免与 transformer 争 VRAM
+        vae_cpu = self.pipe.vae.to("cpu")
+        lat_cpu = lat.to(dtype=torch.float32, device="cpu")
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
+            decoded = vae_cpu.decode(lat_cpu).sample  # (1,3,T,H,W)
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
@@ -325,7 +304,6 @@ class CogVideoXAdapter(ModelAdapter):
         # noisy_latents: (1, C, T, lH, lW) BCTHW（内部统一格式）
         # image_cond:    (1, C, 1, lH, lW) BCTHW
         # CogVideoX transformer 期望 BTCHW 输入，通道轴拼接后再转换格式
-        self._reload_transformer()  # decode 后可能被卸载到 CPU，先移回 GPU
         _, C, T, lH, lW = noisy_latents.shape
         img_pad = torch.zeros_like(noisy_latents)                      # (1, C, T, lH, lW)
         img_pad[:, :, :image_cond.shape[2], :, :] = image_cond        # 写入第 0 帧
