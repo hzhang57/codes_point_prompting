@@ -166,11 +166,6 @@ class PointPrompter:
             tracks, visible = track_marker_sequence(refined, query_model)
             generated = refined
 
-        if sx != 1.0 or sy != 1.0:
-            tracks = tracks.copy()
-            tracks[:, 0] /= sx
-            tracks[:, 1] /= sy
-
         return TrackResult(tracks=tracks, visible=visible, generated_frames=generated)
 
     def track_multiple(

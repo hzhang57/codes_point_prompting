@@ -255,10 +255,8 @@ def main():
     orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
     print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}  fps={src_fps:.2f}")
 
-    # 保留原始帧用于最终可视化（轨迹坐标会被 tracker 反算回原始分辨率）
-    frames_orig = frames
-
-    # 预处理视频到固定分辨率，降低 VAE 编码显存占用；查询点同步缩放到预处理坐标系。
+    # 预处理视频到模型所需分辨率；查询点同步缩放到预处理坐标系。
+    # 输出视频也使用预处理分辨率，无需保留原始分辨率。
     if args.preprocess_width > 0 and args.preprocess_height > 0:
         frames = resize_video(frames, args.preprocess_width, args.preprocess_height)
         query_points = scale_points(
@@ -300,11 +298,10 @@ def main():
     print("正在跟踪…")
     results = tracker.track_multiple(frames, query_points)
 
-    # 可视化轨迹并保存输出视频
-    # 用原始分辨率帧绘制，tracks 已被 tracker 反算回原始坐标系
+    # 可视化轨迹并保存输出视频（预处理分辨率）
     # VAE 时序压缩可能使生成帧数略少于输入帧数，截断对齐
-    n_gen = len(results[0].tracks) if results else len(frames_orig)
-    annotated = draw_tracks(frames_orig[:n_gen], [r.tracks for r in results], [r.visible for r in results])
+    n_gen = len(results[0].tracks) if results else len(frames)
+    annotated = draw_tracks(frames[:n_gen], [r.tracks for r in results], [r.visible for r in results])
     save_video(annotated, args.output, src_fps)
     print(f"已保存至 {args.output}")
 
