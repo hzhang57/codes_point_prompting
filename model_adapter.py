@@ -77,11 +77,12 @@ def _pipe_device(pipe) -> torch.device:
 
     Works whether the pipeline was loaded with .to(device),
     enable_model_cpu_offload(), or device_map="auto".
+    Skips VAE because it may have been moved to CPU by _vae_to_cpu().
     """
     d = getattr(pipe, "_execution_device", None)
     if d is not None:
         return d
-    for attr in ("vae", "transformer", "unet"):
+    for attr in ("transformer", "unet"):  # skip vae — may be on CPU intentionally
         mod = getattr(pipe, attr, None)
         if mod is not None:
             try:
