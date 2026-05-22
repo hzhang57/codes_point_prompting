@@ -236,12 +236,16 @@ class CogVideoXAdapter(ModelAdapter):
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
     def _enable_vae_slicing(self):
-        """启用 VAE 时序切片以降低显存峰值（CogVideoX VAE 专用）。"""
+        """启用 VAE 时序切片（仅 slicing，不开 tiling）。
+
+        tiling 会改变 VAE 空间输出尺寸，并在双卡时把 decode 分散到 GPU 1 导致 OOM。
+        slicing 仅在时序方向分块，不影响空间尺寸，是安全的。
+        """
         vae = self.pipe.vae
         if hasattr(vae, "enable_slicing"):
             vae.enable_slicing()
-        if hasattr(vae, "enable_tiling"):
-            vae.enable_tiling()
+        if hasattr(vae, "disable_tiling"):
+            vae.disable_tiling()
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
@@ -253,32 +257,23 @@ class CogVideoXAdapter(ModelAdapter):
             torch.cuda.empty_cache()
         return lat * self._video_scale()
 
-    def _offload_transformer(self):
-        """将 transformer 参数移到 CPU，为 VAE decode 释放 VRAM。"""
-        if not torch.cuda.is_available():
-            return
-        import warnings
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                self.pipe.transformer.to("cpu")
-        except Exception:
-            pass
-        torch.cuda.empty_cache()
-
     def decode_latents(self, latents: torch.Tensor) -> list:
-        self._offload_transformer()
         self._enable_vae_slicing()
         lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
         return _tensor_to_frames(decoded)
 
-    def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
+    def encode_image_cond(self, frame_bgr: np.ndarray,
+                          video_latent: torch.Tensor = None) -> torch.Tensor:
         """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
 
-        与 encode_video 走完全相同的预处理路径，保证空间尺寸与视频 latent 一致。
+        若传入 video_latent，直接切第 0 帧，保证空间尺寸与视频 latent 严格一致。
+        否则单独编码 frame_bgr。
         """
+        if video_latent is not None:
+            return video_latent[:, :, :1, :, :].clone()
+
         # 单帧走和视频完全相同的路径：BGR → (1,C,1,H,W) → VAE → latent
         img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
         vae = self.pipe.vae
@@ -740,9 +735,10 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
-    # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
+    # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸，不启用
     pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
+    if hasattr(pipe.vae, "disable_tiling"):
+        pipe.vae.disable_tiling()
     return pipe
 
 
