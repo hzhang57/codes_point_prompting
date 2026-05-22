@@ -236,12 +236,16 @@ class CogVideoXAdapter(ModelAdapter):
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
     def _enable_vae_slicing(self):
-        """启用 VAE 时序切片以降低显存峰值（CogVideoX VAE 专用）。"""
+        """启用 VAE 时序切片（仅 slicing，不开 tiling）。
+
+        tiling 会改变 VAE 空间输出尺寸并在多卡时把 decode 分散到 GPU 1 导致 OOM。
+        slicing 仅在时序方向分块，不影响空间尺寸，是安全的。
+        """
         vae = self.pipe.vae
         if hasattr(vae, "enable_slicing"):
             vae.enable_slicing()
-        if hasattr(vae, "enable_tiling"):
-            vae.enable_tiling()
+        if hasattr(vae, "disable_tiling"):
+            vae.disable_tiling()
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
@@ -745,9 +749,10 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
-    # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
+    # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸，不启用
     pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
+    if hasattr(pipe.vae, "disable_tiling"):
+        pipe.vae.disable_tiling()
     return pipe
 
 
