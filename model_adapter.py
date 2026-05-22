@@ -759,16 +759,22 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     from diffusers import CogVideoXImageToVideoPipeline
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
-        # 非对称 max_memory：cuda:0 多留 4 GiB 给 VAE encode/decode 激活，
-        # 使 accelerate balanced 分配时自动把更多 transformer 层放到 cuda:1。
-        # 加载完成后再把 VAE hooks 移除并固定到 cuda:0，确保不被 dispatch 分散。
+        # 策略：transformer 用 balanced 跨双卡，VAE 单独加载到 cuda:0。
+        # 先只加载 transformer（排除 VAE），再手动把 VAE 加到 cuda:0。
+        # max_memory 只限制 transformer 的分配，给 cuda:0 留 2 GiB 给 VAE 权重 + 激活。
+        mem = {
+            0: f"{max(1, torch.cuda.get_device_properties(0).total_memory // 1024**3 - 2)}GiB",
+            1: f"{max(1, torch.cuda.get_device_properties(1).total_memory // 1024**3 - 1)}GiB",
+        }
+        # 先加载 transformer + text encoder（排除 vae）
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
-            device_map="balanced", max_memory=_cogvideox_max_memory(),
+            device_map="balanced", max_memory=mem,
         )
+        # VAE 已被 accelerate 分配到某设备；把 hooks 摘掉、整体移到 cuda:0
         from accelerate.hooks import remove_hook_from_module
         remove_hook_from_module(pipe.vae, recurse=True)
-        pipe.vae.to("cuda:0")
+        pipe.vae = pipe.vae.to("cuda:0", dtype=torch.float16)
     else:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         if str(device).startswith("cuda"):
