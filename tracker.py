@@ -135,7 +135,10 @@ class PointPrompter:
         frame0_marked   = insert_marker(frame0_original, query_model, marker_radius)
         frames_edited   = [frame0_marked] + frames_rb[1:]  # 仅第 0 帧含标记
 
+        total_stages = 2 if cfg.do_refine else 1
+
         # ---- 步骤 3：反事实 SDEdit 生成含标记轨迹的视频 ----
+        print(f"  [阶段 1/{total_stages}] SDEdit 生成（{cfg.num_inference_steps} 步）…")
         generated = run_sdedit(
             adapter=self.adapter,
             frames_bgr_edited=frames_edited,
@@ -149,9 +152,11 @@ class PointPrompter:
 
         # ---- 步骤 4：在生成帧中逐帧检测标记质心 ----
         tracks, visible = track_marker_sequence(generated, query_model)
+        print(f"  [阶段 1/{total_stages}] 完成，可见帧 {visible.sum()}/{len(visible)}")
 
         # ---- 步骤 5：可选 inpainting 精细化 ----
         if cfg.do_refine:
+            print(f"  [阶段 2/{total_stages}] Inpainting 精细化（{cfg.num_inference_steps} 步）…")
             refined = refine_tracks(
                 adapter=self.adapter,
                 frames_bgr_generated=generated,
@@ -165,6 +170,7 @@ class PointPrompter:
             # 在精细化后的帧上重新检测，得到更准确的坐标
             tracks, visible = track_marker_sequence(refined, query_model)
             generated = refined
+            print(f"  [阶段 2/{total_stages}] 完成，可见帧 {visible.sum()}/{len(visible)}")
 
         # 将 tracks 坐标从模型分辨率反算回输入帧分辨率（frames_bgr 的坐标系）
         if sx != 1.0 or sy != 1.0:
