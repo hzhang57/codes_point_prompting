@@ -253,21 +253,50 @@ class CogVideoXAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _vae_on_cpu(self):
+        """将 VAE 权重移到 CPU 并摘掉 accelerate dispatch hooks，返回上下文管理器。"""
+        import contextlib
+        vae = self.pipe.vae
+
+        @contextlib.contextmanager
+        def _ctx():
+            import warnings
+            from accelerate.hooks import remove_hook_from_module, add_hook_to_module, AlignDevicesHook
+            # 保存并移除 hooks
+            saved = {}
+            for name, mod in vae.named_modules():
+                if hasattr(mod, "_hf_hook"):
+                    saved[name] = mod._hf_hook
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                remove_hook_from_module(vae, recurse=True)
+                vae.to("cpu", dtype=torch.float32)
+            try:
+                yield vae
+            finally:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    vae.to(dtype=self.dtype)  # 保持 CPU，dtype 还原即可
+        return _ctx()
+
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
-        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W) BCTHW
-        with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()      # (1,C,T_lat,lH,lW) BCTHW
+        # VAE encode 在 CPU 上运行，避免与 transformer 争 GPU 显存
+        with self._vae_on_cpu() as vae:
+            t = _frames_to_tensor(frames_bgr, "cpu", torch.float32)
+            with torch.no_grad():
+                lat = vae.encode(t).latent_dist.sample()
         del t
         self._gc()
-        return lat * self._video_scale()
+        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._enable_vae_slicing()
         self._gc()
-        lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
-        with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
+        lat = (latents / self._video_scale()).to("cpu", dtype=torch.float32)
+        with self._vae_on_cpu() as vae:
+            with torch.no_grad():
+                decoded = vae.decode(lat).sample
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
