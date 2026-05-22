@@ -236,48 +236,28 @@ class CogVideoXAdapter(ModelAdapter):
         return float(getattr(self.pipe, "vae_scale_factor",
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
-    def _vae_to_cpu(self):
-        """摘除 accelerate hooks 并将 VAE 整体移到 CPU float32（幂等）。
-
-        device_map="balanced" 把 VAE 层分散到两卡；.to("cpu") 被 hooks 拦截
-        无法实际移动，且两卡都被 transformer 占满，VAE encode/decode OOM。
-        摘钩后一次性移到 CPU，encode/decode 全在 CPU 上跑，latent 再回 GPU。
-        """
-        vae = self.pipe.vae
-        if getattr(vae, "_pp_on_cpu", False):
-            return
-        import warnings
-        from accelerate.hooks import remove_hook_from_module
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            remove_hook_from_module(vae, recurse=True)
-            vae.to("cpu", dtype=torch.float32)
-        vae.enable_slicing()
-        if hasattr(vae, "disable_tiling"):
-            vae.disable_tiling()
-        vae._pp_on_cpu = True
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    @property
+    def _vae_device(self) -> torch.device:
+        """VAE 实际所在设备（加载后固定到 cuda:0）。"""
+        return next(self.pipe.vae.parameters()).device
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
-        self._vae_to_cpu()
-        print(f"    VAE encode {len(frames_bgr)} 帧（CPU）…", flush=True)
-        t = _frames_to_tensor(frames_bgr, "cpu", torch.float32)
+        vae_dev = self._vae_device
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
         with torch.no_grad():
             lat = self.pipe.vae.encode(t).latent_dist.sample()
         del t
-        print("    VAE encode 完成", flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
-        self._vae_to_cpu()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("    VAE decode（CPU）…", flush=True)
-        lat = (latents / self._video_scale()).to("cpu", dtype=torch.float32)
+        vae_dev = self._vae_device
+        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
-        print("    VAE decode 完成", flush=True)
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
@@ -285,13 +265,13 @@ class CogVideoXAdapter(ModelAdapter):
         """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
 
         若传入 video_latent，直接切第 0 帧，保证空间尺寸与视频 latent 严格一致。
-        否则单独编码 frame_bgr（VAE 在 CPU 上运行）。
+        否则单独编码 frame_bgr。
         """
         if video_latent is not None:
             return video_latent[:, :, :1, :, :].clone()
 
-        self._vae_to_cpu()
-        img_t = _frames_to_tensor([frame_bgr], "cpu", torch.float32)
+        vae_dev = self._vae_device
+        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
         vae = self.pipe.vae
         with torch.no_grad():
             lat = vae.encode(img_t).latent_dist.sample()
@@ -737,14 +717,33 @@ def create_adapter(pipe) -> ModelAdapter:
 
 
 def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):
-    """加载 CogVideoX-5B I2V pipeline（float16）。"""
+    """加载 CogVideoX-5B I2V pipeline（float16）。
+
+    双卡策略（方案 A）：
+      - cuda:0 限制 10 GiB：逼迫 transformer 大部分层去 cuda:1，
+        为 VAE 权重(0.4G) + encode 激活峰值(0.85G) 留出足够空间。
+      - cuda:1 限制 14 GiB：放 transformer 后半 + T5 text encoder。
+      - 加载完成后摘除 VAE 的 accelerate hooks，整体固定到 cuda:0 fp16，
+        encode/decode 全在 cuda:0 上运行，不再需要 CPU 绕行。
+    """
     from diffusers import CogVideoXImageToVideoPipeline
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
+        total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
+        total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
+        # cuda:0 留 5G 给 VAE + 激活；cuda:1 只留 1G 系统余量
+        mem = {
+            0: f"{max(1, total_0 - 5)}GiB",
+            1: f"{max(1, total_1 - 1)}GiB",
+        }
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
-            device_map="balanced", max_memory=_max_memory_per_gpu(),
+            device_map="balanced", max_memory=mem,
         )
+        # 摘除 accelerate hooks，把 VAE 整体固定到 cuda:0 fp16
+        from accelerate.hooks import remove_hook_from_module
+        remove_hook_from_module(pipe.vae, recurse=True)
+        pipe.vae.to("cuda:0", dtype=torch.float16)
     else:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         if str(device).startswith("cuda"):
