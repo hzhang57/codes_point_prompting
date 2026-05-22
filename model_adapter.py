@@ -261,19 +261,23 @@ class CogVideoXAdapter(ModelAdapter):
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._vae_to_cpu()
+        print(f"    VAE encode {len(frames_bgr)} 帧（CPU）…", flush=True)
         t = _frames_to_tensor(frames_bgr, "cpu", torch.float32)
         with torch.no_grad():
             lat = self.pipe.vae.encode(t).latent_dist.sample()
         del t
+        print("    VAE encode 完成", flush=True)
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._vae_to_cpu()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        print("    VAE decode（CPU）…", flush=True)
         lat = (latents / self._video_scale()).to("cpu", dtype=torch.float32)
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
+        print("    VAE decode 完成", flush=True)
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
