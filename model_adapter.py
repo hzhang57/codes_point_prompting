@@ -779,38 +779,45 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     """
     import os
     from diffusers import DiffusionPipeline
+    from accelerate import dispatch_model, infer_auto_device_map
+    from accelerate.hooks import remove_hook_from_module
     os.environ["TQDM_DISABLE"] = "1"
     _silence_tqdm()
+    # 始终先加载到 CPU（meta device），再手动分配到 GPU
+    # device_map 直接传给 from_pretrained 在部分 diffusers 版本中对 CogVideoX 无效
+    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
         total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
         total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
-        # cuda:0 留 5G 给 VAE + 激活；cuda:1 只留 1G 系统余量
-        mem = {
+        # VAE 固定到 cuda:0（权重 0.4G + encode 激活峰值 ~1G，合计 < 5G）
+        # transformer + text_encoder 用 balanced device_map 跨两卡分配
+        # cuda:0 只给 transformer/text_encoder 留 total_0-5G，剩余给 VAE
+        mem_for_dispatch = {
             0: f"{max(1, total_0 - 5)}GiB",
             1: f"{max(1, total_1 - 1)}GiB",
         }
-        pipe = DiffusionPipeline.from_pretrained(
-            model_id, torch_dtype=torch.float16,
-            device_map="balanced", max_memory=mem,
-        )
-        # 摘除 accelerate hooks，把 VAE 整体固定到 cuda:0 fp16
-        from accelerate.hooks import remove_hook_from_module
-        remove_hook_from_module(pipe.vae, recurse=True)
         pipe.vae.to("cuda:0", dtype=torch.float16)
+        for attr in ("transformer", "text_encoder"):
+            mod = getattr(pipe, attr, None)
+            if mod is None:
+                continue
+            device_map = infer_auto_device_map(mod, max_memory=mem_for_dispatch,
+                                               no_split_module_classes=["CogVideoXBlock",
+                                                                         "CogVideoXTransformerBlock",
+                                                                         "T5Block"])
+            dispatch_model(mod, device_map=device_map)
         # 诊断：确认 VAE 实际所在设备和显存分布
         vae_dev = next(pipe.vae.parameters()).device
         f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
         f1 = torch.cuda.mem_get_info(1)[0] / 1024**3
         print(f"[load] VAE device: {vae_dev}")
-        print(f"[load] GPU 0 free: {f0:.1f} GiB / {torch.cuda.get_device_properties(0).total_memory//1024**3} GiB")
-        print(f"[load] GPU 1 free: {f1:.1f} GiB / {torch.cuda.get_device_properties(1).total_memory//1024**3} GiB")
+        print(f"[load] GPU 0 free: {f0:.1f} GiB / {total_0} GiB")
+        print(f"[load] GPU 1 free: {f1:.1f} GiB / {total_1} GiB")
+    elif str(device).startswith("cuda"):
+        pipe.enable_model_cpu_offload()
     else:
-        pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
-        if str(device).startswith("cuda"):
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe = pipe.to(device)
+        pipe = pipe.to(device)
     # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸且在双卡时 OOM，不启用
     pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "disable_tiling"):
