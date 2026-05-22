@@ -742,6 +742,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         encode/decode 全在 cuda:0 上运行，不再需要 CPU 绕行。
     """
     import os
+    import sys
     from diffusers import DiffusionPipeline
     from accelerate import dispatch_model, infer_auto_device_map
     from accelerate.hooks import remove_hook_from_module
@@ -761,6 +762,13 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             1: f"{max(1, total_1 - 1)}GiB",
         }
         pipe.vae.to("cuda:0", dtype=torch.float16)
+        # 屏蔽 dispatch_model 内部的 "Loading weights" tqdm 进度条
+        try:
+            import accelerate.utils.modeling as _acc_modeling
+            _orig_tqdm = _acc_modeling.tqdm
+            _acc_modeling.tqdm = lambda *a, **kw: _orig_tqdm(*a, **{**kw, "disable": True})
+        except Exception:
+            _orig_tqdm = None
         for attr in ("transformer", "text_encoder"):
             mod = getattr(pipe, attr, None)
             if mod is None:
@@ -770,6 +778,8 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
                                                                          "CogVideoXTransformerBlock",
                                                                          "T5Block"])
             dispatch_model(mod, device_map=device_map)
+        if _orig_tqdm is not None:
+            _acc_modeling.tqdm = _orig_tqdm
         # 诊断：确认 VAE 实际所在设备和显存分布
         vae_dev = next(pipe.vae.parameters()).device
         f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
