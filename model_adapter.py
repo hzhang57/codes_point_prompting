@@ -267,7 +267,6 @@ class CogVideoXAdapter(ModelAdapter):
         torch.cuda.empty_cache()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
-        self._offload_transformer()
         self._enable_vae_slicing()
         lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
         with torch.no_grad():
