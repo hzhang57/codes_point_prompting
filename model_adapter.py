@@ -236,22 +236,15 @@ class CogVideoXAdapter(ModelAdapter):
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
     def _enable_vae_slicing(self):
-        """启用 VAE 时序切片 + 空间分块，降低长视频编解码的显存峰值。"""
+        """启用 VAE 时序切片（仅 slicing，不开 tiling）。
+
+        tiling 会改变 VAE 的空间输出尺寸，导致 latent 与 transformer 期望尺寸不符。
+        slicing 仅在时序方向分块，不影响空间尺寸，是安全的。
+        """
         vae = self.pipe.vae
         if hasattr(vae, "enable_slicing"):
             vae.enable_slicing()
-        if hasattr(vae, "enable_tiling"):
-            vae.enable_tiling()
-        # 缩小空间 tile size（默认 256px），减少单 tile 的激活显存
-        for attr, val in [
-            ("tile_sample_min_height", 128),
-            ("tile_sample_min_width",  128),
-            ("tile_sample_min_num_frames", 16),
-            ("tile_overlap_factor_height", 0.15),
-            ("tile_overlap_factor_width",  0.15),
-        ]:
-            if hasattr(vae, attr):
-                setattr(vae, attr, val)
+        # 不调用 enable_tiling()，保持空间尺寸与模型预期一致
 
     @staticmethod
     def _gc():
@@ -752,9 +745,8 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
-    # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
+    # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸，不启用
     pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
     return pipe
 
 
