@@ -166,6 +166,12 @@ class PointPrompter:
             tracks, visible = track_marker_sequence(refined, query_model)
             generated = refined
 
+        # 将 tracks 坐标从模型分辨率反算回输入帧分辨率（frames_bgr 的坐标系）
+        if sx != 1.0 or sy != 1.0:
+            tracks = tracks.copy()
+            tracks[:, 0] /= sx
+            tracks[:, 1] /= sy
+
         return TrackResult(tracks=tracks, visible=visible, generated_frames=generated)
 
     def track_multiple(

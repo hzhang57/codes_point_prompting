@@ -255,17 +255,21 @@ def main():
     orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
     print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}  fps={src_fps:.2f}")
 
+    # 保留原始帧用于最终可视化
+    frames_orig = [f.copy() for f in frames]
+
     # 预处理视频到模型所需分辨率；查询点同步缩放到预处理坐标系。
-    # 输出视频也使用预处理分辨率，无需保留原始分辨率。
+    pre_w, pre_h = orig_w, orig_h
     if args.preprocess_width > 0 and args.preprocess_height > 0:
-        frames = resize_video(frames, args.preprocess_width, args.preprocess_height)
+        pre_w, pre_h = args.preprocess_width, args.preprocess_height
+        frames = resize_video(frames, pre_w, pre_h)
         query_points = scale_points(
             query_points,
             src_size=(orig_w, orig_h),
-            dst_size=(args.preprocess_width, args.preprocess_height),
+            dst_size=(pre_w, pre_h),
         )
-        print(f"  已预处理到 {args.preprocess_width}×{args.preprocess_height}")
-        print(f"  预处理后查询点：{query_points}")
+        print(f"  已预处理到 {pre_w}×{pre_h}")
+        print(f"  查询点缩放：原始{[(round(x*orig_w/pre_w,1), round(y*orig_h/pre_h,1)) for x,y in query_points]} -> 预处理{[(round(x,1),round(y,1)) for x,y in query_points]}")
 
     device_error = cuda_preflight_error(args.device)
     if device_error is not None:
@@ -298,16 +302,33 @@ def main():
     print("正在跟踪…")
     results = tracker.track_multiple(frames, query_points)
 
-    # 可视化轨迹并保存输出视频（预处理分辨率）
-    # VAE 时序压缩可能使生成帧数略少于输入帧数，截断对齐
-    n_gen = len(results[0].tracks) if results else len(frames)
-    annotated = draw_tracks(frames[:n_gen], [r.tracks for r in results], [r.visible for r in results])
-    save_video(annotated, args.output, src_fps)
-    print(f"已保存至 {args.output}")
+    # 将 tracks 从预处理坐标系反算回原始坐标系，画在原始帧上
+    sx_inv = orig_w / pre_w
+    sy_inv = orig_h / pre_h
+    tracks_orig = []
+    for r in results:
+        t = r.tracks.copy()
+        t[:, 0] *= sx_inv
+        t[:, 1] *= sy_inv
+        tracks_orig.append(t)
 
-    # 打印每个点的可见帧比例统计
+    # 打印每帧坐标：预处理坐标 -> 原始坐标
+    for i, (r, t_orig) in enumerate(zip(results, tracks_orig)):
+        print(f"\n点 {i} 坐标追踪（预处理{pre_w}×{pre_h} -> 原始{orig_w}×{orig_h}）：")
+        for t in range(len(r.tracks)):
+            px, py = r.tracks[t, 0], r.tracks[t, 1]
+            ox, oy = t_orig[t, 0], t_orig[t, 1]
+            vis = "可见" if r.visible[t] else "丢失"
+            print(f"  t={t:02d} [{vis}]  预处理({px:.1f},{py:.1f}) -> 原始({ox:.1f},{oy:.1f})")
+
+    # VAE 时序压缩可能使生成帧数略少于输入帧数，截断对齐
+    n_gen = len(results[0].tracks) if results else len(frames_orig)
+    annotated = draw_tracks(frames_orig[:n_gen], tracks_orig, [r.visible for r in results])
+    save_video(annotated, args.output, src_fps)
+    print(f"\n已保存至 {args.output}（分辨率 {orig_w}×{orig_h}）")
+
     for i, r in enumerate(results):
-        print(f"  点 {i} {query_points[i]}：可见帧占比 {r.visible.mean()*100:.0f}%")
+        print(f"  点 {i}：可见帧占比 {r.visible.mean()*100:.0f}%")
 
 
 if __name__ == "__main__":
