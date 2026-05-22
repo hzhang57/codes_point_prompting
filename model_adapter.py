@@ -312,15 +312,15 @@ class CogVideoXAdapter(ModelAdapter):
             return video_latent[:, :, :1, :, :].clone()  # (1,C,1,lH,lW)
 
         self._enable_vae_slicing()
-        img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
-        vae = self.pipe.vae
-        with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
+        with self._vae_on_cpu() as vae:
+            img_t = _frames_to_tensor([frame_bgr], "cpu", torch.float32)  # (1,C,1,H,W)
+            with torch.no_grad():
+                lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
         del img_t
         self._gc()
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
-        return lat * scale
+        return (lat * scale).to(device=self.device, dtype=self.dtype)
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
