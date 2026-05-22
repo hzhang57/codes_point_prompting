@@ -100,6 +100,22 @@ def _max_memory_per_gpu(reserve_gib: int = 3) -> dict:
     }
 
 
+def _cogvideox_max_memory() -> dict:
+    """双卡加载时的非对称内存限制：cuda:0 多留 4 GiB 给 VAE encode/decode。
+
+    CogVideoX VAE 权重 ~400 MiB，encode 激活峰值 ~844 MiB，合计约 1.3 GiB。
+    cuda:0 限制 transformer 只用到 total-4GiB，cuda:1 限制 total-1GiB。
+    transformer 参数 ~9 GiB（fp16），两卡总配额 (10.5+13.5)=24 GiB 足够。
+    """
+    n = torch.cuda.device_count()
+    result = {}
+    for i in range(n):
+        total_gib = torch.cuda.get_device_properties(i).total_memory // 1024**3
+        reserve = 4 if i == 0 else 1  # cuda:0 多留给 VAE，cuda:1 只留系统余量
+        result[i] = f"{max(1, total_gib - reserve)}GiB"
+    return result
+
+
 # --------------------------------------------------------------------------- #
 #  抽象基类                                                                     #
 # --------------------------------------------------------------------------- #
@@ -743,14 +759,13 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     from diffusers import CogVideoXImageToVideoPipeline
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
-        # VAE 固定在 cuda:0，transformer 跨双卡 balanced 分配。
-        # device_map="balanced" 会把 VAE 也均匀分到两卡，导致 GPU 1 被
-        # transformer 占满后 VAE 激活无法分配，故改用显式 device_map。
+        # 非对称 max_memory：cuda:0 多留 4 GiB 给 VAE encode/decode 激活，
+        # 使 accelerate balanced 分配时自动把更多 transformer 层放到 cuda:1。
+        # 加载完成后再把 VAE hooks 移除并固定到 cuda:0，确保不被 dispatch 分散。
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
-            device_map="balanced", max_memory=_max_memory_per_gpu(),
+            device_map="balanced", max_memory=_cogvideox_max_memory(),
         )
-        # 将 VAE 整体迁移到 cuda:0，为 GPU 1 上的 transformer 层腾出空间
         from accelerate.hooks import remove_hook_from_module
         remove_hook_from_module(pipe.vae, recurse=True)
         pipe.vae.to("cuda:0")
