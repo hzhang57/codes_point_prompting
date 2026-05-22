@@ -77,12 +77,11 @@ def _pipe_device(pipe) -> torch.device:
 
     Works whether the pipeline was loaded with .to(device),
     enable_model_cpu_offload(), or device_map="auto".
-    Skips VAE because it may have been moved to CPU by _vae_to_cpu().
     """
     d = getattr(pipe, "_execution_device", None)
     if d is not None:
         return d
-    for attr in ("transformer", "unet"):  # skip vae — may be on CPU intentionally
+    for attr in ("vae", "transformer", "unet"):
         mod = getattr(pipe, attr, None)
         if mod is not None:
             try:
@@ -236,64 +235,49 @@ class CogVideoXAdapter(ModelAdapter):
         return float(getattr(self.pipe, "vae_scale_factor",
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
-    def _vae_to_cpu(self):
-        """将 VAE 移到 CPU float32 并摘除 accelerate dispatch hooks。
-
-        device_map="balanced" 把 VAE 层分散到两卡；GPU 1 被 transformer 占满，
-        VAE encode/decode 激活无法分配（844 MiB OOM）。
-        解决方案：摘钩 + 整体移到 CPU，encode/decode 全在 CPU 上跑，
-        结果 latent 再移回 GPU 供 transformer 使用。
-        此操作只需执行一次（幂等）。
-        """
+    def _enable_vae_slicing(self):
+        """启用 VAE 时序切片以降低显存峰值（CogVideoX VAE 专用）。"""
         vae = self.pipe.vae
-        if getattr(vae, "_on_cpu", False):
-            return  # 已经在 CPU，跳过
-        import warnings
-        from accelerate.hooks import remove_hook_from_module
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            remove_hook_from_module(vae, recurse=True)
-            vae.to("cpu", dtype=torch.float32)
-        vae.enable_slicing()
-        if hasattr(vae, "disable_tiling"):
-            vae.disable_tiling()
-        vae._on_cpu = True
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
-        self._vae_to_cpu()
-        t = _frames_to_tensor(frames_bgr, "cpu", torch.float32)
+        self._enable_vae_slicing()
+        t = _frames_to_tensor(frames_bgr, self.device, self.dtype)  # (1,C,T,H,W) BCTHW
         with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()
+            lat = self.pipe.vae.encode(t).latent_dist.sample()      # (1,C,T_lat,lH,lW) BCTHW
         del t
-        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return lat * self._video_scale()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
-        self._vae_to_cpu()
-        lat = (latents / self._video_scale()).to("cpu", dtype=torch.float32)
+        self._enable_vae_slicing()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
+        # 将 VAE 和 latent 移到 CPU decode，避免与 transformer 争 VRAM
+        vae_cpu = self.pipe.vae.to("cpu")
+        lat_cpu = lat.to(dtype=torch.float32, device="cpu")
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample
+            decoded = vae_cpu.decode(lat_cpu).sample  # (1,3,T,H,W)
         return _tensor_to_frames(decoded)
 
-    def encode_image_cond(self, frame_bgr: np.ndarray,
-                          video_latent: torch.Tensor = None) -> torch.Tensor:
+    def encode_image_cond(self, frame_bgr: np.ndarray) -> torch.Tensor:
         """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
 
-        若传入 video_latent，直接切第 0 帧，保证空间尺寸与视频 latent 严格一致。
-        否则单独编码 frame_bgr（VAE 在 CPU 上运行）。
+        与 encode_video 走完全相同的预处理路径，保证空间尺寸与视频 latent 一致。
         """
-        if video_latent is not None:
-            return video_latent[:, :, :1, :, :].clone()
-
-        self._vae_to_cpu()
-        img_t = _frames_to_tensor([frame_bgr], "cpu", torch.float32)
+        # 单帧走和视频完全相同的路径：BGR → (1,C,1,H,W) → VAE → latent
+        img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
         vae = self.pipe.vae
         with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()
+            lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
-        return (lat * scale).to(device=self.device, dtype=self.dtype)
+        return lat * scale
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """T5 文本编码，返回 (1, seq_len, D) 嵌入张量。"""
@@ -747,10 +731,9 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
-    # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸，不启用
+    # 降低 VAE 显存峰值：时序切片 + 分块解码（对 CogVideoX 的因果卷积 VAE 有效）
     pipe.vae.enable_slicing()
-    if hasattr(pipe.vae, "disable_tiling"):
-        pipe.vae.disable_tiling()
+    pipe.vae.enable_tiling()
     return pipe
 
 
