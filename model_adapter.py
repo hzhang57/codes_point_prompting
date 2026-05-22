@@ -744,6 +744,13 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         from accelerate.hooks import remove_hook_from_module
         remove_hook_from_module(pipe.vae, recurse=True)
         pipe.vae.to("cuda:0", dtype=torch.float16)
+        # 诊断：确认 VAE 实际所在设备和显存分布
+        vae_dev = next(pipe.vae.parameters()).device
+        f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
+        f1 = torch.cuda.mem_get_info(1)[0] / 1024**3
+        print(f"[load] VAE device: {vae_dev}")
+        print(f"[load] GPU 0 free: {f0:.1f} GiB / {torch.cuda.get_device_properties(0).total_memory//1024**3} GiB")
+        print(f"[load] GPU 1 free: {f1:.1f} GiB / {torch.cuda.get_device_properties(1).total_memory//1024**3} GiB")
     else:
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         if str(device).startswith("cuda"):
