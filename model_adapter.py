@@ -236,12 +236,29 @@ class CogVideoXAdapter(ModelAdapter):
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
     def _enable_vae_slicing(self):
-        """启用 VAE 时序切片以降低显存峰值（CogVideoX VAE 专用）。"""
+        """启用 VAE 时序切片 + 空间分块，降低长视频编解码的显存峰值。"""
         vae = self.pipe.vae
         if hasattr(vae, "enable_slicing"):
             vae.enable_slicing()
         if hasattr(vae, "enable_tiling"):
             vae.enable_tiling()
+        # 缩小空间 tile size（默认 256px），减少单 tile 的激活显存
+        for attr, val in [
+            ("tile_sample_min_height", 128),
+            ("tile_sample_min_width",  128),
+            ("tile_sample_min_num_frames", 16),
+            ("tile_overlap_factor_height", 0.15),
+            ("tile_overlap_factor_width",  0.15),
+        ]:
+            if hasattr(vae, attr):
+                setattr(vae, attr, val)
+
+    @staticmethod
+    def _gc():
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         self._enable_vae_slicing()
@@ -249,15 +266,12 @@ class CogVideoXAdapter(ModelAdapter):
         with torch.no_grad():
             lat = self.pipe.vae.encode(t).latent_dist.sample()      # (1,C,T_lat,lH,lW) BCTHW
         del t
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._gc()
         return lat * self._video_scale()
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         self._enable_vae_slicing()
-        import gc; gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._gc()
         lat = latents / self._video_scale()   # (1,C,T,lH,lW) BCTHW
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample  # (1,3,T,H,W) BCTHW
@@ -268,11 +282,14 @@ class CogVideoXAdapter(ModelAdapter):
 
         与 encode_video 走完全相同的预处理路径，保证空间尺寸与视频 latent 一致。
         """
+        self._enable_vae_slicing()
         # 单帧走和视频完全相同的路径：BGR → (1,C,1,H,W) → VAE → latent
         img_t = _frames_to_tensor([frame_bgr], self.device, self.dtype)  # (1,C,1,H,W)
         vae = self.pipe.vae
         with torch.no_grad():
             lat = vae.encode(img_t).latent_dist.sample()  # (1,C_lat,1,lH,lW) BCTHW
+        del img_t
+        self._gc()
         scale = getattr(self.pipe, "vae_scaling_factor_image",
                         getattr(vae.config, "scaling_factor", 1.0))
         return lat * scale
