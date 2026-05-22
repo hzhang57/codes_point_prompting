@@ -716,7 +716,7 @@ def create_adapter(pipe) -> ModelAdapter:
     return CogVideoXAdapter(pipe)  # 默认为 CogVideoX
 
 
-def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):
+def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):  # noqa: C901
     """加载 CogVideoX-5B I2V pipeline（float16）。
 
     双卡策略（方案 A）：
@@ -726,7 +726,9 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
       - 加载完成后摘除 VAE 的 accelerate hooks，整体固定到 cuda:0 fp16，
         encode/decode 全在 cuda:0 上运行，不再需要 CPU 绕行。
     """
+    import os
     from diffusers import CogVideoXImageToVideoPipeline
+    os.environ["TQDM_DISABLE"] = "1"
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
         total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
@@ -761,6 +763,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
     pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "disable_tiling"):
         pipe.vae.disable_tiling()
+    os.environ.pop("TQDM_DISABLE", None)
     return pipe
 
 
@@ -802,6 +805,8 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
         pipeline_cls = WanImageToVideoPipeline
         pipe_kwargs = dict(torch_dtype=dtype)
 
+    import os
+    os.environ["TQDM_DISABLE"] = "1"
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
         pipe = pipeline_cls.from_pretrained(
@@ -814,4 +819,5 @@ def load_wan_pipe(model_id: str = "Wan-AI/Wan2.1-I2V-14B-480P", device: str = "c
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
+    os.environ.pop("TQDM_DISABLE", None)
     return pipe
