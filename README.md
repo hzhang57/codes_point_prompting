@@ -2,7 +2,7 @@
 
 **v1.0** — 2026-05-23
 
-A zero-shot point tracker based on pre-trained image-conditioned video diffusion models. This is an **unofficial third-party implementation** of the method from the paper [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://arxiv.org/abs/2510.11715).
+A zero-shot point tracker based on pre-trained image-conditioned video diffusion models. This is an implementation of the method from the paper [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://arxiv.org/abs/2510.11715).
 
 ## Changelog
 
@@ -69,16 +69,6 @@ python demo.py --video input.mp4 --points "320,240" \
 # CogVideoX 5B I2V
 python demo.py --video input.mp4 --points "320,240" \
                --model-type cogvideox --model-id THUDM/CogVideoX-5b-I2V
-
-# CogVideoX 5B I2V — fast test (10 frames, no refinement)
-python demo.py --video input.mp4 --points "1157,635" \
-               --model-type cogvideox --model-id THUDM/CogVideoX-5b-I2V \
-               --max-frames 10 --steps 50 --no-refine
-
-# CogVideoX 5B I2V — full run (10 frames, with refinement)
-python demo.py --video input.mp4 --points "1157,635" \
-               --model-type cogvideox --model-id THUDM/CogVideoX-5b-I2V \
-               --max-frames 10 --steps 50
 ```
 
 The output is a video (`tracked.mp4` by default) with the trajectory drawn on the original frames.

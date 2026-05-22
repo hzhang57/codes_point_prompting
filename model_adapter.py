@@ -300,16 +300,6 @@ class CogVideoXAdapter(ModelAdapter):
             return self.pipe._prepare_rotary_positional_embeddings(H * p, W * p, T, self.device)
         return None
 
-    def _ofs_tensor(self, T: int) -> Optional[torch.Tensor]:
-        """CogVideoX 1.5 新增的 ofs（output frame scale）嵌入。
-
-        1.5 版的 Transformer 包含 ofs_proj 层，需要传入帧数作为时间步嵌入。
-        标准 pipeline 将 num_frames - 1 作为 ofs 传入。
-        """
-        if not hasattr(self.pipe.transformer, "ofs_proj"):
-            return None
-        return torch.tensor([T - 1], device=self.device, dtype=self.dtype)
-
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
         # noisy_latents: (1, C, T, lH, lW) BCTHW（内部统一格式）
         # image_cond:    (1, C, 1, lH, lW) BCTHW
@@ -322,20 +312,15 @@ class CogVideoXAdapter(ModelAdapter):
         model_input = model_input.permute(0, 2, 1, 3, 4)              # (1, T, 2C, lH, lW)
 
         ipe = self._rotary_emb(T, lH, lW)
-        ofs = self._ofs_tensor(T)
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
-        kwargs = dict(
+        out = self.pipe.transformer(
             hidden_states=model_input,
             encoder_hidden_states=text_cond,
             timestep=t_b,
             image_rotary_emb=ipe,
             return_dict=False,
         )
-        if ofs is not None:
-            kwargs["ofs"] = ofs
-
-        out = self.pipe.transformer(**kwargs)
         # 输出为 BTCHW: (1, T, C, lH, lW)，转回 BCTHW: (1, C, T, lH, lW)
         return out[0].permute(0, 2, 1, 3, 4)
 
@@ -697,6 +682,7 @@ class WanVACEAdapter(ModelAdapter):
 #  工厂函数                                                                     #
 # --------------------------------------------------------------------------- #
 
+_COGVIDEOX_CLASSES = {"CogVideoXImageToVideoPipeline"}
 _WAN_CLASSES       = {"WanImageToVideoPipeline"}
 _WAN_VACE_CLASSES  = {"WanVACEPipeline"}
 _WAN_I2V_MODEL_HINTS = ("I2V", "Image-to-Video", "ImageToVideo")
@@ -708,13 +694,12 @@ def create_adapter(pipe) -> ModelAdapter:
     """根据 pipeline 类型自动创建对应的 ModelAdapter。
 
     检测顺序：
-      1. 类名前缀匹配：CogVideoX* → CogVideoXAdapter；VACE → WanVACEAdapter；Wan* → WanAdapter
+      1. 类名精确匹配（CogVideoXImageToVideoPipeline / WanImageToVideoPipeline）
       2. 启发式推断：Wan Transformer 的 forward 签名包含 image_embeds 和
          encoder_attention_mask；CogVideoX Transformer 则不含这两个参数。
     """
     cls_name = type(pipe).__name__
-    # CogVideoX 系列：CogVideoXImageToVideoPipeline、CogVideoX1_5ImageToVideoPipeline 等
-    if cls_name.startswith("CogVideo"):
+    if cls_name in _COGVIDEOX_CLASSES:
         return CogVideoXAdapter(pipe)
     if cls_name in _WAN_VACE_CLASSES or "VACE" in cls_name:
         return WanVACEAdapter(pipe)
@@ -742,55 +727,38 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         encode/decode 全在 cuda:0 上运行，不再需要 CPU 绕行。
     """
     import os
-    import sys
-    from diffusers import DiffusionPipeline
-    from accelerate import dispatch_model, infer_auto_device_map
-    from accelerate.hooks import remove_hook_from_module
+    from diffusers import CogVideoXImageToVideoPipeline
     os.environ["TQDM_DISABLE"] = "1"
-    # 始终先加载到 CPU（meta device），再手动分配到 GPU
-    # device_map 直接传给 from_pretrained 在部分 diffusers 版本中对 CogVideoX 无效
-    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
         total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
         total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
-        # VAE 固定到 cuda:0（权重 0.4G + encode 激活峰值 ~1G，合计 < 5G）
-        # transformer + text_encoder 用 balanced device_map 跨两卡分配
-        # cuda:0 只给 transformer/text_encoder 留 total_0-5G，剩余给 VAE
-        mem_for_dispatch = {
+        # cuda:0 留 5G 给 VAE + 激活；cuda:1 只留 1G 系统余量
+        mem = {
             0: f"{max(1, total_0 - 5)}GiB",
             1: f"{max(1, total_1 - 1)}GiB",
         }
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+            model_id, torch_dtype=torch.float16,
+            device_map="balanced", max_memory=mem,
+        )
+        # 摘除 accelerate hooks，把 VAE 整体固定到 cuda:0 fp16
+        from accelerate.hooks import remove_hook_from_module
+        remove_hook_from_module(pipe.vae, recurse=True)
         pipe.vae.to("cuda:0", dtype=torch.float16)
-        # 屏蔽 dispatch_model 内部的 "Loading weights" tqdm 进度条
-        try:
-            import accelerate.utils.modeling as _acc_modeling
-            _orig_tqdm = _acc_modeling.tqdm
-            _acc_modeling.tqdm = lambda *a, **kw: _orig_tqdm(*a, **{**kw, "disable": True})
-        except Exception:
-            _orig_tqdm = None
-        for attr in ("transformer", "text_encoder"):
-            mod = getattr(pipe, attr, None)
-            if mod is None:
-                continue
-            device_map = infer_auto_device_map(mod, max_memory=mem_for_dispatch,
-                                               no_split_module_classes=["CogVideoXBlock",
-                                                                         "CogVideoXTransformerBlock",
-                                                                         "T5Block"])
-            dispatch_model(mod, device_map=device_map)
-        if _orig_tqdm is not None:
-            _acc_modeling.tqdm = _orig_tqdm
         # 诊断：确认 VAE 实际所在设备和显存分布
         vae_dev = next(pipe.vae.parameters()).device
         f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
         f1 = torch.cuda.mem_get_info(1)[0] / 1024**3
         print(f"[load] VAE device: {vae_dev}")
-        print(f"[load] GPU 0 free: {f0:.1f} GiB / {total_0} GiB")
-        print(f"[load] GPU 1 free: {f1:.1f} GiB / {total_1} GiB")
-    elif str(device).startswith("cuda"):
-        pipe.enable_model_cpu_offload()
+        print(f"[load] GPU 0 free: {f0:.1f} GiB / {torch.cuda.get_device_properties(0).total_memory//1024**3} GiB")
+        print(f"[load] GPU 1 free: {f1:.1f} GiB / {torch.cuda.get_device_properties(1).total_memory//1024**3} GiB")
     else:
-        pipe = pipe.to(device)
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+        if str(device).startswith("cuda"):
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(device)
     # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸且在双卡时 OOM，不启用
     pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "disable_tiling"):
