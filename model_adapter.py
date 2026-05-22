@@ -697,7 +697,6 @@ class WanVACEAdapter(ModelAdapter):
 #  工厂函数                                                                     #
 # --------------------------------------------------------------------------- #
 
-_COGVIDEOX_CLASSES = {"CogVideoXImageToVideoPipeline"}
 _WAN_CLASSES       = {"WanImageToVideoPipeline"}
 _WAN_VACE_CLASSES  = {"WanVACEPipeline"}
 _WAN_I2V_MODEL_HINTS = ("I2V", "Image-to-Video", "ImageToVideo")
@@ -709,12 +708,13 @@ def create_adapter(pipe) -> ModelAdapter:
     """根据 pipeline 类型自动创建对应的 ModelAdapter。
 
     检测顺序：
-      1. 类名精确匹配（CogVideoXImageToVideoPipeline / WanImageToVideoPipeline）
+      1. 类名前缀匹配：CogVideoX* → CogVideoXAdapter；VACE → WanVACEAdapter；Wan* → WanAdapter
       2. 启发式推断：Wan Transformer 的 forward 签名包含 image_embeds 和
          encoder_attention_mask；CogVideoX Transformer 则不含这两个参数。
     """
     cls_name = type(pipe).__name__
-    if cls_name in _COGVIDEOX_CLASSES:
+    # CogVideoX 系列：CogVideoXImageToVideoPipeline、CogVideoX1_5ImageToVideoPipeline 等
+    if cls_name.startswith("CogVideo"):
         return CogVideoXAdapter(pipe)
     if cls_name in _WAN_VACE_CLASSES or "VACE" in cls_name:
         return WanVACEAdapter(pipe)
@@ -778,7 +778,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         encode/decode 全在 cuda:0 上运行，不再需要 CPU 绕行。
     """
     import os
-    from diffusers import CogVideoXImageToVideoPipeline
+    from diffusers import DiffusionPipeline
     os.environ["TQDM_DISABLE"] = "1"
     _silence_tqdm()
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
@@ -790,7 +790,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             0: f"{max(1, total_0 - 5)}GiB",
             1: f"{max(1, total_1 - 1)}GiB",
         }
-        pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+        pipe = DiffusionPipeline.from_pretrained(
             model_id, torch_dtype=torch.float16,
             device_map="balanced", max_memory=mem,
         )
@@ -806,7 +806,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         print(f"[load] GPU 0 free: {f0:.1f} GiB / {torch.cuda.get_device_properties(0).total_memory//1024**3} GiB")
         print(f"[load] GPU 1 free: {f1:.1f} GiB / {torch.cuda.get_device_properties(1).total_memory//1024**3} GiB")
     else:
-        pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+        pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         if str(device).startswith("cuda"):
             pipe.enable_model_cpu_offload()
         else:
