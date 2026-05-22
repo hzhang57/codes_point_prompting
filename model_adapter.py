@@ -300,6 +300,16 @@ class CogVideoXAdapter(ModelAdapter):
             return self.pipe._prepare_rotary_positional_embeddings(H * p, W * p, T, self.device)
         return None
 
+    def _ofs_tensor(self, T: int) -> Optional[torch.Tensor]:
+        """CogVideoX 1.5 新增的 ofs（output frame scale）嵌入。
+
+        1.5 版的 Transformer 包含 ofs_proj 层，需要传入帧数作为时间步嵌入。
+        标准 pipeline 将 num_frames - 1 作为 ofs 传入。
+        """
+        if not hasattr(self.pipe.transformer, "ofs_proj"):
+            return None
+        return torch.tensor([T - 1], device=self.device, dtype=self.dtype)
+
     def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
         # noisy_latents: (1, C, T, lH, lW) BCTHW（内部统一格式）
         # image_cond:    (1, C, 1, lH, lW) BCTHW
@@ -312,15 +322,20 @@ class CogVideoXAdapter(ModelAdapter):
         model_input = model_input.permute(0, 2, 1, 3, 4)              # (1, T, 2C, lH, lW)
 
         ipe = self._rotary_emb(T, lH, lW)
+        ofs = self._ofs_tensor(T)
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
-        out = self.pipe.transformer(
+        kwargs = dict(
             hidden_states=model_input,
             encoder_hidden_states=text_cond,
             timestep=t_b,
             image_rotary_emb=ipe,
             return_dict=False,
         )
+        if ofs is not None:
+            kwargs["ofs"] = ofs
+
+        out = self.pipe.transformer(**kwargs)
         # 输出为 BTCHW: (1, T, C, lH, lW)，转回 BCTHW: (1, C, T, lH, lW)
         return out[0].permute(0, 2, 1, 3, 4)
 
