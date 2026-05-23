@@ -54,33 +54,17 @@ For Wan VACE support, make sure your diffusers version exposes `WanVACEPipeline`
 ## Quick Start
 
 ```bash
-# Wan2.1 I2V 1.3B (fits on ~12 GB VRAM, two T4s recommended)
-python demo.py --video input.mp4 --points "320,240" \
-               --model-type wan --model-id Wan-AI/Wan2.1-I2V-1.3B-480P
-
-# Wan2.1 I2V 14B (best quality, needs ~40 GB VRAM)
-python demo.py --video input.mp4 --points "320,240" "640,360" \
-               --model-type wan --model-id Wan-AI/Wan2.1-I2V-14B-480P
-
-# Wan2.1 VACE 1.3B
-python demo.py --video input.mp4 --points "320,240" \
-               --model-type wan --model-id Wan-AI/Wan2.1-VACE-1.3B
-
-# CogVideoX 5B I2V
-python demo.py --video input.mp4 --points "320,240" \
-               --model-type cogvideox --model-id THUDM/CogVideoX-5b-I2V
+!python /kaggle/working/codes_point_prompting/demo.py \
+  --video /kaggle/working/codes_point_prompting/input.mp4 \
+  --points "1157,635" "900,535" \
+  --model-type cogvideox \
+  --model-id THUDM/CogVideoX-5B-I2V \
+  --max-frames 10 \
+  --steps 50
+  #--no-refine
 ```
 
 The output is a video (`tracked.mp4` by default) with the trajectory drawn on the original frames.
-
-### Multiple points
-
-```bash
-python demo.py --video input.mp4 --points "100,200" "400,300" "600,150" \
-               --model-type wan --model-id Wan-AI/Wan2.1-I2V-1.3B-480P
-```
-
-Each point runs through the full pipeline independently.
 
 ## CLI Reference
 
