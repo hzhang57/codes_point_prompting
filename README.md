@@ -2,7 +2,7 @@
 
 **v1.0** — 2026-05-23
 
-A zero-shot point tracker based on pre-trained image-conditioned video diffusion models. This is an implementation of the method from the paper [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://arxiv.org/abs/2510.11715).
+A zero-shot point tracker based on pre-trained image-conditioned video diffusion models. This is an **unofficial third-party implementation** of the method from the paper [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://arxiv.org/abs/2510.11715).
 
 ## Changelog
 
