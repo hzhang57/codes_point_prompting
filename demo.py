@@ -227,6 +227,8 @@ def main():
                         help="模型输入宽高对齐倍数（默认：16）")
     parser.add_argument("--device",  default="cuda",
                         help="计算设备（默认：cuda）")
+    parser.add_argument("--save-generated", action="store_true",
+                        help="将每个点的 SDEdit 生成帧保存为 generated_<i>.mp4，用于调试飘移问题")
     args = parser.parse_args()
 
     # 确定模型 ID 和分辨率（命令行参数优先，否则使用该类型的默认值）
@@ -326,6 +328,24 @@ def main():
     annotated = draw_tracks(frames_orig[:n_gen], tracks_orig, [r.visible for r in results])
     save_video(annotated, args.output, src_fps)
     print(f"\n已保存至 {args.output}（分辨率 {orig_w}×{orig_h}）")
+
+    # 保存生成帧（含标记的原始模型输出，供调试飘移问题）
+    if args.save_generated:
+        for i, r in enumerate(results):
+            gen_path = args.output.replace(".mp4", f"_generated_{i}.mp4")
+            # 生成帧是模型分辨率（pre_w×pre_h），直接保存
+            gen_frames = r.generated_frames
+            if gen_frames:
+                # 在生成帧上叠加检测到的质心位置
+                gen_vis = [f.copy() for f in gen_frames]
+                track_pre = results[i].tracks  # 预处理坐标系
+                for t, (frame, visible) in enumerate(zip(gen_vis, results[i].visible)):
+                    if visible:
+                        cx, cy = int(round(track_pre[t, 0])), int(round(track_pre[t, 1]))
+                        cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)   # 绿色：检测质心
+                        cv2.circle(frame, (cx, cy), 10, (0, 255, 0), 1)   # 外圈
+                save_video(gen_vis, gen_path, src_fps)
+                print(f"  生成帧已保存：{gen_path}（分辨率 {gen_frames[0].shape[1]}×{gen_frames[0].shape[0]}）")
 
     for i, r in enumerate(results):
         print(f"  点 {i}：可见帧占比 {r.visible.mean()*100:.0f}%")
