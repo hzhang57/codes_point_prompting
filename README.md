@@ -1,36 +1,38 @@
 # Point Prompting: Counterfactual Tracking with Video Diffusion Models
 
-**v1.0** — 2026-05-23
+**v2.0** — 2026-05-24
 
-A zero-shot point tracker based on pre-trained image-conditioned video diffusion models. This is an **unofficial third-party implementation** of the method from the paper [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://arxiv.org/abs/2510.11715).
+An unofficial third-party implementation of [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://openreview.net/forum?id=6FFQ007qLX) (ICLR 2026 Poster).
 
 ## Changelog
 
+### v2.0 (2026-05-24)
+- Enable counterfactual guidance loop (paper Eq. 3): `v̂ = (λ+1)·v(c_edited) − λ·v(c_original)`
+- Fix CogVideoX VAE frame count: valid T = 4k+1 (5, 9, 13, …, 49); auto-clip input frames
+- Fix VAE tiling: `enable_slicing()` only — `enable_tiling()` causes checkerboard artifacts
+- Replace all MP4 debug saves with PNG sequences for reliable viewing on Kaggle
+- Fix `refine_gamma`: higher value = less noise = more conservative (was inverted in v1)
+- Debug per-step full-frame decode to verify denoising progress
+
 ### v1.0 (2026-05-23)
-- Full pipeline working end-to-end: color rebalance → marker insert → counterfactual SDEdit → marker detection → inpainting refinement
-- Supports **CogVideoX-5B-I2V** and **Wan2.1-I2V / VACE** backbones via unified `ModelAdapter`
-- Dual-GPU support (2× T4 15 GiB): transformer loaded with `device_map="balanced"`; CogVideoX VAE pinned to cuda:0 via asymmetric `max_memory` to avoid OOM
-- Per-stage progress prints: `[阶段 1/2]` SDEdit, `[阶段 2/2]` refinement
-- Input video preprocessing: auto-resize to model resolution (720×480 for CogVideoX, 832×480 for Wan) with stride alignment; tracks returned in original-frame coordinates
-- `--no-refine` flag to skip refinement and halve runtime
-- `--max-frames` flag to limit frame count and VRAM usage
+- Full pipeline: color rebalance → marker insert → SDEdit → marker detection → inpainting refinement
+- CogVideoX-5B-I2V backbone via unified `ModelAdapter`
+- Dual-GPU support (2× T4 15 GiB)
 
 ## Overview
 
-The key idea: insert a small red circular marker at a query point in frame 0, then use **counterfactual SDEdit** to regenerate the video so the marker propagates naturally through subsequent frames. The marker's centroid in each generated frame gives the track.
+Insert a small red circular marker at a query point in frame 0, then use **counterfactual SDEdit** to regenerate the video so the marker propagates naturally through subsequent frames.
 
 **Pipeline (per query point):**
 
-1. **Color rebalancing** — suppress natural reds in the video (HSV saturation cap at 80 for red-hue pixels) so they don't interfere with marker detection
+1. **Color rebalancing** — suppress natural reds (HSV saturation cap) so they don't interfere with marker detection
 2. **Marker insertion** — draw a 2 px red circle at the query point in frame 0
-3. **Counterfactual SDEdit** — regenerate the video using the marked frame as the positive image condition and the original frame as the negative, with guidance weight λ:
+3. **Counterfactual SDEdit** — regenerate the video with the marked frame as positive condition and the original frame as negative:
    ```
    v̂ = (λ+1) · v(c_edited) − λ · v(c_original)
    ```
-4. **Marker detection** — detect the red marker centroid in each generated frame using HSV thresholding within a local search window
-5. **Inpainting refinement** (optional) — re-denoise a small patch around each detected position at lower noise level γ=0.3 for sub-pixel accuracy
-
-Supports **CogVideoX-5B-I2V** and **Wan2.1-I2V / VACE** backbones.
+4. **Marker detection** — detect red marker centroid per frame via HSV thresholding
+5. **Inpainting refinement** (optional) — re-denoise a small patch around each detected position at lower noise level for sub-pixel accuracy
 
 ## Requirements
 
@@ -44,28 +46,17 @@ pillow>=10.0.0
 numpy>=1.24.0
 ```
 
-Install:
-```bash
-pip install -r requirements.txt
-```
-
-For Wan VACE support, make sure your diffusers version exposes `WanVACEPipeline` (≥0.32.0 recommended).
-
 ## Quick Start
 
 ```bash
-!python /kaggle/working/codes_point_prompting/demo.py \
-  --video /kaggle/working/codes_point_prompting/input.mp4 \
-  --points "1157,635" "900,535" \
-  --model-type cogvideox \
-  --model-id THUDM/CogVideoX-5B-I2V \
-  --max-frames 10 \
-  --steps 50 \
-  --gamma 0.3
-  #--no-refine
+python demo.py \
+  --video input.mp4 \
+  --points "320,240" \
+  --model-id THUDM/CogVideoX-5b-I2V \
+  --max-frames 49
 ```
 
-The output is a video (`tracked.mp4` by default) with the trajectory drawn on the original frames.
+CogVideoX requires T = 4k+1 frames (5, 9, 13, …, 49). `--max-frames 49` matches the VAE's native 49-frame window.
 
 ## CLI Reference
 
@@ -73,100 +64,31 @@ The output is a video (`tracked.mp4` by default) with the trajectory drawn on th
 |---|---|---|
 | `--video` | required | Input video path |
 | `--points` | required | Query point(s) as `x,y` in frame-0 pixel coords |
-| `--model-type` | `wan` | Backbone: `wan` or `cogvideox` |
-| `--model-id` | model-type default | HuggingFace model ID |
+| `--model-id` | `THUDM/CogVideoX-5b-I2V` | HuggingFace model ID |
 | `--output` | `tracked.mp4` | Output video path |
-| `--gamma` | `0.5` | SDEdit noise ratio γ |
-| `--lam` | `8.0` | Counterfactual guidance weight λ |
-| `--steps` | `50` | Number of denoising steps actually executed (paper default) |
-| `--scheduler-steps` | `100` | Total scheduler timesteps; controls timestep granularity (paper default) |
+| `--gamma` | `0.5` | SDEdit noise ratio γ (paper default) |
+| `--lam` | `8.0` | Counterfactual guidance weight λ (paper default) |
+| `--scheduler-steps` | `100` | Total scheduler timesteps (paper default) |
 | `--no-refine` | off | Skip inpainting refinement (faster) |
 | `--seed` | `42` | Random seed |
-| `--max-frames` | `50` | Max frames to process |
-| `--preprocess-width` | `832` | Resize video width before tracking |
-| `--preprocess-height` | `480` | Resize video height before tracking |
+| `--max-frames` | `49` | Max frames; must satisfy T = 4k+1 |
 | `--device` | `cuda` | Compute device |
 
-## Python API
-
-```python
-from model_adapter import load_wan_pipe, create_adapter
-from tracker import PointPrompter, PointPrompterConfig
-import cv2
-
-# Load frames
-cap = cv2.VideoCapture("input.mp4")
-frames = []
-while len(frames) < 50:
-    ret, f = cap.read()
-    if not ret: break
-    frames.append(f)
-cap.release()
-
-# Load model
-pipe    = load_wan_pipe("Wan-AI/Wan2.1-I2V-1.3B-480P")
-tracker = PointPrompter(create_adapter(pipe), PointPrompterConfig(seed=42))
-
-# Track a single point
-result = tracker.track(frames, query_point=(320.0, 240.0))
-print(result.tracks)    # (T, 2) float32 — (x, y) per frame
-print(result.visible)   # (T,)   bool    — whether marker was detected
-
-# Track multiple points
-results = tracker.track_multiple(frames, [(320, 240), (640, 360)])
-```
-
-### PointPrompterConfig
+## PointPrompterConfig
 
 | Parameter | Default | Description |
 |---|---|---|
 | `gamma` | `0.5` | SDEdit noise ratio (paper default) |
 | `lam` | `8.0` | Counterfactual guidance weight (paper default) |
-| `num_inference_steps` | `50` | Denoising steps |
+| `scheduler_steps` | `100` | Total scheduler timesteps |
 | `marker_radius` | `2` | Red marker radius in pixels (paper ablation optimum) |
 | `do_refine` | `True` | Enable inpainting refinement pass |
-| `refine_gamma` | `0.3` | Noise ratio for refinement (< gamma) |
+| `refine_gamma` | `0.7` | Noise ratio for refinement (must be > gamma for less noise) |
 | `prompt` | `""` | Text prompt (paper uses empty string) |
 | `seed` | `None` | Random seed for reproducibility |
 | `model_width` | `832` | Max width fed to diffusion model |
 | `model_height` | `480` | Max height fed to diffusion model |
 | `model_stride` | `16` | Spatial alignment stride |
-
-## Evaluation (TAP-Vid)
-
-```python
-from model_adapter import load_wan_pipe, create_adapter
-from tracker import PointPrompter, PointPrompterConfig
-from eval_tapvid import load_tapvid_davis, evaluate
-
-pipe    = load_wan_pipe("Wan-AI/Wan2.1-I2V-14B-480P")
-tracker = PointPrompter(create_adapter(pipe))
-
-samples = load_tapvid_davis("tapvid_davis.pkl")
-metrics = evaluate(tracker, samples)
-# prints per-video and mean AJ / δ_avg^x / OA
-```
-
-Metrics follow the TAP-Vid protocol (Doersch et al., 2022):
-- **AJ** (Average Jaccard) — joint position accuracy and occlusion prediction
-- **δ_avg^x** — position accuracy averaged over thresholds 1/2/4/8/16 px
-- **OA** (Occlusion Accuracy) — frame-level occlusion prediction accuracy
-
-## Multi-GPU Setup
-
-`load_wan_pipe` and `load_cogvideox_pipe` automatically detect the number of available GPUs.
-
-**Wan:**
-- **2+ GPUs**: `device_map="balanced"` spreads transformer layers across all GPUs
-- **1 GPU**: `enable_model_cpu_offload()`
-
-**CogVideoX (dual T4 15 GiB):**
-- Asymmetric `max_memory`: cuda:0 gets `total-5 GiB`, cuda:1 gets `total-1 GiB`
-- This forces most transformer layers onto cuda:1, leaving ~5 GiB free on cuda:0
-- VAE accelerate hooks are removed after load; VAE is pinned entirely to cuda:0 at fp16
-- Result: VAE encode/decode runs on GPU (10–20× faster than CPU fallback); transformer pipeline-parallel across both GPUs
-
-No extra configuration needed — just make sure `accelerate` is installed.
 
 ## File Structure
 
@@ -177,17 +99,18 @@ No extra configuration needed — just make sure `accelerate` is installed.
 ├── marker.py          # Red marker insertion and detection
 ├── color_rebalance.py # HSV saturation clamp for natural reds
 ├── refinement.py      # Inpainting refinement pass
-├── model_adapter.py   # Unified adapter for CogVideoX / Wan I2V / Wan VACE
-├── eval_tapvid.py     # TAP-Vid benchmark evaluation
+├── model_adapter.py   # CogVideoX adapter + pipeline loader
 └── requirements.txt
 ```
 
 ## Reference
 
 ```bibtex
-@article{pointprompting2024,
-  title   = {Point Prompting: Counterfactual Tracking with Video Diffusion Models},
-  year    = {2024},
-  url     = {https://arxiv.org/abs/2510.11715}
+@inproceedings{shrivastava2026pointprompting,
+  title     = {Point Prompting: Counterfactual Tracking with Video Diffusion Models},
+  author    = {Shrivastava, Ayush and Mehta, Sanyam and Geng, Daniel and Owens, Andrew},
+  booktitle = {ICLR},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=6FFQ007qLX}
 }
 ```
