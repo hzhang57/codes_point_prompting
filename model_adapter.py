@@ -289,7 +289,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
       - 加载完成后摘除 VAE 的 accelerate hooks，整体固定到 cuda:0 fp16
     """
     import os
-    from diffusers import CogVideoXImageToVideoPipeline, CogVideoXDPMScheduler
+    from diffusers import CogVideoXImageToVideoPipeline, CogVideoXDDIMScheduler
     os.environ["TQDM_DISABLE"] = "1"
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
     if n_gpus >= 2:
@@ -318,7 +318,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
-    pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = CogVideoXDDIMScheduler.from_config(pipe.scheduler.config)
     pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "disable_tiling"):
         pipe.vae.disable_tiling()
