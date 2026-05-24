@@ -78,7 +78,8 @@ The output is a video (`tracked.mp4` by default) with the trajectory drawn on th
 | `--output` | `tracked.mp4` | Output video path |
 | `--gamma` | `0.5` | SDEdit noise ratio γ |
 | `--lam` | `8.0` | Counterfactual guidance weight λ |
-| `--steps` | `50` | Diffusion denoising steps |
+| `--steps` | `50` | Number of denoising steps actually executed (paper default) |
+| `--scheduler-steps` | `100` | Total scheduler timesteps; controls timestep granularity (paper default) |
 | `--no-refine` | off | Skip inpainting refinement (faster) |
 | `--seed` | `42` | Random seed |
 | `--max-frames` | `50` | Max frames to process |

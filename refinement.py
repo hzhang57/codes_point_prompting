@@ -67,6 +67,7 @@ def refine_tracks(
     tracks: np.ndarray,              # (T, 2) 粗跟踪阶段检测到的标记坐标
     gamma: float = 0.3,              # 精细化加噪比例，小于主 SDEdit 的 γ
     num_inference_steps: int = 50,
+    scheduler_steps: int = 100,
     prompt: str = "",
     generator: Optional[torch.Generator] = None,
 ) -> list:
@@ -124,10 +125,10 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 5：仅运行后 γ 比例的去噪步骤（跳过前面已完成的步骤）           #
     # ------------------------------------------------------------------ #
-    adapter.set_timesteps(num_inference_steps)
+    adapter.set_timesteps(scheduler_steps)
     timesteps     = adapter.timesteps
-    t_start_idx   = max(0, int((1.0 - gamma) * num_inference_steps))
-    timesteps_run = timesteps[t_start_idx:]
+    t_start_idx   = max(0, int((1.0 - gamma) * scheduler_steps))
+    timesteps_run = timesteps[t_start_idx: t_start_idx + num_inference_steps]
 
     latents = lat_start.clone()
 

@@ -208,7 +208,9 @@ def main():
     parser.add_argument("--lam",     type=float, default=8.0,
                         help="反事实引导权重 λ（默认：8.0）")
     parser.add_argument("--steps",   type=int,   default=50,
-                        help="扩散模型去噪总步数（默认：50）")
+                        help="实际执行的去噪步数（默认：50，论文值）")
+    parser.add_argument("--scheduler-steps", type=int, default=100,
+                        help="调度器总步数，决定时间步粒度（默认：100，论文值）")
     parser.add_argument("--no-refine", action="store_true",
                         help="跳过 inpainting 精细化步骤（速度更快但精度略低）")
     parser.add_argument("--seed",    type=int,   default=42,
@@ -292,6 +294,7 @@ def main():
         gamma=args.gamma,
         lam=args.lam,
         num_inference_steps=args.steps,
+        scheduler_steps=args.scheduler_steps,
         do_refine=not args.no_refine,
         seed=args.seed,
         model_width=args.model_width,

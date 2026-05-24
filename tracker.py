@@ -38,17 +38,18 @@ class TrackResult:
 @dataclass
 class PointPrompterConfig:
     """跟踪器超参数配置。"""
-    gamma: float = 0.5           # SDEdit 加噪比例（论文默认 0.5）
-    lam: float = 8.0             # 反事实引导权重 λ（论文默认 8）
-    num_inference_steps: int = 50  # 扩散模型去噪总步数
+    gamma: float = 0.5             # SDEdit 加噪比例（论文默认 0.5）
+    lam: float = 8.0               # 反事实引导权重 λ（论文默认 8）
+    num_inference_steps: int = 50  # 实际执行的去噪步数（论文默认 50）
+    scheduler_steps: int = 100     # 调度器总步数，决定时间步粒度（论文默认 100）
     marker_radius: int = 2         # 插入标记的圆形半径（像素）；论文消融最优值为 2px
     do_refine: bool = True         # 是否执行 inpainting 精细化
     refine_gamma: float = 0.3      # 精细化阶段的加噪比例（< gamma）
     prompt: str = ""               # 文本提示（论文零样本设置为空字符串）
     seed: Optional[int] = None     # 随机种子，None 表示不固定
-    model_width: int = 832          # 扩散模型输入的最大宽度，防止高分辨率视频 OOM
-    model_height: int = 480         # 扩散模型输入的最大高度，防止高分辨率视频 OOM
-    model_stride: int = 16          # 模型输入尺寸对齐倍数
+    model_width: int = 832         # 扩散模型输入的最大宽度，防止高分辨率视频 OOM
+    model_height: int = 480        # 扩散模型输入的最大高度，防止高分辨率视频 OOM
+    model_stride: int = 16         # 模型输入尺寸对齐倍数
 
 
 def _aligned_size(width: int, height: int, max_width: int, max_height: int, stride: int) -> Tuple[int, int]:
@@ -146,6 +147,7 @@ class PointPrompter:
             gamma=cfg.gamma,
             lam=cfg.lam,
             num_inference_steps=cfg.num_inference_steps,
+            scheduler_steps=cfg.scheduler_steps,
             prompt=cfg.prompt,
             generator=gen,
         )
@@ -164,6 +166,7 @@ class PointPrompter:
                 tracks=tracks,
                 gamma=cfg.refine_gamma,
                 num_inference_steps=cfg.num_inference_steps,
+                scheduler_steps=cfg.scheduler_steps,
                 prompt=cfg.prompt,
                 generator=gen,
             )

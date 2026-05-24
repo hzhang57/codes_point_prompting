@@ -32,6 +32,7 @@ def run_sdedit(
     gamma: float = 0.5,
     lam: float = 8.0,
     num_inference_steps: int = 50,
+    scheduler_steps: int = 100,
     prompt: str = "",
     generator: Optional[torch.Generator] = None,
 ) -> list:
@@ -43,7 +44,8 @@ def run_sdedit(
         frame_bgr_original:  不含标记的原始 frame[0]（用于负向条件）
         gamma:               SDEdit 加噪比例 γ ∈ (0, 1]，越大生成越自由
         lam:                 反事实引导权重 λ，越大标记越显著
-        num_inference_steps: 总去噪步数
+        num_inference_steps: 实际执行的去噪步数（论文：50）
+        scheduler_steps:     调度器总步数，决定时间步粒度（论文：100）
         prompt:              文本提示（论文零样本设置为空字符串）
         generator:           可复现性用的随机数生成器
 
@@ -74,13 +76,14 @@ def run_sdedit(
     # 步骤 4：在 t ≈ γ·T_max 处加噪（Flow Matching SDEdit 前向过程）      #
     # x_t = (1-γ)·x_0 + γ·ε                                             #
     # ------------------------------------------------------------------ #
+    # 用 scheduler_steps 建立完整时间步序列，从中切出起始位置
     noise = torch.randn_like(latents_clean, generator=generator)
-    adapter.set_timesteps(num_inference_steps)
-    timesteps = adapter.timesteps  # 从大到小的时间步序列
+    adapter.set_timesteps(scheduler_steps)
+    timesteps = adapter.timesteps  # 从大到小，共 scheduler_steps 个时间步
 
-    # 根据 γ 找到去噪的起始时间步索引（跳过已经足够干净的步骤）
-    t_start_idx    = max(0, int((1.0 - gamma) * num_inference_steps))
-    timesteps_run  = timesteps[t_start_idx:]
+    # 根据 γ 在完整序列中找起始索引，然后只取后 num_inference_steps 步去噪
+    t_start_idx = max(0, int((1.0 - gamma) * scheduler_steps))
+    timesteps_run = timesteps[t_start_idx: t_start_idx + num_inference_steps]
 
     # 加噪比例 = 起始时间步 / 最大时间步 ≈ gamma（对非均匀调度器更鲁棒）
     t_val  = timesteps[t_start_idx].float()
