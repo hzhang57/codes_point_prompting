@@ -109,13 +109,25 @@ def run_sdedit(
         noise,
         t_start[None] if t_start.ndim == 0 else t_start,
     )
+    # [DEBUG] 打印 add_noise 内部实际使用的 sigma/alpha（flow matching: x_t = (1-sigma)*x0 + sigma*noise）
+    _t_norm = t_start.item() / 1000.0  # 归一化到 [0,1]
+    print(f"[DEBUG] t_start={t_start.item():.1f} t_norm={_t_norm:.3f}")
+    print(f"[DEBUG] 期望 flow-matching 混合: content={(1-_t_norm):.3f} noise={_t_norm:.3f}")
+    print(f"[DEBUG] latents_clean norm: {latents_clean.norm():.3f}  noise norm: {noise.norm():.3f}")
     print(f"[DEBUG] latents after add_noise: "
-          f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
+          f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f} norm={latents.norm():.3f}")
+
+    # [DEBUG] 手动线性插值对照组（flow matching 公式）
+    _manual_noisy = (1 - _t_norm) * latents_clean + _t_norm * noise
+    print(f"[DEBUG] manual lerp latents:    "
+          f"min={_manual_noisy.min():.3f} max={_manual_noisy.max():.3f} norm={_manual_noisy.norm():.3f}")
+    _manual_frames = adapter.decode_latents(_manual_noisy)
+    _save_debug_video(_manual_frames, "debug_noisy_manual.mp4")
 
     # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
     _noisy_frames = adapter.decode_latents(latents)
     _save_debug_video(_noisy_frames, "debug_noisy_input.mp4")
-    print(f"[DEBUG] debug_noisy_input.mp4 saved — 应看到加噪后的模糊帧")
+    print(f"[DEBUG] debug_noisy_input.mp4 (scheduler) / debug_noisy_manual.mp4 (manual lerp) saved")
 
     # 从 start_idx 去噪到序列末尾（共 scheduler_steps - start_idx 步）
     timesteps_run = timesteps[start_idx:]
