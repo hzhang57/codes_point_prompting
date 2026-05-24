@@ -18,12 +18,24 @@ Point Prompting 核心：带反事实增强引导的 SDEdit 去噪。
 
 from __future__ import annotations
 
+import os
 import torch
 import numpy as np
 import cv2
 from typing import Optional
 
 from model_adapter import ModelAdapter
+
+
+def _save_frames(frames: list, prefix: str) -> None:
+    """将帧列表保存为一组 PNG：{prefix}_000.png, {prefix}_001.png, ..."""
+    if not frames:
+        return
+    os.makedirs(os.path.dirname(prefix) if os.path.dirname(prefix) else ".", exist_ok=True)
+    for i, f in enumerate(frames):
+        path = f"{prefix}_{i:03d}.png"
+        cv2.imwrite(path, f)
+    print(f"[DEBUG] saved {len(frames)} PNGs → {prefix}_000.png … {prefix}_{len(frames)-1:03d}.png")
 
 
 def run_sdedit(
@@ -61,9 +73,9 @@ def run_sdedit(
     print(f"[DEBUG] latents_clean: shape={latents_clean.shape} "
           f"min={latents_clean.min():.3f} max={latents_clean.max():.3f} mean={latents_clean.mean():.3f}")
 
-    # [DEBUG] 存输入帧作为参考（含标记的原始输入）
-    _save_debug_video(frames_bgr_edited, "debug_input_frames.mp4")
-    print(f"[DEBUG] debug_input_frames.mp4 saved ({len(frames_bgr_edited)} frames)")
+    # [DEBUG] 存输入帧（含标记的原始输入）
+    _save_frames(frames_bgr_edited, "debug_input_frames")
+    print(f"[DEBUG] debug_input_frames saved ({len(frames_bgr_edited)} frames)")
 
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
@@ -109,8 +121,7 @@ def run_sdedit(
         noise,
         t_start[None] if t_start.ndim == 0 else t_start,
     )
-    # [DEBUG] 打印 add_noise 内部实际使用的 sigma/alpha（flow matching: x_t = (1-sigma)*x0 + sigma*noise）
-    _t_norm = t_start.item() / 1000.0  # 归一化到 [0,1]
+    _t_norm = t_start.item() / 1000.0
     print(f"[DEBUG] t_start={t_start.item():.1f} t_norm={_t_norm:.3f}")
     print(f"[DEBUG] 期望 flow-matching 混合: content={(1-_t_norm):.3f} noise={_t_norm:.3f}")
     print(f"[DEBUG] latents_clean norm: {latents_clean.norm():.3f}  noise norm: {noise.norm():.3f}")
@@ -118,8 +129,8 @@ def run_sdedit(
           f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f} norm={latents.norm():.3f}")
 
     # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
-    _save_debug_video(adapter.decode_latents(latents), "debug_noisy_input.mp4")
-    print(f"[DEBUG] debug_noisy_input.mp4 saved")
+    _save_frames(adapter.decode_latents(latents), "debug_noisy_input")
+    print(f"[DEBUG] debug_noisy_input saved")
 
     # 从 start_idx 去噪到序列末尾（共 scheduler_steps - start_idx 步）
     timesteps_run = timesteps[start_idx:]
@@ -127,7 +138,7 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     # 步骤 5：普通去噪循环（DEBUG：跳过反事实引导，验证去噪本身是否正常）   #
     # ------------------------------------------------------------------ #
-    print(f"[DEBUG] timesteps_run: {timesteps_run.cpu().numpy()}")  # 打印实际去噪的时间步列表
+    print(f"[DEBUG] timesteps_run: {timesteps_run.cpu().numpy()}")
     for i, t in enumerate(timesteps_run):
         t_batch = t.unsqueeze(0).to(device)
         t_next  = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
@@ -137,7 +148,6 @@ def run_sdedit(
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
                   f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
-            # 取第 0 帧 latent 解码并保存，观察去噪过程中第一帧的恢复情况
             _f0 = adapter.decode_latents(latents[:, :, :1, :, :])[0]
             cv2.imwrite(f"debug_step_{i+1:03d}_frame0.png", _f0)
 
@@ -159,33 +169,6 @@ def run_sdedit(
     # 步骤 6：解码潜变量 → 像素帧                                          #
     # ------------------------------------------------------------------ #
     print(f"[DEBUG] final latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
-    return adapter.decode_latents(latents)
-
-
-def _save_debug_video(frames: list, path: str, fps: float = 8.0) -> None:
-    """将帧列表保存为 mp4，并额外保存首帧 PNG 用于直观验证。"""
-    if not frames:
-        return
-    f0 = frames[0]
-    print(f"[DEBUG] _save_debug_video: {len(frames)} frames, frame0 shape={f0.shape} dtype={f0.dtype} "
-          f"min={f0.min()} max={f0.max()}")
-    # 保存首帧 PNG（最可靠的格式，不受 codec 影响）
-    png_path = path.replace(".mp4", "_frame0.png")
-    cv2.imwrite(png_path, f0)
-    print(f"[DEBUG] saved {png_path}")
-    # 保存中间帧 PNG
-    mid = len(frames) // 2
-    png_mid = path.replace(".mp4", f"_frame{mid}.png")
-    cv2.imwrite(png_mid, frames[mid])
-    print(f"[DEBUG] saved {png_mid}")
-
-    H, W = f0.shape[:2]
-    # 优先尝试 avc1（H.264），fallback 到 mp4v
-    for fourcc_str in ("avc1", "mp4v"):
-        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc_str), fps, (W, H))
-        if writer.isOpened():
-            break
-    for f in frames:
-        writer.write(f)
-    writer.release()
-    print(f"[DEBUG] saved {path} ({len(frames)} frames, codec={fourcc_str})")
+    frames_out = adapter.decode_latents(latents)
+    _save_frames(frames_out, "debug_output_frames")
+    return frames_out
