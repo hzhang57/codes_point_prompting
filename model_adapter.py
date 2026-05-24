@@ -184,10 +184,8 @@ class CogVideoXAdapter(ModelAdapter):
         return self.pipe.scheduler
 
     def _video_scale(self) -> float:
-        # 官方 CogVideoX pipeline 用 vae_scaling_factor_image 做 latent 数值归一化
-        # vae_scale_factor 是空间下采样因子（整数 8），不是数值 scale，不能用
-        return float(getattr(self.pipe, "vae_scaling_factor_image",
-                     getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
+        # [DEBUG] 测试 scale=1.0，验证 VAE encode/decode 不需要手动 scale
+        return 1.0
 
     @property
     def _vae_device(self) -> torch.device:
