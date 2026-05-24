@@ -352,15 +352,9 @@ class WanVACEAdapter(ModelAdapter):
             lat = self.pipe.vae.encode(img_t).latent_dist.mean
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
-    def encode_text(self, prompt: str) -> torch.Tensor:
-        # Wan 用 T5 文本编码器
-        tok = self.pipe.tokenizer(
-            prompt, return_tensors="pt", padding="max_length",
-            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
-        ).to(self.device)
-        with torch.no_grad():
-            emb = self.pipe.text_encoder(**tok).last_hidden_state
-        return emb.to(self.dtype)
+    def encode_text(self, prompt: str) -> Optional[torch.Tensor]:  # noqa: ARG002
+        # T5 未加载（Point Prompting 用空 prompt），返回 None
+        return None
 
     def _build_control(
         self,
@@ -399,13 +393,16 @@ class WanVACEAdapter(ModelAdapter):
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
         # WanTransformer3DModel forward：BCTHW 输入，不需要 permute
-        out = self.pipe.transformer(
+        # text_cond=None 时不传 encoder_hidden_states（textless 模式）
+        kwargs = dict(
             hidden_states=noisy_latents,
             timestep=t_b,
-            encoder_hidden_states=text_cond,
             control_hidden_states=control_hidden_states,
             return_dict=False,
         )
+        if text_cond is not None:
+            kwargs["encoder_hidden_states"] = text_cond
+        out = self.pipe.transformer(**kwargs)
         return out[0]  # (1, C, lT, lH, lW) BCTHW
 
 
@@ -423,41 +420,44 @@ def create_adapter(pipe) -> ModelAdapter:
 
 def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
                        device: str = "cuda") -> Any:
-    """加载 Wan2.1-VACE-1.3B pipeline（bfloat16）。
+    """加载 Wan2.1-VACE-1.3B pipeline（bfloat16），跳过 T5 文本编码器。
 
-    1.3B 参数量约 2-3GB，T5 文本编码器约 9.4GB，
-    2×T4 共 30GB 可以跑（transformer + T5 分布在两卡，VAE 固定在 cuda:0）。
+    Point Prompting 使用空字符串 prompt，不需要文本编码器。
+    跳过 T5 节省约 9.4GB 显存，transformer(2.6GB) + VAE(1GB) 轻松放入单卡。
     """
     import os
     from diffusers import WanVACEPipeline
     os.environ["TQDM_DISABLE"] = "1"
-    n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
-    if n_gpus >= 2:
-        total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
-        total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
-        mem = {
-            0: f"{max(1, total_0 - 5)}GiB",
-            1: f"{max(1, total_1 - 1)}GiB",
-        }
-        pipe = WanVACEPipeline.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16,
-            device_map="balanced", max_memory=mem,
-        )
-        from accelerate.hooks import remove_hook_from_module
-        remove_hook_from_module(pipe.vae, recurse=True)
-        pipe.vae.to("cuda:0", dtype=torch.bfloat16)
-        vae_dev = next(pipe.vae.parameters()).device
-        f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
-        f1 = torch.cuda.mem_get_info(1)[0] / 1024**3
-        print(f"[load] VAE device: {vae_dev}")
-        print(f"[load] GPU 0 free: {f0:.1f} GiB / {total_0} GiB")
-        print(f"[load] GPU 1 free: {f1:.1f} GiB / {total_1} GiB")
-    else:
-        pipe = WanVACEPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-        if str(device).startswith("cuda"):
-            pipe.enable_model_cpu_offload()
+
+    pipe = WanVACEPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        text_encoder=None,   # 跳过 T5，节省 ~9.4GB 显存
+        tokenizer=None,
+    )
+
+    if str(device).startswith("cuda"):
+        n_gpus = torch.cuda.device_count()
+        if n_gpus >= 2:
+            # transformer 分布到两卡，VAE 固定在 cuda:0
+            try:
+                from accelerate import dispatch_model, infer_auto_device_map
+                total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
+                total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
+                mem = {0: f"{max(1, total_0 - 3)}GiB", 1: f"{max(1, total_1 - 3)}GiB"}
+                device_map = infer_auto_device_map(pipe.transformer, max_memory=mem)
+                pipe.transformer = dispatch_model(pipe.transformer, device_map=device_map)
+            except Exception as e:
+                print(f"[load] transformer dispatch skipped ({e}), using cuda:0")
+                pipe.transformer.to("cuda:0")
         else:
-            pipe = pipe.to(device)
+            pipe.transformer.to("cuda:0")
+        pipe.vae.to("cuda:0", dtype=torch.bfloat16)
+        for i in range(n_gpus if n_gpus >= 2 else 1):
+            free = torch.cuda.mem_get_info(i)[0] / 1024**3
+            total = torch.cuda.get_device_properties(i).total_memory // 1024**3
+            print(f"[load] GPU {i} free: {free:.1f} GiB / {total} GiB")
+
     pipe.vae.enable_slicing()
     os.environ.pop("TQDM_DISABLE", None)
     return pipe
