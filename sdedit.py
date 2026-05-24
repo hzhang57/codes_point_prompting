@@ -63,10 +63,9 @@ def run_sdedit(
 
     # [DEBUG] 验证 VAE encode→decode 重建质量（无任何去噪，直接解码干净 latent）
     _clean_frames = adapter.decode_latents(latents_clean)
-    print(f"[DEBUG] VAE reconstruct: {len(_clean_frames)} frames, frame0 shape={_clean_frames[0].shape}")
-    for _fi, _ff in enumerate(_clean_frames):
-        cv2.imwrite(f"debug_vae_reconstruct_frame{_fi}.png", _ff)
-    print(f"[DEBUG] debug_vae_reconstruct_frame*.png saved — 应与输入帧接近")
+    print(f"[DEBUG] VAE reconstruct: {len(_clean_frames)} frames decoded")
+    _save_debug_video(_clean_frames, "debug_vae_reconstruct.mp4")
+    print(f"[DEBUG] debug_vae_reconstruct.mp4 saved — 应与输入帧接近")
 
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
@@ -121,8 +120,8 @@ def run_sdedit(
           f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f} norm={latents.norm():.3f}")
 
     # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
-    cv2.imwrite("debug_noisy_frame0.png", adapter.decode_latents(latents)[0])
-    print(f"[DEBUG] debug_noisy_frame0.png saved")
+    _save_debug_video(adapter.decode_latents(latents), "debug_noisy_input.mp4")
+    print(f"[DEBUG] debug_noisy_input.mp4 saved")
 
     # 从 start_idx 去噪到序列末尾（共 scheduler_steps - start_idx 步）
     timesteps_run = timesteps[start_idx:]
@@ -163,3 +162,16 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     print(f"[DEBUG] final latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
     return adapter.decode_latents(latents)
+
+
+def _save_debug_video(frames: list, path: str, fps: float = 8.0, min_frames: int = 4) -> None:
+    """将帧列表保存为 mp4。单帧时复制到 min_frames 帧，避免播放器显示绿色。"""
+    if not frames:
+        return
+    out = frames if len(frames) >= min_frames else frames * (min_frames // len(frames) + 1)
+    out = out[:max(len(frames), min_frames)]
+    H, W = out[0].shape[:2]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    for f in out:
+        writer.write(f)
+    writer.release()
