@@ -27,6 +27,18 @@ from typing import Optional
 from model_adapter import ModelAdapter
 
 
+def _save_mp4(frames: list, path: str, fps: float = 8.0) -> None:
+    """将帧列表保存为 mp4。"""
+    if not frames:
+        return
+    H, W = frames[0].shape[:2]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    for f in frames:
+        writer.write(f)
+    writer.release()
+    print(f"[DEBUG] saved {path} ({len(frames)} frames)")
+
+
 def _save_frames(frames: list, prefix: str) -> None:
     """将帧列表保存为一组 PNG：{prefix}_000.png, {prefix}_001.png, ..."""
     if not frames:
@@ -155,8 +167,7 @@ def run_sdedit(
             print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
                   f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
             _frames = adapter.decode_latents(latents)
-            for _fi, _f in enumerate(_frames):
-                cv2.imwrite(f"debug_step_{i+1:03d}_frame{_fi:03d}.png", _f)
+            _save_mp4(_frames, f"generated_step_{i+1:03d}.mp4")
 
     # ------------------------------------------------------------------ #
     # 步骤 6：解码潜变量 → 像素帧                                          #
