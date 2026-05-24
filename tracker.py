@@ -9,7 +9,7 @@ Point Prompting 主跟踪器。
   5. 精细化（可选）：对标记周围区域执行 inpainting 精细化。
   6. 返回轨迹坐标和可见性标志。
 
-支持任意 ModelAdapter（CogVideoX 或 Wan）。
+基于 CogVideoX-I2V。
 """
 
 from __future__ import annotations
@@ -79,15 +79,9 @@ class PointPrompter:
     接受原始 diffusers pipeline（自动检测类型）或 ModelAdapter 实例。
 
     使用示例：
-        # CogVideoX
         pipe    = load_cogvideox_pipe("THUDM/CogVideoX-5b-I2V")
         tracker = PointPrompter(pipe)
-
-        # Wan 2.1
-        pipe    = load_wan_pipe("Wan-AI/Wan2.1-I2V-14B-480P")
-        tracker = PointPrompter(pipe)
-
-        result = tracker.track(frames, query_point=(x, y))
+        result  = tracker.track(frames, query_point=(x, y))
     """
 
     def __init__(self, pipe_or_adapter, config: Optional[PointPrompterConfig] = None):

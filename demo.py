@@ -1,16 +1,9 @@
 """
 演示脚本：使用 Point Prompting 跟踪视频中的用户指定点，并将轨迹可视化写入输出视频。
 
-支持 CogVideoX-I2V 和 Wan2.1-I2V / VACE 两种模型。
-
 使用示例：
-    # Wan 2.1 14B（论文主要模型，质量最佳，需约 40 GB 显存）
-    python demo.py --video input.mp4 --points "320,240" "640,360" \\
-                   --model-type wan --model-id Wan-AI/Wan2.1-I2V-14B-480P
-
-    # CogVideoX 5B I2V
-    python demo.py --video input.mp4 --points "1157,635" \\
-                   --model-type cogvideox --model-id THUDM/CogVideoX-5b-I2V
+    python demo.py --video input.mp4 --points "1157,635" "900,535" \\
+                   --model-id THUDM/CogVideoX-5b-I2V
 
 依赖安装：
     pip install torch diffusers transformers accelerate opencv-python pillow
@@ -24,7 +17,7 @@ import cv2
 import numpy as np
 import torch
 
-from model_adapter import load_cogvideox_pipe, load_wan_pipe, create_adapter
+from model_adapter import load_cogvideox_pipe, create_adapter
 from tracker import PointPrompter, PointPrompterConfig
 
 
@@ -33,21 +26,10 @@ from tracker import PointPrompter, PointPrompterConfig
 # --------------------------------------------------------------------------- #
 
 MODEL_DEFAULTS = {
-    "wan": {
-        "model_id": "Wan-AI/Wan2.1-I2V-14B-480P",   # 默认使用 14B 版本
-        "dtype": "bfloat16",
-        "width": 832,
-        "height": 480,
-        "max_frames": 50,
-    },
-    "cogvideox": {
-        "model_id": "THUDM/CogVideoX-5b-I2V",
-        "dtype": "float16",
-        # CogVideoX-5b-I2V 硬编码只接受 720×480，不支持其他分辨率；训练帧数为 49
-        "width": 720,
-        "height": 480,
-        "max_frames": 49,
-    },
+    "model_id": "THUDM/CogVideoX-5b-I2V",
+    "width": 720,
+    "height": 480,
+    "max_frames": 49,
 }
 
 
@@ -197,10 +179,8 @@ def main():
     parser.add_argument("--video",   required=True, help="输入视频文件路径")
     parser.add_argument("--points",  nargs="+", required=True,
                         help="查询点坐标，格式为 'x,y'（第 0 帧像素坐标），可指定多个点")
-    parser.add_argument("--model-type", choices=["wan", "cogvideox"], default="wan",
-                        help="使用的模型骨干（默认：wan）")
     parser.add_argument("--model-id",   default=None,
-                        help="HuggingFace 模型 ID（覆盖各类型的默认值）")
+                        help="HuggingFace 模型 ID（默认：THUDM/CogVideoX-5b-I2V）")
     parser.add_argument("--output",  default="tracked.mp4",
                         help="输出视频路径（默认：tracked.mp4）")
     parser.add_argument("--gamma",   type=float, default=0.5,
@@ -216,15 +196,15 @@ def main():
     parser.add_argument("--seed",    type=int,   default=42,
                         help="随机种子（默认：42）")
     parser.add_argument("--max-frames", type=int, default=None,
-                        help="最多处理的帧数（默认：由模型类型决定，cogvideox=49 wan=50）")
+                        help="最多处理的帧数（默认：49）")
     parser.add_argument("--preprocess-width", type=int, default=None,
-                        help="跟踪前先将视频缩放到此宽度，0 表示不预处理缩放（默认：由模型类型决定）")
+                        help="跟踪前先将视频缩放到此宽度（默认：720）")
     parser.add_argument("--preprocess-height", type=int, default=None,
-                        help="跟踪前先将视频缩放到此高度，0 表示不预处理缩放（默认：由模型类型决定）")
+                        help="跟踪前先将视频缩放到此高度（默认：480）")
     parser.add_argument("--model-width", type=int, default=None,
-                        help="送入扩散模型的最大宽度，0 表示不缩放（默认：由模型类型决定）")
+                        help="送入扩散模型的最大宽度（默认：720）")
     parser.add_argument("--model-height", type=int, default=None,
-                        help="送入扩散模型的最大高度，0 表示不缩放（默认：由模型类型决定）")
+                        help="送入扩散模型的最大高度（默认：480）")
     parser.add_argument("--model-stride", type=int, default=16,
                         help="模型输入宽高对齐倍数（默认：16）")
     parser.add_argument("--device",  default="cuda",
@@ -233,15 +213,13 @@ def main():
                         help="将每个点的 SDEdit 生成帧保存为 generated_<i>.mp4，用于调试飘移问题")
     args = parser.parse_args()
 
-    # 确定模型 ID 和分辨率（命令行参数优先，否则使用该类型的默认值）
-    model_type = args.model_type
-    model_id   = args.model_id or MODEL_DEFAULTS[model_type]["model_id"]
-    _mdef = MODEL_DEFAULTS[model_type]
-    if args.preprocess_width  is None: args.preprocess_width  = _mdef["width"]
-    if args.preprocess_height is None: args.preprocess_height = _mdef["height"]
-    if args.model_width       is None: args.model_width       = _mdef["width"]
-    if args.model_height      is None: args.model_height      = _mdef["height"]
-    if args.max_frames        is None: args.max_frames        = _mdef["max_frames"]
+    # 确定模型 ID 和分辨率（命令行参数优先，否则使用默认值）
+    model_id = args.model_id or MODEL_DEFAULTS["model_id"]
+    if args.preprocess_width  is None: args.preprocess_width  = MODEL_DEFAULTS["width"]
+    if args.preprocess_height is None: args.preprocess_height = MODEL_DEFAULTS["height"]
+    if args.model_width       is None: args.model_width       = MODEL_DEFAULTS["width"]
+    if args.model_height      is None: args.model_height      = MODEL_DEFAULTS["height"]
+    if args.max_frames        is None: args.max_frames        = MODEL_DEFAULTS["max_frames"]
 
     try:
         query_points = parse_points(args.points)
@@ -280,11 +258,8 @@ def main():
         sys.exit(device_error)
 
     # 加载视频扩散模型
-    print(f"加载 {model_type} 模型：{model_id}")
-    if model_type == "wan":
-        pipe = load_wan_pipe(model_id, args.device)
-    else:
-        pipe = load_cogvideox_pipe(model_id, args.device)
+    print(f"加载模型：{model_id}")
+    pipe = load_cogvideox_pipe(model_id, args.device)
 
     adapter = create_adapter(pipe)
     print(f"  已使用适配器：{type(adapter).__name__}")

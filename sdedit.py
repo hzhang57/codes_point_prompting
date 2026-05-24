@@ -1,7 +1,7 @@
 """
 Point Prompting 核心：带反事实增强引导的 SDEdit 去噪。
 
-与模型无关，支持任意 ModelAdapter（CogVideoX-I2V 或 Wan2.1-I2V）。
+基于 CogVideoX-I2V 的 SDEdit 去噪。
 
 反事实引导公式（论文公式 3）：
     v̂_θ(x_t, c_edited) = (λ+1) · v_θ(x_t, c_edited) - λ · v_θ(x_t, c_original)
@@ -39,7 +39,7 @@ def run_sdedit(
     """执行一次带反事实增强引导的 SDEdit 完整流程。
 
     Args:
-        adapter:             ModelAdapter（CogVideoXAdapter 或 WanAdapter）
+        adapter:             CogVideoXAdapter
         frames_bgr_edited:   frame[0] 含红色标记的视频帧列表
         frame_bgr_original:  不含标记的原始 frame[0]（用于负向条件）
         gamma:               SDEdit 加噪比例 γ ∈ (0, 1]，越大生成越自由

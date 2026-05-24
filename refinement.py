@@ -6,7 +6,7 @@
 掩码外的区域每步都从原始干净帧的潜变量中粘贴回来，
 从而在保留标记可见性的同时消除初次 SDEdit 引入的伪影。
 
-支持任意 ModelAdapter（CogVideoX-I2V 或 Wan2.1-I2V）。
+基于 CogVideoX-I2V。
 """
 
 from __future__ import annotations
