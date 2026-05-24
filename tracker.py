@@ -132,7 +132,8 @@ class PointPrompter:
         total_stages = 2 if cfg.do_refine else 1
 
         # ---- 步骤 3：反事实 SDEdit 生成含标记轨迹的视频 ----
-        print(f"  [阶段 1/{total_stages}] SDEdit 生成（{cfg.scheduler_steps} 步）…")
+        denoise_steps = cfg.scheduler_steps - int(cfg.scheduler_steps * cfg.gamma)
+        print(f"  [阶段 1/{total_stages}] SDEdit 生成（调度器 {cfg.scheduler_steps} 步 / 去噪 {denoise_steps} 步）…")
         generated = run_sdedit(
             adapter=self.adapter,
             frames_bgr_edited=frames_edited,
@@ -150,7 +151,8 @@ class PointPrompter:
 
         # ---- 步骤 5：可选 inpainting 精细化 ----
         if cfg.do_refine:
-            print(f"  [阶段 2/{total_stages}] Inpainting 精细化（{cfg.scheduler_steps} 步）…")
+            refine_denoise_steps = cfg.scheduler_steps - int(cfg.scheduler_steps * cfg.refine_gamma)
+            print(f"  [阶段 2/{total_stages}] Inpainting 精细化（调度器 {cfg.scheduler_steps} 步 / 去噪 {refine_denoise_steps} 步）…")
             refined = refine_tracks(
                 adapter=self.adapter,
                 frames_bgr_generated=generated,
