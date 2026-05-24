@@ -90,8 +90,12 @@ class ModelAdapter(ABC):
         ...
 
     @abstractmethod
-    def encode_image_cond(self, frame_bgr: np.ndarray) -> Any:
-        """将单帧 BGR 图像编码为模型特定的图像条件表示。"""
+    def encode_image_cond(self, frame_bgr: np.ndarray,
+                          video_latent: Optional[torch.Tensor] = None) -> Any:
+        """将单帧 BGR 图像编码为模型特定的图像条件表示。
+
+        若传入 video_latent，实现可直接切第 0 帧以保证尺寸严格一致。
+        """
         ...
 
     @abstractmethod
