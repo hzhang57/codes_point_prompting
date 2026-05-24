@@ -481,8 +481,12 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
             total = torch.cuda.get_device_properties(i).total_memory // 1024**3
             print(f"[load] GPU {i} free: {free:.1f} GiB / {total} GiB")
 
-    from diffusers import FlowDPMSolverMultistepScheduler
-    pipe.scheduler = FlowDPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    try:
+        from diffusers import FlowDPMSolverMultistepScheduler
+        pipe.scheduler = FlowDPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        print(f"[load] scheduler: FlowDPMSolverMultistepScheduler")
+    except ImportError:
+        print(f"[load] scheduler: {type(pipe.scheduler).__name__} (FlowDPMSolver not available)")
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
     os.environ.pop("TQDM_DISABLE", None)
