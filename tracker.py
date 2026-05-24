@@ -43,7 +43,7 @@ class PointPrompterConfig:
     scheduler_steps: int = 100     # 调度器总步数，决定时间步粒度（论文默认 100）
     marker_radius: int = 2         # 插入标记的圆形半径（像素）；论文消融最优值为 2px
     do_refine: bool = True         # 是否执行 inpainting 精细化
-    refine_gamma: float = 0.3      # 精细化阶段的加噪比例（< gamma）
+    refine_gamma: float = 0.7      # 精细化阶段的加噪比例（> gamma，噪声更小，编辑更保守）
     prompt: str = ""               # 文本提示（论文零样本设置为空字符串）
     seed: Optional[int] = None     # 随机种子，None 表示不固定
     model_width: int = 832         # 扩散模型输入的最大宽度，防止高分辨率视频 OOM
@@ -132,7 +132,7 @@ class PointPrompter:
         total_stages = 2 if cfg.do_refine else 1
 
         # ---- 步骤 3：反事实 SDEdit 生成含标记轨迹的视频 ----
-        print(f"  [阶段 1/{total_stages}] SDEdit 生成（{cfg.num_inference_steps} 步）…")
+        print(f"  [阶段 1/{total_stages}] SDEdit 生成（{cfg.scheduler_steps} 步）…")
         generated = run_sdedit(
             adapter=self.adapter,
             frames_bgr_edited=frames_edited,
@@ -150,7 +150,7 @@ class PointPrompter:
 
         # ---- 步骤 5：可选 inpainting 精细化 ----
         if cfg.do_refine:
-            print(f"  [阶段 2/{total_stages}] Inpainting 精细化（{cfg.num_inference_steps} 步）…")
+            print(f"  [阶段 2/{total_stages}] Inpainting 精细化（{cfg.scheduler_steps} 步）…")
             refined = refine_tracks(
                 adapter=self.adapter,
                 frames_bgr_generated=generated,

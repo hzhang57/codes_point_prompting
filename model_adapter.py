@@ -142,14 +142,13 @@ class ModelAdapter(ABC):
         latents: torch.Tensor,
         t_next: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import inspect
-        sig = inspect.signature(self.scheduler.step)
-        params = list(sig.parameters.keys())
-        # CogVideoXDPMScheduler requires timestep_back (next smaller timestep)
-        if "timestep_back" in params:
-            if t_next is None:
-                t_next = torch.zeros_like(t)
-            return self.scheduler.step(velocity, t, t_next, latents).prev_sample
+        if self._dpm_step is None:
+            import inspect
+            params = inspect.signature(self.scheduler.step).parameters
+            self._dpm_step = "timestep_back" in params
+        if self._dpm_step:
+            t_back = t_next if t_next is not None else torch.zeros_like(t)
+            return self.scheduler.step(velocity, t, latents, timestep_back=t_back).prev_sample
         return self.scheduler.step(velocity, t, latents).prev_sample
 
 
@@ -166,6 +165,7 @@ class CogVideoXAdapter(ModelAdapter):
 
     def __init__(self, pipe):
         self.pipe = pipe
+        self._dpm_step: Optional[bool] = None  # cached after first scheduler_step call
 
     @property
     def device(self):
@@ -217,12 +217,9 @@ class CogVideoXAdapter(ModelAdapter):
 
         vae_dev = self._vae_device
         img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
-        vae = self.pipe.vae
         with torch.no_grad():
-            lat = vae.encode(img_t).latent_dist.sample()
-        scale = getattr(self.pipe, "vae_scaling_factor_image",
-                        getattr(vae.config, "scaling_factor", 1.0))
-        return (lat * scale).to(device=self.device, dtype=self.dtype)
+            lat = self.pipe.vae.encode(img_t).latent_dist.sample()
+        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         tok = self.pipe.tokenizer(
