@@ -66,7 +66,6 @@ def refine_tracks(
     frames_bgr_original: list,
     tracks: np.ndarray,              # (T, 2) 粗跟踪阶段检测到的标记坐标
     gamma: float = 0.3,              # 精细化加噪比例，小于主 SDEdit 的 γ
-    num_inference_steps: int = 50,
     scheduler_steps: int = 100,
     prompt: str = "",
     generator: Optional[torch.Generator] = None,
@@ -82,7 +81,6 @@ def refine_tracks(
         frames_bgr_original:  颜色重平衡后的原始帧（不含标记）
         tracks:               (T, 2) 粗跟踪坐标，用于定位掩码中心
         gamma:                精细化的 SDEdit 加噪比例（应 < 主流程 γ）
-        num_inference_steps:  总去噪步数
         prompt:               文本提示
         generator:            可复现性随机数生成器
 
@@ -135,7 +133,7 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 5：仅运行后 γ 比例的去噪步骤                                    #
     # ------------------------------------------------------------------ #
-    timesteps_run = timesteps[start_idx: start_idx + num_inference_steps]
+    timesteps_run = timesteps[start_idx:]
 
     latents = lat_start.clone()
 

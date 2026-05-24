@@ -40,7 +40,6 @@ class PointPrompterConfig:
     """跟踪器超参数配置。"""
     gamma: float = 0.5             # SDEdit 加噪比例（论文默认 0.5）
     lam: float = 8.0               # 反事实引导权重 λ（论文默认 8）
-    num_inference_steps: int = 50  # 实际执行的去噪步数（论文默认 50）
     scheduler_steps: int = 100     # 调度器总步数，决定时间步粒度（论文默认 100）
     marker_radius: int = 2         # 插入标记的圆形半径（像素）；论文消融最优值为 2px
     do_refine: bool = True         # 是否执行 inpainting 精细化
@@ -140,7 +139,6 @@ class PointPrompter:
             frame_bgr_original=frame0_original,  # 负向条件：无标记的原始帧
             gamma=cfg.gamma,
             lam=cfg.lam,
-            num_inference_steps=cfg.num_inference_steps,
             scheduler_steps=cfg.scheduler_steps,
             prompt=cfg.prompt,
             generator=gen,
@@ -159,7 +157,6 @@ class PointPrompter:
                 frames_bgr_original=frames_rb,
                 tracks=tracks,
                 gamma=cfg.refine_gamma,
-                num_inference_steps=cfg.num_inference_steps,
                 scheduler_steps=cfg.scheduler_steps,
                 prompt=cfg.prompt,
                 generator=gen,
