@@ -193,35 +193,25 @@ class CogVideoXAdapter(ModelAdapter):
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         vae_dev = self._vae_device
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
-        t = t.permute(0, 2, 1, 3, 4)  # BCTHW → BTCHW (CogVideoX VAE encode 期望 BTCHW)
-        print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f} dtype={t.dtype}")
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W)
+        print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f}")
         with torch.no_grad():
             dist = self.pipe.vae.encode(t).latent_dist
-            lat_sample = dist.sample()
-            lat_mean   = dist.mean
+            lat_mean = dist.mean
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        # VAE encode 输出 BTCHW，permute 回内部统一的 BCTHW
-        lat_sample = lat_sample.permute(0, 2, 1, 3, 4)
-        lat_mean   = lat_mean.permute(0, 2, 1, 3, 4)
-        scale = self._video_scale()
-        print(f"[DEBUG] encode_video: scale={scale:.4f}")
-        print(f"[DEBUG] encode_video: lat shape after permute={lat_mean.shape}")
-        print(f"[DEBUG] encode_video: sample min={lat_sample.min():.3f} max={lat_sample.max():.3f} norm={lat_sample.norm():.3f}")
-        print(f"[DEBUG] encode_video: mean   min={lat_mean.min():.3f}   max={lat_mean.max():.3f}   norm={lat_mean.norm():.3f}")
-        return (lat_mean * scale).to(device=self.device, dtype=self.dtype)
+        print(f"[DEBUG] encode_video: lat shape={lat_mean.shape} min={lat_mean.min():.3f} max={lat_mean.max():.3f}")
+        return (lat_mean * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         vae_dev = self._vae_device
-        # CogVideoX VAE decode 期望 (B, T, C, H, W)，内部存储是 (B, C, T, H, W)
         lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)
-        lat = lat.permute(0, 2, 1, 3, 4)  # BCTHW → BTCHW
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
+        print(f"[DEBUG] decode_latents: decoded shape={decoded.shape} min={decoded.min():.3f} max={decoded.max():.3f}")
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
@@ -235,10 +225,8 @@ class CogVideoXAdapter(ModelAdapter):
 
         vae_dev = self._vae_device
         img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
-        img_t = img_t.permute(0, 2, 1, 3, 4)  # BCTHW → BTCHW
         with torch.no_grad():
             lat = self.pipe.vae.encode(img_t).latent_dist.mean
-        lat = lat.permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def encode_text(self, prompt: str) -> torch.Tensor:
