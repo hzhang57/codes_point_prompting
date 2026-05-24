@@ -459,6 +459,7 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
             print(f"[load] GPU {i} free: {free:.1f} GiB / {total} GiB")
 
     pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
     os.environ.pop("TQDM_DISABLE", None)
     return pipe
 
