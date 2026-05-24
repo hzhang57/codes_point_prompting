@@ -162,14 +162,30 @@ def run_sdedit(
     return adapter.decode_latents(latents)
 
 
-def _save_debug_video(frames: list, path: str, fps: float = 8.0, min_frames: int = 4) -> None:
-    """将帧列表保存为 mp4。单帧时复制到 min_frames 帧，避免播放器显示绿色。"""
+def _save_debug_video(frames: list, path: str, fps: float = 8.0) -> None:
+    """将帧列表保存为 mp4，并额外保存首帧 PNG 用于直观验证。"""
     if not frames:
         return
-    out = frames if len(frames) >= min_frames else frames * (min_frames // len(frames) + 1)
-    out = out[:max(len(frames), min_frames)]
-    H, W = out[0].shape[:2]
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-    for f in out:
+    f0 = frames[0]
+    print(f"[DEBUG] _save_debug_video: {len(frames)} frames, frame0 shape={f0.shape} dtype={f0.dtype} "
+          f"min={f0.min()} max={f0.max()}")
+    # 保存首帧 PNG（最可靠的格式，不受 codec 影响）
+    png_path = path.replace(".mp4", "_frame0.png")
+    cv2.imwrite(png_path, f0)
+    print(f"[DEBUG] saved {png_path}")
+    # 保存中间帧 PNG
+    mid = len(frames) // 2
+    png_mid = path.replace(".mp4", f"_frame{mid}.png")
+    cv2.imwrite(png_mid, frames[mid])
+    print(f"[DEBUG] saved {png_mid}")
+
+    H, W = f0.shape[:2]
+    # 优先尝试 avc1（H.264），fallback 到 mp4v
+    for fourcc_str in ("avc1", "mp4v"):
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc_str), fps, (W, H))
+        if writer.isOpened():
+            break
+    for f in frames:
         writer.write(f)
     writer.release()
+    print(f"[DEBUG] saved {path} ({len(frames)} frames, codec={fourcc_str})")
