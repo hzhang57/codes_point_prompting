@@ -195,7 +195,10 @@ class CogVideoXAdapter(ModelAdapter):
         vae_dev = self._vae_device
         # _frames_to_tensor → (1, C, T, H, W); VAE encode 期望 (1, T, C, H, W)
         t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W) — VAE 期望 BCTHW
-        print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f}")
+        T_in = t.shape[2]
+        lT_expected = (T_in - 1) // 4
+        print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f} "
+              f"(T={T_in} → expect lT={(T_in-1)//4}, need T=4k+1 e.g. {lT_expected*4+1})")
         with torch.no_grad():
             dist = self.pipe.vae.encode(t).latent_dist
             lat_mean = dist.mean  # (1, C_lat, lT, lH, lW)
