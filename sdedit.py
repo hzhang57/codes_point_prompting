@@ -61,11 +61,9 @@ def run_sdedit(
     print(f"[DEBUG] latents_clean: shape={latents_clean.shape} "
           f"min={latents_clean.min():.3f} max={latents_clean.max():.3f} mean={latents_clean.mean():.3f}")
 
-    # [DEBUG] 验证 VAE encode→decode 重建质量（无任何去噪，直接解码干净 latent）
-    _clean_frames = adapter.decode_latents(latents_clean)
-    print(f"[DEBUG] VAE reconstruct: {len(_clean_frames)} frames decoded")
-    _save_debug_video(_clean_frames, "debug_vae_reconstruct.mp4")
-    print(f"[DEBUG] debug_vae_reconstruct.mp4 saved — 应与输入帧接近")
+    # [DEBUG] 存输入帧作为参考（含标记的原始输入）
+    _save_debug_video(frames_bgr_edited, "debug_input_frames.mp4")
+    print(f"[DEBUG] debug_input_frames.mp4 saved ({len(frames_bgr_edited)} frames)")
 
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
