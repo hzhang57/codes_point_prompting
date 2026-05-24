@@ -148,8 +148,9 @@ def run_sdedit(
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
                   f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
-            _f0 = adapter.decode_latents(latents[:, :, :1, :, :])[0]
-            cv2.imwrite(f"debug_step_{i+1:03d}_frame0.png", _f0)
+            _frames = adapter.decode_latents(latents)
+            for _fi, _f in enumerate(_frames):
+                cv2.imwrite(f"debug_step_{i+1:03d}_frame{_fi:03d}.png", _f)
 
     # [DEBUG] ---- 反事实引导循环（暂时注释） ----
     # for i, t in enumerate(timesteps_run):
