@@ -120,17 +120,9 @@ def run_sdedit(
     print(f"[DEBUG] latents after add_noise: "
           f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f} norm={latents.norm():.3f}")
 
-    # [DEBUG] 手动线性插值对照组（flow matching 公式）
-    _manual_noisy = (1 - _t_norm) * latents_clean + _t_norm * noise
-    print(f"[DEBUG] manual lerp latents:    "
-          f"min={_manual_noisy.min():.3f} max={_manual_noisy.max():.3f} norm={_manual_noisy.norm():.3f}")
-    _manual_frames = adapter.decode_latents(_manual_noisy)
-    _save_debug_video(_manual_frames, "debug_noisy_manual.mp4")
-
     # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
-    _noisy_frames = adapter.decode_latents(latents)
-    _save_debug_video(_noisy_frames, "debug_noisy_input.mp4")
-    print(f"[DEBUG] debug_noisy_input.mp4 (scheduler) / debug_noisy_manual.mp4 (manual lerp) saved")
+    cv2.imwrite("debug_noisy_frame0.png", adapter.decode_latents(latents)[0])
+    print(f"[DEBUG] debug_noisy_frame0.png saved")
 
     # 从 start_idx 去噪到序列末尾（共 scheduler_steps - start_idx 步）
     timesteps_run = timesteps[start_idx:]
@@ -171,14 +163,3 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     print(f"[DEBUG] final latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
     return adapter.decode_latents(latents)
-
-
-def _save_debug_video(frames: list, path: str, fps: float = 8.0) -> None:
-    """将帧列表保存为 mp4，用于调试。"""
-    if not frames:
-        return
-    H, W = frames[0].shape[:2]
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-    for f in frames:
-        writer.write(f)
-    writer.release()
