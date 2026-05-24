@@ -123,6 +123,7 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     # 步骤 5：普通去噪循环（DEBUG：跳过反事实引导，验证去噪本身是否正常）   #
     # ------------------------------------------------------------------ #
+    print(f"[DEBUG] timesteps_run: {timesteps_run.cpu().numpy()}")  # 打印实际去噪的时间步列表
     for i, t in enumerate(timesteps_run):
         t_batch = t.unsqueeze(0).to(device)
         t_next  = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
