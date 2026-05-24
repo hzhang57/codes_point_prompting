@@ -234,10 +234,11 @@ def main():
         sys.exit("错误：无法从视频中读取任何帧。")
     orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
     print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}  fps={src_fps:.2f}")
-    # CogVideoX 3D VAE 时序压缩因子为 4，要求 (T-1) % 4 == 0（即 T=5,9,13,...,49）
-    if (len(frames) - 1) % 4 != 0:
-        good = len(frames) - 1 - (len(frames) - 1) % 4 + 1  # round down
-        print(f"  警告：帧数 {len(frames)} 不满足 (T-1)%4==0，VAE 解码可能模糊。建议用 --max-frames {max(1, good)}")
+    # CogVideoX 3D VAE 时序压缩因子为 4，encode T帧→lT=T//4，decode lT→lT*4帧
+    # 因此要求 T % 4 == 0（即 T=4,8,12,...,48）才能无损还原
+    if len(frames) % 4 != 0:
+        good = (len(frames) // 4) * 4
+        print(f"  警告：帧数 {len(frames)} 不满足 T%4==0，VAE 解码会丢帧。建议用 --max-frames {max(4, good)}")
 
     # 保留原始帧用于最终可视化
     frames_orig = [f.copy() for f in frames]
