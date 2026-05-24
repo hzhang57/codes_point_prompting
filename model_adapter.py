@@ -193,11 +193,12 @@ class CogVideoXAdapter(ModelAdapter):
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         vae_dev = self._vae_device
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W)
+        # _frames_to_tensor → (1, C, T, H, W); VAE encode 期望 (1, T, C, H, W)
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype).permute(0, 2, 1, 3, 4)
         print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f}")
         with torch.no_grad():
             dist = self.pipe.vae.encode(t).latent_dist
-            lat_mean = dist.mean
+            lat_mean = dist.mean  # (1, C_lat, lT, lH, lW)
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -208,9 +209,10 @@ class CogVideoXAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         vae_dev = self._vae_device
-        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)
+        # 内部 latent (1, C, T, H, W); VAE decode 期望 (1, T, C, H, W)
+        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype).permute(0, 2, 1, 3, 4)
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample
+            decoded = self.pipe.vae.decode(lat).sample  # (1, C, T, H, W)
         print(f"[DEBUG] decode_latents: decoded shape={decoded.shape} min={decoded.min():.3f} max={decoded.max():.3f}")
         return _tensor_to_frames(decoded)
 
@@ -224,9 +226,9 @@ class CogVideoXAdapter(ModelAdapter):
             return video_latent[:, :, :1, :, :].clone()
 
         vae_dev = self._vae_device
-        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
+        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype).permute(0, 2, 1, 3, 4)  # BCTHW→BTCHW
         with torch.no_grad():
-            lat = self.pipe.vae.encode(img_t).latent_dist.mean
+            lat = self.pipe.vae.encode(img_t).latent_dist.mean  # (1, C_lat, lT, lH, lW)
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def encode_text(self, prompt: str) -> torch.Tensor:
