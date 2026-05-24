@@ -60,7 +60,8 @@ For Wan VACE support, make sure your diffusers version exposes `WanVACEPipeline`
   --model-type cogvideox \
   --model-id THUDM/CogVideoX-5B-I2V \
   --max-frames 10 \
-  --steps 50
+  --steps 50 \
+  --gamma 0.3
   #--no-refine
 ```
 
