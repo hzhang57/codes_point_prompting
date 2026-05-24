@@ -1,8 +1,9 @@
 """
 Point Prompting 的模型适配层。
 
-支持 CogVideoX-5B-I2V：图像条件 = VAE 潜变量沿通道轴拼接，
-Transformer 输入通道数翻倍（2C），已在 I2V 版本预训练好。
+支持两种后端：
+- CogVideoX-5B-I2V：图像条件 = VAE 潜变量沿通道轴拼接（2C 输入）
+- Wan2.1-VACE-1.3B：图像条件 = control_hidden_states（VAE latent + mask 注入 VACE 层）
 """
 
 from __future__ import annotations
@@ -281,12 +282,185 @@ class CogVideoXAdapter(ModelAdapter):
 
 
 # --------------------------------------------------------------------------- #
+#  Wan2.1-VACE 适配器                                                          #
+# --------------------------------------------------------------------------- #
+
+class WanVACEAdapter(ModelAdapter):
+    """Wan2.1-VACE-1.3B 适配器。
+
+    图像条件方式：
+      - 将第 0 帧（含/不含标记）VAE 编码后作为 control_hidden_states
+      - 其余帧对应位置填零（让模型自由生成）
+      - mask=0 表示第 0 帧已知条件，mask=1 表示其余帧需要生成
+      - control_hidden_states 通过 VACE 专属层注入 transformer
+    """
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+        self._dpm_step: Optional[bool] = None
+
+    @property
+    def device(self) -> torch.device:
+        return _pipe_device(self.pipe)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.pipe.transformer.dtype
+
+    @property
+    def scheduler(self):
+        return self.pipe.scheduler
+
+    @property
+    def _vae_device(self) -> torch.device:
+        return next(self.pipe.vae.parameters()).device
+
+    def _video_scale(self) -> float:
+        return getattr(self.pipe.vae.config, "scaling_factor", 1.0)
+
+    def encode_video(self, frames_bgr: list) -> torch.Tensor:
+        vae_dev = self._vae_device
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W)
+        T_in = t.shape[2]
+        print(f"[DEBUG] encode_video input: shape={t.shape} (T={T_in} → expect lT={(T_in-1)//4})")
+        with torch.no_grad():
+            lat = self.pipe.vae.encode(t).latent_dist.mean
+        del t
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[DEBUG] encode_video: lat shape={lat.shape}")
+        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
+
+    def decode_latents(self, latents: torch.Tensor) -> list:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        vae_dev = self._vae_device
+        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)
+        with torch.no_grad():
+            decoded = self.pipe.vae.decode(lat).sample  # (1, C, T, H, W)
+        print(f"[DEBUG] decode_latents: decoded shape={decoded.shape}")
+        return _tensor_to_frames(decoded)
+
+    def encode_image_cond(self, frame_bgr: np.ndarray,
+                          video_latent: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """返回 (1, C_lat, 1, lH, lW) 第 0 帧的 latent，用于构建 control_hidden_states。"""
+        if video_latent is not None:
+            return video_latent[:, :, :1, :, :].clone()
+        vae_dev = self._vae_device
+        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
+        with torch.no_grad():
+            lat = self.pipe.vae.encode(img_t).latent_dist.mean
+        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
+
+    def encode_text(self, prompt: str) -> torch.Tensor:
+        # Wan 用 T5 文本编码器
+        tok = self.pipe.tokenizer(
+            prompt, return_tensors="pt", padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
+        ).to(self.device)
+        with torch.no_grad():
+            emb = self.pipe.text_encoder(**tok).last_hidden_state
+        return emb.to(self.dtype)
+
+    def _build_control(
+        self,
+        noisy_latents: torch.Tensor,
+        image_cond: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """构建 VACE control_hidden_states 和 mask。
+
+        control_hidden_states: (1, C, lT, lH, lW)
+          - 第 0 latent 帧填入图像条件，其余帧填零
+        mask: (1, 1, lT, lH, lW)
+          - 第 0 latent 帧 = 0（已知，条件帧）
+          - 其余帧 = 1（未知，需要生成）
+        """
+        _, C, lT, lH, lW = noisy_latents.shape
+        ctrl = torch.zeros_like(noisy_latents)
+        ctrl[:, :, :image_cond.shape[2], :, :] = image_cond
+
+        mask = torch.ones(1, 1, lT, lH, lW, device=self.device, dtype=self.dtype)
+        mask[:, :, :image_cond.shape[2], :, :] = 0.0
+        return ctrl, mask
+
+    def forward_transformer(
+        self,
+        noisy_latents: torch.Tensor,
+        timestep: torch.Tensor,
+        text_cond: torch.Tensor,
+        image_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        ctrl, mask = self._build_control(noisy_latents, image_cond)
+
+        # VACE 将 control latent 和 mask 沿通道拼接后送入 VACE 层
+        # 拼接顺序：[ctrl, mask] → (1, C+1, lT, lH, lW)
+        control_hidden_states = torch.cat([ctrl, mask], dim=1)
+
+        t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
+
+        # WanTransformer3DModel forward：BCTHW 输入，不需要 permute
+        out = self.pipe.transformer(
+            hidden_states=noisy_latents,
+            timestep=t_b,
+            encoder_hidden_states=text_cond,
+            control_hidden_states=control_hidden_states,
+            return_dict=False,
+        )
+        return out[0]  # (1, C, lT, lH, lW) BCTHW
+
+
+# --------------------------------------------------------------------------- #
 #  工厂函数                                                                     #
 # --------------------------------------------------------------------------- #
 
 def create_adapter(pipe) -> ModelAdapter:
-    """根据 pipeline 类型自动创建 CogVideoXAdapter。"""
+    """根据 pipeline 类名自动选择适配器。"""
+    cls_name = type(pipe).__name__
+    if "VACE" in cls_name or "Vace" in cls_name:
+        return WanVACEAdapter(pipe)
     return CogVideoXAdapter(pipe)
+
+
+def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+                       device: str = "cuda") -> Any:
+    """加载 Wan2.1-VACE-1.3B pipeline（bfloat16）。
+
+    1.3B 参数量约 2-3GB，T5 文本编码器约 9.4GB，
+    2×T4 共 30GB 可以跑（transformer + T5 分布在两卡，VAE 固定在 cuda:0）。
+    """
+    import os
+    from diffusers import WanVACEPipeline
+    os.environ["TQDM_DISABLE"] = "1"
+    n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
+    if n_gpus >= 2:
+        total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
+        total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
+        mem = {
+            0: f"{max(1, total_0 - 5)}GiB",
+            1: f"{max(1, total_1 - 1)}GiB",
+        }
+        pipe = WanVACEPipeline.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16,
+            device_map="balanced", max_memory=mem,
+        )
+        from accelerate.hooks import remove_hook_from_module
+        remove_hook_from_module(pipe.vae, recurse=True)
+        pipe.vae.to("cuda:0", dtype=torch.bfloat16)
+        vae_dev = next(pipe.vae.parameters()).device
+        f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
+        f1 = torch.cuda.mem_get_info(1)[0] / 1024**3
+        print(f"[load] VAE device: {vae_dev}")
+        print(f"[load] GPU 0 free: {f0:.1f} GiB / {total_0} GiB")
+        print(f"[load] GPU 1 free: {f1:.1f} GiB / {total_1} GiB")
+    else:
+        pipe = WanVACEPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+        if str(device).startswith("cuda"):
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(device)
+    pipe.vae.enable_slicing()
+    os.environ.pop("TQDM_DISABLE", None)
+    return pipe
 
 
 def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):

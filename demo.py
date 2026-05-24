@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import torch
 
-from model_adapter import load_cogvideox_pipe, create_adapter
+from model_adapter import load_cogvideox_pipe, load_wan_vace_pipe, create_adapter
 from tracker import PointPrompter, PointPrompterConfig
 
 
@@ -26,10 +26,18 @@ from tracker import PointPrompter, PointPrompterConfig
 # --------------------------------------------------------------------------- #
 
 MODEL_DEFAULTS = {
-    "model_id": "THUDM/CogVideoX-5b-I2V",
-    "width": 720,
-    "height": 480,
-    "max_frames": 49,
+    "cogvideox": {
+        "model_id": "THUDM/CogVideoX-5b-I2V",
+        "width": 720,
+        "height": 480,
+        "max_frames": 49,
+    },
+    "wan-vace": {
+        "model_id": "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+        "width": 832,
+        "height": 480,
+        "max_frames": 81,
+    },
 }
 
 
@@ -179,8 +187,11 @@ def main():
     parser.add_argument("--video",   required=True, help="输入视频文件路径")
     parser.add_argument("--points",  nargs="+", required=True,
                         help="查询点坐标，格式为 'x,y'（第 0 帧像素坐标），可指定多个点")
+    parser.add_argument("--model-type", default="cogvideox",
+                        choices=["cogvideox", "wan-vace"],
+                        help="模型类型（默认：cogvideox）")
     parser.add_argument("--model-id",   default=None,
-                        help="HuggingFace 模型 ID（默认：THUDM/CogVideoX-5b-I2V）")
+                        help="HuggingFace 模型 ID（默认由 --model-type 决定）")
     parser.add_argument("--output",  default="tracked.mp4",
                         help="输出视频路径（默认：tracked.mp4）")
     parser.add_argument("--gamma",   type=float, default=0.5,
@@ -212,12 +223,13 @@ def main():
     args = parser.parse_args()
 
     # 确定模型 ID 和分辨率（命令行参数优先，否则使用默认值）
-    model_id = args.model_id or MODEL_DEFAULTS["model_id"]
-    if args.preprocess_width  is None: args.preprocess_width  = MODEL_DEFAULTS["width"]
-    if args.preprocess_height is None: args.preprocess_height = MODEL_DEFAULTS["height"]
-    if args.model_width       is None: args.model_width       = MODEL_DEFAULTS["width"]
-    if args.model_height      is None: args.model_height      = MODEL_DEFAULTS["height"]
-    if args.max_frames        is None: args.max_frames        = MODEL_DEFAULTS["max_frames"]
+    defaults = MODEL_DEFAULTS[args.model_type]
+    model_id = args.model_id or defaults["model_id"]
+    if args.preprocess_width  is None: args.preprocess_width  = defaults["width"]
+    if args.preprocess_height is None: args.preprocess_height = defaults["height"]
+    if args.model_width       is None: args.model_width       = defaults["width"]
+    if args.model_height      is None: args.model_height      = defaults["height"]
+    if args.max_frames        is None: args.max_frames        = defaults["max_frames"]
 
     try:
         query_points = parse_points(args.points)
@@ -264,8 +276,11 @@ def main():
         sys.exit(device_error)
 
     # 加载视频扩散模型
-    print(f"加载模型：{model_id}")
-    pipe = load_cogvideox_pipe(model_id, args.device)
+    print(f"加载模型：{model_id}  (type={args.model_type})")
+    if args.model_type == "wan-vace":
+        pipe = load_wan_vace_pipe(model_id, args.device)
+    else:
+        pipe = load_cogvideox_pipe(model_id, args.device)
 
     adapter = create_adapter(pipe)
     print(f"  已使用适配器：{type(adapter).__name__}")
