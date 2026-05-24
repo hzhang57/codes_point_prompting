@@ -360,22 +360,45 @@ class WanVACEAdapter(ModelAdapter):
         self,
         noisy_latents: torch.Tensor,
         image_cond: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """构建 VACE control_hidden_states 和 mask。
+    ) -> torch.Tensor:
+        """构建 VACE control_hidden_states，共 96 通道。
 
-        control_hidden_states: (1, C, lT, lH, lW)
-          - 第 0 latent 帧填入图像条件，其余帧填零
-        mask: (1, 1, lT, lH, lW)
-          - 第 0 latent 帧 = 0（已知，条件帧）
-          - 其余帧 = 1（未知，需要生成）
+        VACE pipeline 的构建逻辑（pipeline_wan_vace.py）：
+          inactive = video * (1 - mask)  → VAE encode → 16ch
+          reactive = video * mask        → VAE encode → 16ch
+          video_ctrl = cat([inactive, reactive], dim=1)  → 32ch
+
+          mask_patches: pixel mask (T, H, W) → reshape 成 (64, lT, lH, lW)
+                        通过 8×8 spatial patch flatten 得到 64 通道
+
+          control = cat([video_ctrl, mask_patches], dim=1) → 96ch
+
+        我们的简化版本（第 0 帧已知，其余帧未知）：
+          inactive：第 0 帧填 image_cond，其余帧填零
+          reactive：全零（不知道"reactive"内容）
+          mask_patches：第 0 帧 patches 全 0，其余帧 patches 全 1
         """
         _, C, lT, lH, lW = noisy_latents.shape
-        ctrl = torch.zeros_like(noisy_latents)
-        ctrl[:, :, :image_cond.shape[2], :, :] = image_cond
+        dev, dt = self.device, self.dtype
 
-        mask = torch.ones(1, 1, lT, lH, lW, device=self.device, dtype=self.dtype)
-        mask[:, :, :image_cond.shape[2], :, :] = 0.0
-        return ctrl, mask
+        # --- video control (32ch) ---
+        inactive = torch.zeros(1, C, lT, lH, lW, device=dev, dtype=dt)
+        inactive[:, :, :image_cond.shape[2], :, :] = image_cond
+        reactive = torch.zeros_like(inactive)
+        video_ctrl = torch.cat([inactive, reactive], dim=1)  # (1, 32, lT, lH, lW)
+
+        # --- mask patches (64ch) ---
+        # pixel-space mask: (1, 1, T_px, H_px, W_px)
+        # T_px ≈ lT * vae_temporal (4), H_px = lH * 8, W_px = lW * 8
+        # 使用 vae_scale_factor_spatial=8, patch_size=2 → 8*2=16 → 64=8*8
+        # 简化：直接在 latent 空间构建 (lT, lH, lW) mask，然后 tile 到 64ch
+        # 第 0 latent 帧对应第 0 原始帧 → 已知 → mask=0；其余 → mask=1
+        mask_frame = torch.ones(lT, lH, lW, device=dev, dtype=dt)
+        mask_frame[:image_cond.shape[2]] = 0.0  # 已知帧
+        # expand 到 64 通道（spatial patch flatten 的近似）
+        mask_patches = mask_frame.unsqueeze(0).unsqueeze(0).expand(1, 64, lT, lH, lW)
+
+        return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 96, lT, lH, lW)
 
     def forward_transformer(
         self,
@@ -384,11 +407,7 @@ class WanVACEAdapter(ModelAdapter):
         text_cond: torch.Tensor,
         image_cond: torch.Tensor,
     ) -> torch.Tensor:
-        ctrl, mask = self._build_control(noisy_latents, image_cond)
-
-        # VACE 将 control latent 和 mask 沿通道拼接后送入 VACE 层
-        # 拼接顺序：[ctrl, mask] → (1, C+1, lT, lH, lW)
-        control_hidden_states = torch.cat([ctrl, mask], dim=1)
+        control_hidden_states = self._build_control(noisy_latents, image_cond)
 
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
