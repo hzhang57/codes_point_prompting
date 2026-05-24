@@ -195,15 +195,17 @@ class CogVideoXAdapter(ModelAdapter):
         vae_dev = self._vae_device
         t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
         with torch.no_grad():
-            lat = self.pipe.vae.encode(t).latent_dist.sample()
+            dist = self.pipe.vae.encode(t).latent_dist
+            lat_sample = dist.sample()
+            lat_mean   = dist.mean
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         scale = self._video_scale()
-        print(f"[DEBUG] encode_video: raw lat min={lat.min():.3f} max={lat.max():.3f} norm={lat.norm():.3f} scale={scale:.4f}")
-        scaled = lat * scale
-        print(f"[DEBUG] encode_video: scaled lat min={scaled.min():.3f} max={scaled.max():.3f} norm={scaled.norm():.3f}")
-        return scaled.to(device=self.device, dtype=self.dtype)
+        print(f"[DEBUG] encode_video: scale={scale:.4f}")
+        print(f"[DEBUG] encode_video: sample min={lat_sample.min():.3f} max={lat_sample.max():.3f} norm={lat_sample.norm():.3f}")
+        print(f"[DEBUG] encode_video: mean   min={lat_mean.min():.3f}   max={lat_mean.max():.3f}   norm={lat_mean.norm():.3f}")
+        return (lat_mean * scale).to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         if torch.cuda.is_available():
@@ -226,7 +228,7 @@ class CogVideoXAdapter(ModelAdapter):
         vae_dev = self._vae_device
         img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
         with torch.no_grad():
-            lat = self.pipe.vae.encode(img_t).latent_dist.sample()
+            lat = self.pipe.vae.encode(img_t).latent_dist.mean
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
 
     def encode_text(self, prompt: str) -> torch.Tensor:
