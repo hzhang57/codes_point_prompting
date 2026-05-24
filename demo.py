@@ -236,10 +236,12 @@ def main():
     print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}  fps={src_fps:.2f}")
     # CogVideoX 3D VAE 时序压缩：lT = (T-1)//4，需要 T = 4k+1（即1,5,9,...,49）
     # encode T帧 → lT=(T-1)//4 latent帧，decode lT → (lT*4+1) 帧
+    # 自动裁剪到最近的合法帧数，避免 VAE 出错
     if (len(frames) - 1) % 4 != 0:
         good = ((len(frames) - 1) // 4) * 4 + 1
         good = max(5, good)
-        print(f"  警告：帧数 {len(frames)} 不满足 T=4k+1，建议用 --max-frames {good}")
+        print(f"  帧数 {len(frames)} 不满足 T=4k+1，自动裁剪到 {good} 帧")
+        frames = frames[:good]
 
     # 保留原始帧用于最终可视化
     frames_orig = [f.copy() for f in frames]

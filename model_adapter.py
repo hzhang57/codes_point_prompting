@@ -328,10 +328,7 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         else:
             pipe = pipe.to(device)
     pipe.scheduler = CogVideoXDDIMScheduler.from_config(pipe.scheduler.config)
-    # [DEBUG] 关闭 slicing，避免 VAE 逐帧处理导致时序维度丢失
-    if hasattr(pipe.vae, "disable_slicing"):
-        pipe.vae.disable_slicing()
-    if hasattr(pipe.vae, "disable_tiling"):
-        pipe.vae.disable_tiling()
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
     os.environ.pop("TQDM_DISABLE", None)
     return pipe
