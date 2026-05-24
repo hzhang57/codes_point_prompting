@@ -28,15 +28,24 @@ from model_adapter import ModelAdapter
 
 
 def _save_mp4(frames: list, path: str, fps: float = 8.0) -> None:
-    """将帧列表保存为 mp4。"""
+    """将帧列表保存为 mp4（使用 imageio + ffmpeg，编码兼容性更好）。"""
     if not frames:
         return
-    H, W = frames[0].shape[:2]
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-    for f in frames:
-        writer.write(f)
-    writer.release()
-    print(f"[DEBUG] saved {path} ({len(frames)} frames)")
+    try:
+        import imageio
+        # BGR → RGB
+        rgb = [f[..., ::-1] for f in frames]
+        imageio.mimsave(path, rgb, fps=fps, codec="libx264",
+                        output_params=["-crf", "23", "-pix_fmt", "yuv420p"])
+        print(f"[DEBUG] saved {path} ({len(frames)} frames, imageio/libx264)")
+    except Exception as e:
+        print(f"[DEBUG] imageio failed ({e}), fallback to cv2")
+        H, W = frames[0].shape[:2]
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+        for f in frames:
+            writer.write(f)
+        writer.release()
+        print(f"[DEBUG] saved {path} ({len(frames)} frames, cv2/mp4v)")
 
 
 def _save_frames(frames: list, prefix: str) -> None:
