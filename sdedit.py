@@ -57,6 +57,7 @@ def run_sdedit(
     # 步骤 1：将编辑后的视频帧编码到潜变量空间                            #
     # ------------------------------------------------------------------ #
     latents_clean = adapter.encode_video(frames_bgr_edited)  # (1, C, T, lH, lW)
+    print(f"[DEBUG] vae_scale_factor={adapter._video_scale():.4f}")
     print(f"[DEBUG] latents_clean: shape={latents_clean.shape} "
           f"min={latents_clean.min():.3f} max={latents_clean.max():.3f} mean={latents_clean.mean():.3f}")
 

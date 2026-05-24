@@ -199,7 +199,11 @@ class CogVideoXAdapter(ModelAdapter):
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
+        scale = self._video_scale()
+        print(f"[DEBUG] encode_video: raw lat min={lat.min():.3f} max={lat.max():.3f} norm={lat.norm():.3f} scale={scale:.4f}")
+        scaled = lat * scale
+        print(f"[DEBUG] encode_video: scaled lat min={scaled.min():.3f} max={scaled.max():.3f} norm={scaled.norm():.3f}")
+        return scaled.to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         if torch.cuda.is_available():
