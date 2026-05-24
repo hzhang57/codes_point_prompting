@@ -70,7 +70,7 @@ def run_sdedit(
 
     # ------------------------------------------------------------------ #
     # 步骤 4：在 t ≈ γ·T_max 处加噪（SDEdit 前向过程）                   #
-    # 用 scheduler.add_noise() 确保与 DPM 加噪公式一致。                  #
+    # 用 scheduler.add_noise() 确保与 DDIM 加噪公式一致。                  #
     # ------------------------------------------------------------------ #
     noise = torch.randn_like(latents_clean, generator=generator)
     adapter.set_timesteps(scheduler_steps)
