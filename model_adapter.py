@@ -184,7 +184,9 @@ class CogVideoXAdapter(ModelAdapter):
         return self.pipe.scheduler
 
     def _video_scale(self) -> float:
-        return float(getattr(self.pipe, "vae_scale_factor",
+        # 官方 CogVideoX pipeline 用 vae_scaling_factor_image 做 latent 数值归一化
+        # vae_scale_factor 是空间下采样因子（整数 8），不是数值 scale，不能用
+        return float(getattr(self.pipe, "vae_scaling_factor_image",
                      getattr(self.pipe.vae.config, "scaling_factor", 1.0)))
 
     @property
@@ -202,7 +204,9 @@ class CogVideoXAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         scale = self._video_scale()
-        print(f"[DEBUG] encode_video: scale={scale:.4f}")
+        print(f"[DEBUG] encode_video: scale={scale:.4f} "
+              f"(vae_scaling_factor_image={getattr(self.pipe, 'vae_scaling_factor_image', 'N/A')} "
+              f"vae.config.scaling_factor={getattr(self.pipe.vae.config, 'scaling_factor', 'N/A')})")
         print(f"[DEBUG] encode_video: sample min={lat_sample.min():.3f} max={lat_sample.max():.3f} norm={lat_sample.norm():.3f}")
         print(f"[DEBUG] encode_video: mean   min={lat_mean.min():.3f}   max={lat_mean.max():.3f}   norm={lat_mean.norm():.3f}")
         return (lat_mean * scale).to(device=self.device, dtype=self.dtype)
