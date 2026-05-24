@@ -329,6 +329,6 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe = pipe.to(device)
     pipe.scheduler = CogVideoXDDIMScheduler.from_config(pipe.scheduler.config)
     pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
+    # tiling 会在空间块边界产生棋盘格伪影，不开
     os.environ.pop("TQDM_DISABLE", None)
     return pipe
