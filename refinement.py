@@ -137,11 +137,12 @@ def refine_tracks(
 
     latents = lat_start.clone()
 
-    for t in timesteps_run:
+    for i, t in enumerate(timesteps_run):
         t_batch = t.unsqueeze(0).to(device)
+        t_next  = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
         with torch.no_grad():
             v = adapter.forward_transformer(latents, t_batch, text_cond, image_cond)
-        latents = adapter.scheduler_step(v, t, latents)
+        latents = adapter.scheduler_step(v, t, latents, t_next)
 
         # 关键：每步去噪后将掩码外的区域替换回原始潜变量
         # 确保精细化只影响标记附近，避免其他区域被模型随机改变

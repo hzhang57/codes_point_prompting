@@ -91,8 +91,9 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     # 步骤 5：带反事实引导的去噪循环                                       #
     # ------------------------------------------------------------------ #
-    for t in timesteps_run:
+    for i, t in enumerate(timesteps_run):
         t_batch  = t.unsqueeze(0).to(device)
+        t_next   = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
         v_guided = adapter.predict_with_guidance(
             noisy_latents=latents,
             timestep=t_batch,
@@ -101,7 +102,7 @@ def run_sdedit(
             image_cond_original=cond_original,
             lam=lam,
         )
-        latents = adapter.scheduler_step(v_guided, t, latents)
+        latents = adapter.scheduler_step(v_guided, t, latents, t_next)
 
     # ------------------------------------------------------------------ #
     # 步骤 6：解码潜变量 → 像素帧                                          #

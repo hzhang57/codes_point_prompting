@@ -136,8 +136,20 @@ class ModelAdapter(ABC):
         return self.scheduler.timesteps
 
     def scheduler_step(
-        self, velocity: torch.Tensor, t: torch.Tensor, latents: torch.Tensor
+        self,
+        velocity: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        t_next: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import inspect
+        sig = inspect.signature(self.scheduler.step)
+        params = list(sig.parameters.keys())
+        # CogVideoXDPMScheduler requires timestep_back (next smaller timestep)
+        if "timestep_back" in params:
+            if t_next is None:
+                t_next = torch.zeros_like(t)
+            return self.scheduler.step(velocity, t, t_next, latents).prev_sample
         return self.scheduler.step(velocity, t, latents).prev_sample
 
 
