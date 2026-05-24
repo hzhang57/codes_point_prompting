@@ -143,6 +143,7 @@ class PointPrompter:
             scheduler_steps=cfg.scheduler_steps,
             prompt=cfg.prompt,
             generator=gen,
+            query_point=query_model,
         )
 
         # ---- 步骤 4：在生成帧中逐帧检测标记质心 ----

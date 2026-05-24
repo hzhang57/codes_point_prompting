@@ -25,24 +25,37 @@ import cv2
 from typing import Optional
 
 from model_adapter import ModelAdapter
+from marker import track_marker_sequence
 
 
-def _save_mp4(frames: list, path: str, fps: float = 8.0) -> None:
-    """将帧列表保存为 mp4（使用 imageio + ffmpeg，编码兼容性更好）。"""
+def _save_mp4(frames: list, path: str, fps: float = 8.0,
+              query_point: tuple = None) -> None:
+    """将帧列表保存为 mp4，可选叠加追踪点检测可视化。"""
     if not frames:
         return
+    if query_point is not None:
+        tracks, visible = track_marker_sequence(frames, query_point, smooth_sigma=0.0)
+        vis_frames = []
+        for i, f in enumerate(frames):
+            f = f.copy()
+            x, y = int(round(tracks[i, 0])), int(round(tracks[i, 1]))
+            color = (0, 255, 0) if visible[i] else (0, 0, 255)
+            cv2.circle(f, (x, y), 6, color, 2)
+            cv2.circle(f, (x, y), 2, color, -1)
+            vis_frames.append(f)
+    else:
+        vis_frames = frames
     try:
         import imageio
-        # BGR → RGB
-        rgb = [f[..., ::-1] for f in frames]
+        rgb = [f[..., ::-1] for f in vis_frames]
         imageio.mimsave(path, rgb, fps=fps, codec="libx264",
                         output_params=["-crf", "23", "-pix_fmt", "yuv420p"])
         print(f"[DEBUG] saved {path} ({len(frames)} frames, imageio/libx264)")
     except Exception as e:
         print(f"[DEBUG] imageio failed ({e}), fallback to cv2")
-        H, W = frames[0].shape[:2]
+        H, W = vis_frames[0].shape[:2]
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-        for f in frames:
+        for f in vis_frames:
             writer.write(f)
         writer.release()
         print(f"[DEBUG] saved {path} ({len(frames)} frames, cv2/mp4v)")
@@ -68,6 +81,7 @@ def run_sdedit(
     scheduler_steps: int = 100,
     prompt: str = "",
     generator: Optional[torch.Generator] = None,
+    query_point: Optional[tuple] = None,
 ) -> list:
     """执行一次带反事实增强引导的 SDEdit 完整流程。
 
@@ -176,7 +190,7 @@ def run_sdedit(
             print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
                   f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
             _frames = adapter.decode_latents(latents)
-            _save_mp4(_frames, f"generated_step_{i+1:03d}.mp4")
+            _save_mp4(_frames, f"generated_step_{i+1:03d}.mp4", query_point=query_point)
 
     # ------------------------------------------------------------------ #
     # 步骤 6：解码潜变量 → 像素帧                                          #
