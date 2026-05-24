@@ -100,7 +100,7 @@ def run_sdedit(
     # 步骤 3：编码文本提示                                                  #
     # ------------------------------------------------------------------ #
     text_cond = adapter.encode_text(prompt)
-    print(f"[DEBUG] text_cond: shape={text_cond.shape}")
+    print(f"[DEBUG] text_cond: {text_cond.shape if text_cond is not None else None}")
 
     # ------------------------------------------------------------------ #
     # 步骤 4：在 t ≈ γ·T_max 处加噪（SDEdit 前向过程）                   #

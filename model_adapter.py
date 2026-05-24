@@ -322,7 +322,7 @@ class WanVACEAdapter(ModelAdapter):
         vae_dev = self._vae_device
         t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W)
         T_in = t.shape[2]
-        print(f"[DEBUG] encode_video input: shape={t.shape} (T={T_in} → expect lT={(T_in-1)//4})")
+        print(f"[DEBUG] encode_video input: shape={t.shape} (T={T_in} → expect lT={(T_in-1)//4 + 1})")
         with torch.no_grad():
             lat = self.pipe.vae.encode(t).latent_dist.mean
         del t
