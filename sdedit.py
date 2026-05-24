@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import torch
 import numpy as np
+import cv2
 from typing import Optional
 
 from model_adapter import ModelAdapter
@@ -62,6 +63,11 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
     cond_original = adapter.encode_image_cond(frame_bgr_original)
+
+    # [DEBUG] 将 cond_edited（含红点的第 0 帧 latent）解码回像素，确认标记是否正确编码
+    _debug_frame = adapter.decode_latents(cond_edited)[0]
+    cv2.imwrite("debug_cond_edited.png", _debug_frame)
+    print(f"[DEBUG] debug_cond_edited.png saved, shape={_debug_frame.shape}")
 
     # ------------------------------------------------------------------ #
     # 步骤 3：编码文本提示                                                  #
