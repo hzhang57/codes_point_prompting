@@ -194,7 +194,7 @@ class CogVideoXAdapter(ModelAdapter):
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         vae_dev = self._vae_device
         # _frames_to_tensor → (1, C, T, H, W); VAE encode 期望 (1, T, C, H, W)
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype).permute(0, 2, 1, 3, 4)
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W) — VAE 期望 BCTHW
         print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f}")
         with torch.no_grad():
             dist = self.pipe.vae.encode(t).latent_dist
@@ -209,8 +209,7 @@ class CogVideoXAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         vae_dev = self._vae_device
-        # 内部 latent (1, C, T, H, W); VAE decode 期望 (1, T, C, H, W)
-        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype).permute(0, 2, 1, 3, 4)
+        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)  # (1, C, T, H, W) BCTHW
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample  # (1, C, T, H, W)
         print(f"[DEBUG] decode_latents: decoded shape={decoded.shape} min={decoded.min():.3f} max={decoded.max():.3f}")
@@ -226,7 +225,7 @@ class CogVideoXAdapter(ModelAdapter):
             return video_latent[:, :, :1, :, :].clone()
 
         vae_dev = self._vae_device
-        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype).permute(0, 2, 1, 3, 4)  # BCTHW→BTCHW
+        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)  # (1, C, 1, H, W) BCTHW
         with torch.no_grad():
             lat = self.pipe.vae.encode(img_t).latent_dist.mean  # (1, C_lat, lT, lH, lW)
         return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
@@ -326,7 +325,9 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
         else:
             pipe = pipe.to(device)
     pipe.scheduler = CogVideoXDDIMScheduler.from_config(pipe.scheduler.config)
-    pipe.vae.enable_slicing()
+    # [DEBUG] 关闭 slicing，避免 VAE 逐帧处理导致时序维度丢失
+    if hasattr(pipe.vae, "disable_slicing"):
+        pipe.vae.disable_slicing()
     if hasattr(pipe.vae, "disable_tiling"):
         pipe.vae.disable_tiling()
     os.environ.pop("TQDM_DISABLE", None)
