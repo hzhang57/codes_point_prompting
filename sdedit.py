@@ -136,35 +136,27 @@ def run_sdedit(
     timesteps_run = timesteps[start_idx:]
 
     # ------------------------------------------------------------------ #
-    # 步骤 5：普通去噪循环（DEBUG：跳过反事实引导，验证去噪本身是否正常）   #
+    # 步骤 5：反事实引导去噪循环（论文公式 3）                              #
     # ------------------------------------------------------------------ #
     print(f"[DEBUG] timesteps_run: {timesteps_run.cpu().numpy()}")
     for i, t in enumerate(timesteps_run):
-        t_batch = t.unsqueeze(0).to(device)
-        t_next  = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
-        with torch.no_grad():
-            v = adapter.forward_transformer(latents, t_batch, text_cond, cond_edited)
-        latents = adapter.scheduler_step(v, t, latents, t_next)
+        t_batch  = t.unsqueeze(0).to(device)
+        t_next   = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
+        v_guided = adapter.predict_with_guidance(
+            noisy_latents=latents,
+            timestep=t_batch,
+            text_cond=text_cond,
+            image_cond_edited=cond_edited,
+            image_cond_original=cond_original,
+            lam=lam,
+        )
+        latents = adapter.scheduler_step(v_guided, t, latents, t_next)
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
                   f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
             _frames = adapter.decode_latents(latents)
             for _fi, _f in enumerate(_frames):
                 cv2.imwrite(f"debug_step_{i+1:03d}_frame{_fi:03d}.png", _f)
-
-    # [DEBUG] ---- 反事实引导循环（暂时注释） ----
-    # for i, t in enumerate(timesteps_run):
-    #     t_batch  = t.unsqueeze(0).to(device)
-    #     t_next   = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
-    #     v_guided = adapter.predict_with_guidance(
-    #         noisy_latents=latents,
-    #         timestep=t_batch,
-    #         text_cond=text_cond,
-    #         image_cond_edited=cond_edited,
-    #         image_cond_original=cond_original,
-    #         lam=lam,
-    #     )
-    #     latents = adapter.scheduler_step(v_guided, t, latents, t_next)
 
     # ------------------------------------------------------------------ #
     # 步骤 6：解码潜变量 → 像素帧                                          #
