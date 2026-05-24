@@ -759,6 +759,9 @@ def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = 
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to(device)
+    # 替换为 CogVideoXDPMScheduler（论文使用 DPM，而非默认的 DDIM）
+    from diffusers import CogVideoXDPMScheduler
+    pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config)
     # slicing 仅做时序分块，不改变空间尺寸；tiling 会改变输出尺寸且在双卡时 OOM，不启用
     pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "disable_tiling"):
