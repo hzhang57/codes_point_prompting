@@ -73,23 +73,28 @@ def run_sdedit(
     text_cond = adapter.encode_text(prompt)
 
     # ------------------------------------------------------------------ #
-    # 步骤 4：在 t ≈ γ·T_max 处加噪（Flow Matching SDEdit 前向过程）      #
-    # x_t = (1-γ)·x_0 + γ·ε                                             #
+    # 步骤 4：在 t ≈ γ·T_max 处加噪（SDEdit 前向过程）                   #
+    # 用 scheduler.add_noise() 而非手动线性插值，                         #
+    # 确保与 DPM scheduler 的加噪公式一致。                               #
     # ------------------------------------------------------------------ #
-    # 用 scheduler_steps 建立完整时间步序列，从中切出起始位置
     noise = torch.randn_like(latents_clean, generator=generator)
     adapter.set_timesteps(scheduler_steps)
     timesteps = adapter.timesteps  # 从大到小，共 scheduler_steps 个时间步
 
-    # 根据 γ 在完整序列中找起始索引，然后只取后 num_inference_steps 步去噪
-    t_start_idx = max(0, int((1.0 - gamma) * scheduler_steps))
-    timesteps_run = timesteps[t_start_idx: t_start_idx + num_inference_steps]
+    # gamma 对应 V2V 的 strength：从 gamma 比例处开始去噪
+    start_idx = int(scheduler_steps * gamma)
+    start_idx = min(start_idx, scheduler_steps - 1)
+    t_start = timesteps[start_idx]
 
-    # 加噪比例 = 起始时间步 / 最大时间步 ≈ gamma（对非均匀调度器更鲁棒）
-    t_val  = timesteps[t_start_idx].float()
-    t_max  = timesteps[0].float()
-    t_frac = (t_val / t_max).item()           # ≈ gamma，直接作为插值系数
-    latents = adapter.add_noise(latents_clean, noise, t_frac)
+    # 用调度器内置加噪，兼容 DPM / DDIM 各自的公式
+    latents = adapter.scheduler.add_noise(
+        latents_clean,
+        noise,
+        t_start[None] if t_start.ndim == 0 else t_start,
+    )
+
+    # 从 t_start 对应索引开始，执行 num_inference_steps 步去噪
+    timesteps_run = timesteps[start_idx: start_idx + num_inference_steps]
 
     # ------------------------------------------------------------------ #
     # 步骤 5：带反事实引导的去噪循环                                       #

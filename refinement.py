@@ -111,8 +111,18 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 3：掩码内区域加噪，掩码外保留原始干净潜变量                     #
     # ------------------------------------------------------------------ #
+    adapter.set_timesteps(scheduler_steps)
+    timesteps   = adapter.timesteps
+    start_idx   = int(scheduler_steps * gamma)
+    start_idx   = min(start_idx, scheduler_steps - 1)
+    t_start     = timesteps[start_idx]
+
     noise     = torch.randn_like(lat_gen, generator=generator)
-    lat_noisy = adapter.add_noise(lat_gen, noise, gamma)          # 含标记区域加噪
+    lat_noisy = adapter.scheduler.add_noise(
+        lat_gen,
+        noise,
+        t_start[None] if t_start.ndim == 0 else t_start,
+    )
     # 掩码内用噪声潜变量，掩码外直接用原始潜变量（无需去噪）
     lat_start = mask_lat * lat_noisy + (1.0 - mask_lat) * lat_orig
 
@@ -123,12 +133,9 @@ def refine_tracks(
     image_cond = adapter.encode_image_cond(frames_bgr_generated[0])  # 以生成帧第 0 帧为条件
 
     # ------------------------------------------------------------------ #
-    # 步骤 5：仅运行后 γ 比例的去噪步骤（跳过前面已完成的步骤）           #
+    # 步骤 5：仅运行后 γ 比例的去噪步骤                                    #
     # ------------------------------------------------------------------ #
-    adapter.set_timesteps(scheduler_steps)
-    timesteps     = adapter.timesteps
-    t_start_idx   = max(0, int((1.0 - gamma) * scheduler_steps))
-    timesteps_run = timesteps[t_start_idx: t_start_idx + num_inference_steps]
+    timesteps_run = timesteps[start_idx: start_idx + num_inference_steps]
 
     latents = lat_start.clone()
 
