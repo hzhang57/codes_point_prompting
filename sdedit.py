@@ -63,8 +63,10 @@ def run_sdedit(
 
     # [DEBUG] 验证 VAE encode→decode 重建质量（无任何去噪，直接解码干净 latent）
     _clean_frames = adapter.decode_latents(latents_clean)
-    _save_debug_video(_clean_frames, "debug_vae_reconstruct.mp4")
-    print(f"[DEBUG] debug_vae_reconstruct.mp4 saved ({len(_clean_frames)} frames) — 应与输入帧接近")
+    print(f"[DEBUG] VAE reconstruct: {len(_clean_frames)} frames, frame0 shape={_clean_frames[0].shape}")
+    for _fi, _ff in enumerate(_clean_frames):
+        cv2.imwrite(f"debug_vae_reconstruct_frame{_fi}.png", _ff)
+    print(f"[DEBUG] debug_vae_reconstruct_frame*.png saved — 应与输入帧接近")
 
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
