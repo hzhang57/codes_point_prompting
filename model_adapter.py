@@ -393,16 +393,20 @@ class WanVACEAdapter(ModelAdapter):
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
         # WanTransformer3DModel forward：BCTHW 输入，不需要 permute
-        # text_cond=None 时不传 encoder_hidden_states（textless 模式）
-        kwargs = dict(
+        # encoder_hidden_states 是必填项；text_cond=None 时用全零占位
+        # Wan-1.3B text_dim=512，seq_len 取 transformer config 或默认 512
+        if text_cond is None:
+            text_dim = getattr(self.pipe.transformer.config, "text_dim", 512)
+            seq_len  = getattr(self.pipe.transformer.config, "max_text_seq_len", 512)
+            text_cond = torch.zeros(1, seq_len, text_dim,
+                                    device=self.device, dtype=self.dtype)
+        out = self.pipe.transformer(
             hidden_states=noisy_latents,
             timestep=t_b,
+            encoder_hidden_states=text_cond,
             control_hidden_states=control_hidden_states,
             return_dict=False,
         )
-        if text_cond is not None:
-            kwargs["encoder_hidden_states"] = text_cond
-        out = self.pipe.transformer(**kwargs)
         return out[0]  # (1, C, lT, lH, lW) BCTHW
 
 
