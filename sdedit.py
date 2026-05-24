@@ -57,22 +57,38 @@ def run_sdedit(
     # 步骤 1：将编辑后的视频帧编码到潜变量空间                            #
     # ------------------------------------------------------------------ #
     latents_clean = adapter.encode_video(frames_bgr_edited)  # (1, C, T, lH, lW)
+    print(f"[DEBUG] latents_clean: shape={latents_clean.shape} "
+          f"min={latents_clean.min():.3f} max={latents_clean.max():.3f} mean={latents_clean.mean():.3f}")
+
+    # [DEBUG] 验证 VAE encode→decode 重建质量（无任何去噪，直接解码干净 latent）
+    _clean_frames = adapter.decode_latents(latents_clean)
+    _save_debug_video(_clean_frames, "debug_vae_reconstruct.mp4")
+    print(f"[DEBUG] debug_vae_reconstruct.mp4 saved ({len(_clean_frames)} frames) — 应与输入帧接近")
 
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
     # ------------------------------------------------------------------ #
     cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
     cond_original = adapter.encode_image_cond(frame_bgr_original)
+    print(f"[DEBUG] cond_edited:   shape={cond_edited.shape} "
+          f"min={cond_edited.min():.3f} max={cond_edited.max():.3f}")
+    print(f"[DEBUG] cond_original: shape={cond_original.shape} "
+          f"min={cond_original.min():.3f} max={cond_original.max():.3f}")
+    print(f"[DEBUG] cond diff (edited-original): "
+          f"mean abs={( cond_edited - cond_original).abs().mean():.4f}")
 
-    # [DEBUG] 将 cond_edited（含红点的第 0 帧 latent）解码回像素，确认标记是否正确编码
-    _debug_frame = adapter.decode_latents(cond_edited)[0]
-    cv2.imwrite("debug_cond_edited.png", _debug_frame)
-    print(f"[DEBUG] debug_cond_edited.png saved, shape={_debug_frame.shape}")
+    # [DEBUG] 将 cond_edited 解码回像素，确认红色标记是否正确保留
+    _cond_frame = adapter.decode_latents(cond_edited)[0]
+    cv2.imwrite("debug_cond_edited.png", _cond_frame)
+    _cond_orig_frame = adapter.decode_latents(cond_original)[0]
+    cv2.imwrite("debug_cond_original.png", _cond_orig_frame)
+    print(f"[DEBUG] debug_cond_edited.png / debug_cond_original.png saved")
 
     # ------------------------------------------------------------------ #
     # 步骤 3：编码文本提示                                                  #
     # ------------------------------------------------------------------ #
     text_cond = adapter.encode_text(prompt)
+    print(f"[DEBUG] text_cond: shape={text_cond.shape}")
 
     # ------------------------------------------------------------------ #
     # 步骤 4：在 t ≈ γ·T_max 处加噪（SDEdit 前向过程）                   #
@@ -84,12 +100,22 @@ def run_sdedit(
 
     start_idx = min(int(scheduler_steps * gamma), scheduler_steps - 1)
     t_start   = timesteps[start_idx]
+    print(f"[DEBUG] scheduler_steps={scheduler_steps} gamma={gamma} "
+          f"start_idx={start_idx} t_start={t_start.item():.1f} "
+          f"denoise_steps={len(timesteps) - start_idx}")
 
     latents = adapter.scheduler.add_noise(
         latents_clean,
         noise,
         t_start[None] if t_start.ndim == 0 else t_start,
     )
+    print(f"[DEBUG] latents after add_noise: "
+          f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
+
+    # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
+    _noisy_frames = adapter.decode_latents(latents)
+    _save_debug_video(_noisy_frames, "debug_noisy_input.mp4")
+    print(f"[DEBUG] debug_noisy_input.mp4 saved — 应看到加噪后的模糊帧")
 
     # 从 start_idx 去噪到序列末尾（共 scheduler_steps - start_idx 步）
     timesteps_run = timesteps[start_idx:]
@@ -103,6 +129,9 @@ def run_sdedit(
         with torch.no_grad():
             v = adapter.forward_transformer(latents, t_batch, text_cond, cond_edited)
         latents = adapter.scheduler_step(v, t, latents, t_next)
+        if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
+            print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
+                  f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
 
     # [DEBUG] ---- 反事实引导循环（暂时注释） ----
     # for i, t in enumerate(timesteps_run):
@@ -121,4 +150,16 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     # 步骤 6：解码潜变量 → 像素帧                                          #
     # ------------------------------------------------------------------ #
+    print(f"[DEBUG] final latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
     return adapter.decode_latents(latents)
+
+
+def _save_debug_video(frames: list, path: str, fps: float = 8.0) -> None:
+    """将帧列表保存为 mp4，用于调试。"""
+    if not frames:
+        return
+    H, W = frames[0].shape[:2]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    for f in frames:
+        writer.write(f)
+    writer.release()
