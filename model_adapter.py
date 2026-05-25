@@ -161,18 +161,45 @@ class ModelAdapter(ABC):
 # --------------------------------------------------------------------------- #
 
 class WanVACEAdapter(ModelAdapter):
-    """Wan2.1-VACE-1.3B 适配器。
+    """Wan2.1-VACE-1.3B 适配器。对齐官方 pipeline_wan_vace.py 的实现。
 
-    图像条件方式：
-      - 将第 0 帧（含/不含标记）VAE 编码后作为 control_hidden_states
-      - 其余帧对应位置填零（让模型自由生成）
-      - mask=0 表示第 0 帧已知条件，mask=1 表示其余帧需要生成
-      - control_hidden_states 通过 VACE 专属层注入 transformer
+    VAE 标准化：(latent - latents_mean) * latents_std（官方做法，非 scaling_factor）
+    control_hidden_states：inactive(C) + reactive(C) + mask_patches(64) = 2C+64 ch
+    mask 构建：像素空间 mask 经 spatial patch flatten（8×8 → 64ch）得到
     """
 
     def __init__(self, pipe):
         self.pipe = pipe
         self._dpm_step: Optional[bool] = None
+        # 缓存 VAE 标准化参数（与官方 pipeline 对齐）
+        self._latents_mean: Optional[torch.Tensor] = None
+        self._latents_std: Optional[torch.Tensor] = None
+
+    def _get_vae_norm(self, device):
+        """获取 VAE 标准化参数（惰性初始化，缓存复用）。"""
+        if self._latents_mean is None:
+            mean = torch.tensor(
+                self.pipe.vae.config.latents_mean, dtype=torch.float32
+            ).view(1, self.pipe.vae.config.z_dim, 1, 1, 1)
+            std = 1.0 / torch.tensor(
+                self.pipe.vae.config.latents_std, dtype=torch.float32
+            ).view(1, self.pipe.vae.config.z_dim, 1, 1, 1)
+            self._latents_mean = mean
+            self._latents_std  = std
+        return (
+            self._latents_mean.to(device=device, dtype=torch.float32),
+            self._latents_std.to(device=device, dtype=torch.float32),
+        )
+
+    def _normalize(self, lat: torch.Tensor) -> torch.Tensor:
+        """官方标准化：(lat - mean) * std，在 float32 计算后转回原 dtype。"""
+        mean, std = self._get_vae_norm(lat.device)
+        return ((lat.float() - mean) * std).to(lat.dtype)
+
+    def _denormalize(self, lat: torch.Tensor) -> torch.Tensor:
+        """逆标准化：lat / std + mean。"""
+        mean, std = self._get_vae_norm(lat.device)
+        return (lat.float() / std + mean).to(lat.dtype)
 
     @property
     def device(self) -> torch.device:
@@ -191,11 +218,11 @@ class WanVACEAdapter(ModelAdapter):
         return next(self.pipe.vae.parameters()).device
 
     def _video_scale(self) -> float:
-        return getattr(self.pipe.vae.config, "scaling_factor", 1.0)
+        return 1.0  # 标准化由 _normalize/_denormalize 处理，此处不再用 scaling_factor
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         vae_dev = self._vae_device
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W)
+        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
         T_in = t.shape[2]
         print(f"[DEBUG] encode_video input: shape={t.shape} (T={T_in} → expect lT={(T_in-1)//4 + 1})")
         with torch.no_grad():
@@ -203,22 +230,23 @@ class WanVACEAdapter(ModelAdapter):
         del t
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        lat = self._normalize(lat)
         print(f"[DEBUG] encode_video: lat shape={lat.shape}")
-        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
+        return lat.to(device=self.device, dtype=self.dtype)
 
     def decode_latents(self, latents: torch.Tensor) -> list:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         vae_dev = self._vae_device
-        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)
+        lat = self._denormalize(latents).to(vae_dev, dtype=self.dtype)
         with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample  # (1, C, T, H, W)
+            decoded = self.pipe.vae.decode(lat).sample
         print(f"[DEBUG] decode_latents: decoded shape={decoded.shape}")
         return _tensor_to_frames(decoded)
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
                           video_latent: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """返回 (1, C_lat, 1, lH, lW) 第 0 帧的单帧 latent，用于构建 control_hidden_states。
+        """返回 (1, C_lat, 1, lH, lW) 第 0 帧的单帧 latent（已标准化）。
 
         若传入 video_latent，直接切第 0 帧，保证空间尺寸严格一致。
         """
@@ -228,7 +256,7 @@ class WanVACEAdapter(ModelAdapter):
         img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
         with torch.no_grad():
             lat = self.pipe.vae.encode(img_t).latent_dist.mean
-        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
+        return self._normalize(lat).to(device=self.device, dtype=self.dtype)
 
     def encode_text(self, prompt: str) -> Optional[torch.Tensor]:  # noqa: ARG002
         # T5 未加载（Point Prompting 用空 prompt），返回 None
@@ -239,21 +267,23 @@ class WanVACEAdapter(ModelAdapter):
         noisy_latents: torch.Tensor,
         image_cond: torch.Tensor,
     ) -> torch.Tensor:
-        """构建 VACE control_hidden_states，共 2C+64 通道。
+        """构建 VACE control_hidden_states，对齐官方 pipeline_wan_vace.py。
 
-        VACE pipeline 的构建逻辑（pipeline_wan_vace.py）：
-          inactive = video * (1 - mask)  → VAE latent → C ch
-          reactive = video * mask        → VAE latent → C ch
+        官方结构（prepare_latents_vace + prepare_masks）：
+          inactive = video * (1-mask) → VAE encode → normalize → C ch
+          reactive = video * mask     → VAE encode → normalize → C ch
           video_ctrl = cat([inactive, reactive], dim=1)  → 2C ch
 
-          mask_patches: latent 空间 mask → tile 到 64 通道
+          mask_patches：像素空间 mask (T, H, W) 经 spatial patch flatten
+            view(T, lH, 8, lW, 8) → permute(2,4,0,1,3) → flatten(0,1)
+            → (64, T, lH, lW) → interpolate to (64, lT, lH, lW)
 
           control = cat([video_ctrl, mask_patches], dim=1) → 2C+64 ch
 
-        image_cond 是第 0 帧的单帧 latent (1, C, 1, lH, lW)：
-          inactive：第 0 帧填 image_cond，其余帧全零
-          reactive：全零
-          mask：第 0 帧为 0（已知），其余帧为 1（待生成）
+        Point Prompting 的场景（第 0 帧已知，其余帧待生成）：
+          mask = 0 on frame 0（已知），1 on frames 1..T-1（待生成）
+          inactive = video * (1-mask)：仅第 0 帧有内容（image_cond），其余为零
+          reactive = video * mask：全零（待生成帧内容未知）
         """
         _, C, lT, lH, lW = noisy_latents.shape
         dev, dt = self.device, self.dtype
@@ -264,10 +294,19 @@ class WanVACEAdapter(ModelAdapter):
         reactive = torch.zeros_like(inactive)
         video_ctrl = torch.cat([inactive, reactive], dim=1)  # (1, 2C, lT, lH, lW)
 
-        # --- mask patches (64ch) ---
-        mask_frame = torch.ones(lT, lH, lW, device=dev, dtype=dt)
-        mask_frame[0] = 0.0  # 第 0 帧已知
-        mask_patches = mask_frame.unsqueeze(0).unsqueeze(0).repeat(1, 64, 1, 1, 1)
+        # --- mask patches（官方 spatial patch flatten，64ch）---
+        # 像素空间 mask：(T_px, H_px, W_px)，第 0 帧=0，其余=1
+        vae_s = 8  # vae_scale_factor_spatial
+        T_px, H_px, W_px = lT * 4, lH * vae_s, lW * vae_s  # 近似像素空间尺寸
+        mask_px = torch.ones(T_px, H_px, W_px, device=dev, dtype=dt)
+        mask_px[0] = 0.0  # 第 0 像素帧已知
+        # spatial patch flatten：(T, H, W) → (64, T, lH, lW)
+        mask_px = mask_px.view(T_px, lH, vae_s, lW, vae_s)
+        mask_px = mask_px.permute(2, 4, 0, 1, 3).flatten(0, 1)  # (64, T_px, lH, lW)
+        # 时序插值到 latent 帧数
+        mask_patches = torch.nn.functional.interpolate(
+            mask_px.unsqueeze(0), size=(lT, lH, lW), mode="nearest"
+        )  # (1, 64, lT, lH, lW)
 
         return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 2C+64, lT, lH, lW)
 
