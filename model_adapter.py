@@ -1,8 +1,7 @@
 """
 Point Prompting 的模型适配层。
 
-支持两种后端：
-- CogVideoX-5B-I2V：图像条件 = VAE 潜变量沿通道轴拼接（2C 输入）
+支持后端：
 - Wan2.1-VACE-1.3B：图像条件 = control_hidden_states（VAE latent + mask 注入 VACE 层）
 """
 
@@ -158,130 +157,6 @@ class ModelAdapter(ABC):
 
 
 # --------------------------------------------------------------------------- #
-#  CogVideoX-I2V 适配器                                                        #
-# --------------------------------------------------------------------------- #
-
-class CogVideoXAdapter(ModelAdapter):
-    """CogVideoX-I2V 适配器。
-
-    图像条件方式：VAE 编码第 0 帧 → 潜变量 →
-    沿通道轴（dim=1）与视频潜变量拼接 → 输入通道数翻倍。
-    """
-
-    def __init__(self, pipe):
-        self.pipe = pipe
-        self._dpm_step: Optional[bool] = None  # cached after first scheduler_step call
-
-    @property
-    def device(self):
-        return _pipe_device(self.pipe)
-
-    @property
-    def dtype(self):
-        return self.pipe.transformer.dtype
-
-    @property
-    def scheduler(self):
-        return self.pipe.scheduler
-
-    def _video_scale(self) -> float:
-        # [DEBUG] 测试 scale=1.0，验证 VAE encode/decode 不需要手动 scale
-        return 1.0
-
-    @property
-    def _vae_device(self) -> torch.device:
-        return next(self.pipe.vae.parameters()).device
-
-    def encode_video(self, frames_bgr: list) -> torch.Tensor:
-        vae_dev = self._vae_device
-        # _frames_to_tensor → (1, C, T, H, W); VAE encode 期望 (1, T, C, H, W)
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)  # (1, C, T, H, W) — VAE 期望 BCTHW
-        T_in = t.shape[2]
-        lT_expected = (T_in - 1) // 4
-        print(f"[DEBUG] encode_video input: shape={t.shape} min={t.min():.3f} max={t.max():.3f} "
-              f"(T={T_in} → expect lT={(T_in-1)//4}, need T=4k+1 e.g. {lT_expected*4+1})")
-        with torch.no_grad():
-            dist = self.pipe.vae.encode(t).latent_dist
-            lat_mean = dist.mean  # (1, C_lat, lT, lH, lW)
-        del t
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(f"[DEBUG] encode_video: lat shape={lat_mean.shape} min={lat_mean.min():.3f} max={lat_mean.max():.3f}")
-        return (lat_mean * self._video_scale()).to(device=self.device, dtype=self.dtype)
-
-    def decode_latents(self, latents: torch.Tensor) -> list:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        vae_dev = self._vae_device
-        lat = (latents / self._video_scale()).to(vae_dev, dtype=self.dtype)  # (1, C, T, H, W) BCTHW
-        with torch.no_grad():
-            decoded = self.pipe.vae.decode(lat).sample  # (1, C, T, H, W)
-        print(f"[DEBUG] decode_latents: decoded shape={decoded.shape} min={decoded.min():.3f} max={decoded.max():.3f}")
-        return _tensor_to_frames(decoded)
-
-    def encode_image_cond(self, frame_bgr: np.ndarray,
-                          video_latent: torch.Tensor = None) -> torch.Tensor:
-        """用 VAE 编码单帧，返回 (1, C_lat, 1, lH, lW) BCTHW 图像潜变量。
-
-        若传入 video_latent，直接切第 0 帧，保证空间尺寸严格一致。
-        """
-        if video_latent is not None:
-            return video_latent[:, :, :1, :, :].clone()
-
-        vae_dev = self._vae_device
-        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)  # (1, C, 1, H, W) BCTHW
-        with torch.no_grad():
-            lat = self.pipe.vae.encode(img_t).latent_dist.mean  # (1, C_lat, lT, lH, lW)
-        return (lat * self._video_scale()).to(device=self.device, dtype=self.dtype)
-
-    def encode_text(self, prompt: str) -> torch.Tensor:
-        tok = self.pipe.tokenizer(
-            prompt, return_tensors="pt", padding="max_length",
-            max_length=self.pipe.tokenizer.model_max_length, truncation=True,
-        ).to(self.device)
-        with torch.no_grad():
-            emb = self.pipe.text_encoder(**tok).last_hidden_state
-        return emb.to(self.dtype)
-
-    def _rotary_emb(self, T: int, H: int, W: int) -> Optional[Any]:
-        if not getattr(self.pipe.transformer.config, "use_rotary_positional_embeddings", False):
-            return None
-        if hasattr(self.pipe, "_prepare_rotary_positional_embeddings"):
-            p = self.pipe.vae_scale_factor_spatial if hasattr(self.pipe, "vae_scale_factor_spatial") else 8
-            return self.pipe._prepare_rotary_positional_embeddings(H * p, W * p, T, self.device)
-        return None
-
-    def _ofs_tensor(self, T: int) -> Optional[torch.Tensor]:
-        """CogVideoX 1.5 新增的 ofs（output frame scale）嵌入。"""
-        if not hasattr(self.pipe.transformer, "ofs_proj"):
-            return None
-        return torch.tensor([T - 1], device=self.device, dtype=self.dtype)
-
-    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond):
-        _, C, T, lH, lW = noisy_latents.shape
-        img_pad = torch.zeros_like(noisy_latents)
-        img_pad[:, :, :image_cond.shape[2], :, :] = image_cond
-        model_input = torch.cat([noisy_latents, img_pad], dim=1).permute(0, 2, 1, 3, 4)  # (1,T,2C,lH,lW)
-
-        ipe = self._rotary_emb(T, lH, lW)
-        ofs = self._ofs_tensor(T)
-        t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
-
-        kwargs = dict(
-            hidden_states=model_input,
-            encoder_hidden_states=text_cond,
-            timestep=t_b,
-            image_rotary_emb=ipe,
-            return_dict=False,
-        )
-        if ofs is not None:
-            kwargs["ofs"] = ofs
-
-        out = self.pipe.transformer(**kwargs)
-        return out[0].permute(0, 2, 1, 3, 4)  # BTCHW → BCTHW
-
-
-# --------------------------------------------------------------------------- #
 #  Wan2.1-VACE 适配器                                                          #
 # --------------------------------------------------------------------------- #
 
@@ -343,7 +218,10 @@ class WanVACEAdapter(ModelAdapter):
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
                           video_latent: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """返回 (1, C_lat, 1, lH, lW) 第 0 帧的 latent，用于构建 control_hidden_states。"""
+        """返回 (1, C_lat, 1, lH, lW) 第 0 帧的单帧 latent，用于构建 control_hidden_states。
+
+        若传入 video_latent，直接切第 0 帧，保证空间尺寸严格一致。
+        """
         if video_latent is not None:
             return video_latent[:, :, :1, :, :].clone()
         vae_dev = self._vae_device
@@ -361,44 +239,37 @@ class WanVACEAdapter(ModelAdapter):
         noisy_latents: torch.Tensor,
         image_cond: torch.Tensor,
     ) -> torch.Tensor:
-        """构建 VACE control_hidden_states，共 96 通道。
+        """构建 VACE control_hidden_states，共 2C+64 通道。
 
         VACE pipeline 的构建逻辑（pipeline_wan_vace.py）：
-          inactive = video * (1 - mask)  → VAE encode → 16ch
-          reactive = video * mask        → VAE encode → 16ch
-          video_ctrl = cat([inactive, reactive], dim=1)  → 32ch
+          inactive = video * (1 - mask)  → VAE latent → C ch
+          reactive = video * mask        → VAE latent → C ch
+          video_ctrl = cat([inactive, reactive], dim=1)  → 2C ch
 
-          mask_patches: pixel mask (T, H, W) → reshape 成 (64, lT, lH, lW)
-                        通过 8×8 spatial patch flatten 得到 64 通道
+          mask_patches: latent 空间 mask → tile 到 64 通道
 
-          control = cat([video_ctrl, mask_patches], dim=1) → 96ch
+          control = cat([video_ctrl, mask_patches], dim=1) → 2C+64 ch
 
-        我们的简化版本（第 0 帧已知，其余帧未知）：
-          inactive：第 0 帧填 image_cond，其余帧填零
-          reactive：全零（不知道"reactive"内容）
-          mask_patches：第 0 帧 patches 全 0，其余帧 patches 全 1
+        image_cond 是第 0 帧的单帧 latent (1, C, 1, lH, lW)：
+          inactive：第 0 帧填 image_cond，其余帧全零
+          reactive：全零
+          mask：第 0 帧为 0（已知），其余帧为 1（待生成）
         """
         _, C, lT, lH, lW = noisy_latents.shape
         dev, dt = self.device, self.dtype
 
-        # --- video control (32ch) ---
+        # --- video control (2C ch) ---
         inactive = torch.zeros(1, C, lT, lH, lW, device=dev, dtype=dt)
-        inactive[:, :, :image_cond.shape[2], :, :] = image_cond
+        inactive[:, :, :1, :, :] = image_cond
         reactive = torch.zeros_like(inactive)
-        video_ctrl = torch.cat([inactive, reactive], dim=1)  # (1, 32, lT, lH, lW)
+        video_ctrl = torch.cat([inactive, reactive], dim=1)  # (1, 2C, lT, lH, lW)
 
         # --- mask patches (64ch) ---
-        # pixel-space mask: (1, 1, T_px, H_px, W_px)
-        # T_px ≈ lT * vae_temporal (4), H_px = lH * 8, W_px = lW * 8
-        # 使用 vae_scale_factor_spatial=8, patch_size=2 → 8*2=16 → 64=8*8
-        # 简化：直接在 latent 空间构建 (lT, lH, lW) mask，然后 tile 到 64ch
-        # 第 0 latent 帧对应第 0 原始帧 → 已知 → mask=0；其余 → mask=1
         mask_frame = torch.ones(lT, lH, lW, device=dev, dtype=dt)
-        mask_frame[:image_cond.shape[2]] = 0.0  # 已知帧
-        # expand 到 64 通道（spatial patch flatten 的近似）
-        mask_patches = mask_frame.unsqueeze(0).unsqueeze(0).expand(1, 64, lT, lH, lW)
+        mask_frame[0] = 0.0  # 第 0 帧已知
+        mask_patches = mask_frame.unsqueeze(0).unsqueeze(0).repeat(1, 64, 1, 1, 1)
 
-        return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 96, lT, lH, lW)
+        return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 2C+64, lT, lH, lW)
 
     def forward_transformer(
         self,
@@ -435,10 +306,7 @@ class WanVACEAdapter(ModelAdapter):
 
 def create_adapter(pipe) -> ModelAdapter:
     """根据 pipeline 类名自动选择适配器。"""
-    cls_name = type(pipe).__name__
-    if "VACE" in cls_name or "Vace" in cls_name:
-        return WanVACEAdapter(pipe)
-    return CogVideoXAdapter(pipe)
+    return WanVACEAdapter(pipe)
 
 
 def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
@@ -489,50 +357,5 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
         print(f"[load] scheduler: {type(pipe.scheduler).__name__} (FlowDPMSolver not available)")
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
-    os.environ.pop("TQDM_DISABLE", None)
-    return pipe
-
-
-def load_cogvideox_pipe(model_id: str = "THUDM/CogVideoX-5b-I2V", device: str = "cuda"):
-    """加载 CogVideoX I2V pipeline（float16）。
-
-    双卡策略（方案 A）：
-      - cuda:0 限制 total-5 GiB：为 VAE 权重(0.4G) + encode 激活(~1G) 留出空间
-      - cuda:1 限制 total-1 GiB：放 transformer 后半 + T5 text encoder
-      - 加载完成后摘除 VAE 的 accelerate hooks，整体固定到 cuda:0 fp16
-    """
-    import os
-    from diffusers import CogVideoXImageToVideoPipeline, CogVideoXDDIMScheduler
-    os.environ["TQDM_DISABLE"] = "1"
-    n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
-    if n_gpus >= 2:
-        total_0 = torch.cuda.get_device_properties(0).total_memory // 1024**3
-        total_1 = torch.cuda.get_device_properties(1).total_memory // 1024**3
-        mem = {
-            0: f"{max(1, total_0 - 5)}GiB",
-            1: f"{max(1, total_1 - 1)}GiB",
-        }
-        pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-            model_id, torch_dtype=torch.float16,
-            device_map="balanced", max_memory=mem,
-        )
-        from accelerate.hooks import remove_hook_from_module
-        remove_hook_from_module(pipe.vae, recurse=True)
-        pipe.vae.to("cuda:0", dtype=torch.float16)
-        vae_dev = next(pipe.vae.parameters()).device
-        f0 = torch.cuda.mem_get_info(0)[0] / 1024**3
-        f1 = torch.cuda.mem_get_info(1)[0] / 1024**3
-        print(f"[load] VAE device: {vae_dev}")
-        print(f"[load] GPU 0 free: {f0:.1f} GiB / {total_0} GiB")
-        print(f"[load] GPU 1 free: {f1:.1f} GiB / {total_1} GiB")
-    else:
-        pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
-        if str(device).startswith("cuda"):
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe = pipe.to(device)
-    pipe.scheduler = CogVideoXDDIMScheduler.from_config(pipe.scheduler.config)
-    pipe.vae.enable_slicing()
-    # tiling 会在空间块边界产生棋盘格伪影，不开
     os.environ.pop("TQDM_DISABLE", None)
     return pipe

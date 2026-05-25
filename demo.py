@@ -2,8 +2,7 @@
 演示脚本：使用 Point Prompting 跟踪视频中的用户指定点，并将轨迹可视化写入输出视频。
 
 使用示例：
-    python demo.py --video input.mp4 --points "1157,635" "900,535" \\
-                   --model-id THUDM/CogVideoX-5b-I2V
+    python demo.py --video input.mp4 --points "1157,635" "900,535"
 
 依赖安装：
     pip install torch diffusers transformers accelerate opencv-python pillow
@@ -17,7 +16,7 @@ import cv2
 import numpy as np
 import torch
 
-from model_adapter import load_cogvideox_pipe, load_wan_vace_pipe, create_adapter
+from model_adapter import load_wan_vace_pipe, create_adapter
 from tracker import PointPrompter, PointPrompterConfig
 
 
@@ -26,12 +25,6 @@ from tracker import PointPrompter, PointPrompterConfig
 # --------------------------------------------------------------------------- #
 
 MODEL_DEFAULTS = {
-    "cogvideox": {
-        "model_id": "THUDM/CogVideoX-5b-I2V",
-        "width": 720,
-        "height": 480,
-        "max_frames": 49,
-    },
     "wan-vace": {
         "model_id": "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
         "width": 832,
@@ -187,9 +180,9 @@ def main():
     parser.add_argument("--video",   required=True, help="输入视频文件路径")
     parser.add_argument("--points",  nargs="+", required=True,
                         help="查询点坐标，格式为 'x,y'（第 0 帧像素坐标），可指定多个点")
-    parser.add_argument("--model-type", default="cogvideox",
-                        choices=["cogvideox", "wan-vace"],
-                        help="模型类型（默认：cogvideox）")
+    parser.add_argument("--model-type", default="wan-vace",
+                        choices=["wan-vace"],
+                        help="模型类型（默认：wan-vace）")
     parser.add_argument("--model-id",   default=None,
                         help="HuggingFace 模型 ID（默认由 --model-type 决定）")
     parser.add_argument("--output",  default="tracked.mp4",
@@ -202,6 +195,8 @@ def main():
                         help="调度器总步数，决定时间步粒度（默认：100，论文值）")
     parser.add_argument("--no-refine", action="store_true",
                         help="跳过 inpainting 精细化步骤（速度更快但精度略低）")
+    parser.add_argument("--marker-radius", type=int, default=2,
+                        help="插入标记的圆形半径（像素，默认：2，论文最优值）")
     parser.add_argument("--seed",    type=int,   default=42,
                         help="随机种子（默认：42）")
     parser.add_argument("--max-frames", type=int, default=None,
@@ -246,9 +241,6 @@ def main():
         sys.exit("错误：无法从视频中读取任何帧。")
     orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
     print(f"  {len(frames)} 帧  分辨率 {orig_w}×{orig_h}  fps={src_fps:.2f}")
-    # CogVideoX 3D VAE 时序压缩：lT = (T-1)//4，需要 T = 4k+1（即1,5,9,...,49）
-    # encode T帧 → lT=(T-1)//4 latent帧，decode lT → (lT*4+1) 帧
-    # 自动裁剪到最近的合法帧数，避免 VAE 出错
     if (len(frames) - 1) % 4 != 0:
         good = ((len(frames) - 1) // 4) * 4 + 1
         good = max(5, good)
@@ -277,10 +269,7 @@ def main():
 
     # 加载视频扩散模型
     print(f"加载模型：{model_id}  (type={args.model_type})")
-    if args.model_type == "wan-vace":
-        pipe = load_wan_vace_pipe(model_id, args.device)
-    else:
-        pipe = load_cogvideox_pipe(model_id, args.device)
+    pipe = load_wan_vace_pipe(model_id, args.device)
 
     adapter = create_adapter(pipe)
     print(f"  已使用适配器：{type(adapter).__name__}")
@@ -291,6 +280,7 @@ def main():
         lam=args.lam,
         scheduler_steps=args.scheduler_steps,
         do_refine=not args.no_refine,
+        marker_radius=args.marker_radius,
         seed=args.seed,
         model_width=args.model_width,
         model_height=args.model_height,

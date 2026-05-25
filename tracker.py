@@ -9,7 +9,7 @@ Point Prompting 主跟踪器。
   5. 精细化（可选）：对标记周围区域执行 inpainting 精细化。
   6. 返回轨迹坐标和可见性标志。
 
-基于 CogVideoX-I2V。
+基于 Wan2.1-VACE-I2V。
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class PointPrompter:
     接受原始 diffusers pipeline（自动检测类型）或 ModelAdapter 实例。
 
     使用示例：
-        pipe    = load_cogvideox_pipe("THUDM/CogVideoX-5b-I2V")
+        pipe    = load_wan_vace_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers")
         tracker = PointPrompter(pipe)
         result  = tracker.track(frames, query_point=(x, y))
     """
@@ -137,7 +137,7 @@ class PointPrompter:
         generated = run_sdedit(
             adapter=self.adapter,
             frames_bgr_edited=frames_edited,
-            frame_bgr_original=frame0_original,  # 负向条件：无标记的原始帧
+            frame_bgr_original=frame0_original,  # 负向条件：第 0 帧无标记
             gamma=cfg.gamma,
             lam=cfg.lam,
             scheduler_steps=cfg.scheduler_steps,

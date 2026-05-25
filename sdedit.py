@@ -1,7 +1,7 @@
 """
 Point Prompting 核心：带反事实增强引导的 SDEdit 去噪。
 
-基于 CogVideoX-I2V 的 SDEdit 去噪。
+基于 Wan2.1-VACE 的 SDEdit 去噪。
 
 反事实引导公式（论文公式 3）：
     v̂_θ(x_t, c_edited) = (λ+1) · v_θ(x_t, c_edited) - λ · v_θ(x_t, c_original)
@@ -86,14 +86,14 @@ def run_sdedit(
     """执行一次带反事实增强引导的 SDEdit 完整流程。
 
     Args:
-        adapter:          CogVideoXAdapter
-        frames_bgr_edited: frame[0] 含红色标记的视频帧列表
-        frame_bgr_original: 不含标记的原始 frame[0]（用于负向条件）
-        gamma:            SDEdit 加噪比例 γ ∈ (0, 1]，越大生成越自由
-        lam:              反事实引导权重 λ，越大标记越显著
-        scheduler_steps:  调度器总步数（论文：100）；从 gamma*N 处开始去噪到末尾
-        prompt:           文本提示（论文零样本设置为空字符串）
-        generator:        可复现性用的随机数生成器
+        adapter:            ModelAdapter
+        frames_bgr_edited:  frame[0] 含红色标记的完整视频帧列表（用于加噪）
+        frame_bgr_original: 第 0 帧不含标记的原始图像（负向条件）
+        gamma:              SDEdit 加噪比例 γ ∈ (0, 1]，越大生成越自由
+        lam:                反事实引导权重 λ，越大标记越显著
+        scheduler_steps:    调度器总步数（论文：100）；从 gamma*N 处开始去噪到末尾
+        prompt:             文本提示（论文零样本设置为空字符串）
+        generator:          可复现性用的随机数生成器
 
     Returns:
         生成后的帧列表，每帧 (H, W, 3) BGR uint8
@@ -113,22 +113,22 @@ def run_sdedit(
     print(f"[DEBUG] debug_input_frames saved ({len(frames_bgr_edited)} frames)")
 
     # ------------------------------------------------------------------ #
-    # 步骤 2：分别编码"含标记"和"原始"帧的图像条件                       #
+    # 步骤 2：分别编码正负向图像条件（论文设计：仅第 0 帧，差异只在红点）  #
     # ------------------------------------------------------------------ #
-    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
+    # c_edited：第 0 帧带红点的单帧 latent
+    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0])
+    # c_original：第 0 帧不带红点的单帧 latent（唯一变量是红点的有无）
     cond_original = adapter.encode_image_cond(frame_bgr_original)
     print(f"[DEBUG] cond_edited:   shape={cond_edited.shape} "
           f"min={cond_edited.min():.3f} max={cond_edited.max():.3f}")
     print(f"[DEBUG] cond_original: shape={cond_original.shape} "
           f"min={cond_original.min():.3f} max={cond_original.max():.3f}")
     print(f"[DEBUG] cond diff (edited-original): "
-          f"mean abs={( cond_edited - cond_original).abs().mean():.4f}")
+          f"mean abs={(cond_edited - cond_original).abs().mean():.4f}")
 
-    # [DEBUG] 将 cond_edited 解码回像素，确认红色标记是否正确保留
-    _cond_frame = adapter.decode_latents(cond_edited)[0]
-    cv2.imwrite("debug_cond_edited.png", _cond_frame)
-    _cond_orig_frame = adapter.decode_latents(cond_original)[0]
-    cv2.imwrite("debug_cond_original.png", _cond_orig_frame)
+    # [DEBUG] 解码确认标记保留
+    cv2.imwrite("debug_cond_edited.png",   adapter.decode_latents(cond_edited)[0])
+    cv2.imwrite("debug_cond_original.png", adapter.decode_latents(cond_original)[0])
     print(f"[DEBUG] debug_cond_edited.png / debug_cond_original.png saved")
 
     # ------------------------------------------------------------------ #

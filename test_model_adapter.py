@@ -24,7 +24,6 @@ sys.path.insert(0, ".")
 
 from model_adapter import (
     ModelAdapter,
-    CogVideoXAdapter,
     WanAdapter,
     WanVACEAdapter,
     create_adapter,
@@ -166,27 +165,6 @@ class _MockScheduler:
 
 
 # --------------------------------------------------------------------------- #
-#  CogVideoX mock transformer                                                   #
-# Receives (1, 2*LAT_C, T, lH, lW), returns (1, LAT_C, T, lH, lW)            #
-# --------------------------------------------------------------------------- #
-
-class _MockCogVideoXTransformer:
-    def __init__(self, use_rotary=False):
-        self.config = SimpleNamespace(use_rotary_positional_embeddings=use_rotary)
-        self.dtype  = torch.float32
-
-    def forward(self, hidden_states, encoder_hidden_states, timestep,
-                image_rotary_emb=None, return_dict=False, **kwargs):
-        B_, combined_C, T_, lH_, lW_ = hidden_states.shape
-        lat_c = combined_C // 2
-        vel   = torch.zeros(B_, lat_c, T_, lH_, lW_, dtype=hidden_states.dtype)
-        return (vel,)
-
-    def __call__(self, **kwargs):
-        return self.forward(**kwargs)
-
-
-# --------------------------------------------------------------------------- #
 #  Wan mock transformer                                                         #
 # Receives (1, LAT_C, 1+T, lH, lW), returns same shape                        #
 # --------------------------------------------------------------------------- #
@@ -226,17 +204,6 @@ class _MockWanVACETransformer:
 
 # Named exactly so that type(pipe).__name__ matches what create_adapter looks for.
 
-class CogVideoXImageToVideoPipeline:
-    """Mock CogVideoX I2V pipeline."""
-    def __init__(self, use_rotary=False):
-        self.device          = torch.device("cpu")
-        self.vae             = _MockVAE()
-        self.transformer     = _MockCogVideoXTransformer(use_rotary)
-        self.tokenizer       = _MockTokenizer()
-        self.text_encoder    = _MockTextEncoder()
-        self.scheduler       = _MockScheduler()
-
-
 class WanImageToVideoPipeline:
     """Mock Wan I2V pipeline."""
     def __init__(self, use_lhs=True):
@@ -259,10 +226,6 @@ class WanVACEPipeline:
         self.tokenizer      = _MockTokenizer()
         self.text_encoder   = _MockTextEncoder()
         self.scheduler      = _MockScheduler()
-
-
-def _cogvideox_pipe(use_rotary=False) -> CogVideoXImageToVideoPipeline:
-    return CogVideoXImageToVideoPipeline(use_rotary)
 
 
 def _wan_pipe(use_lhs=True) -> WanImageToVideoPipeline:
@@ -530,193 +493,6 @@ class TestSchedulerWrappers(unittest.TestCase):
         out     = adapter.scheduler_step(vel, t, lat)
         # Our mock: prev_sample = latents - 0.01*velocity = latents when vel=0
         torch.testing.assert_close(out, lat)
-
-
-# =========================================================================== #
-#  Tests: CogVideoXAdapter                                                      #
-# =========================================================================== #
-
-class TestCogVideoXAdapterProperties(unittest.TestCase):
-
-    def setUp(self):
-        self.pipe    = _cogvideox_pipe()
-        self.adapter = CogVideoXAdapter(self.pipe)
-
-    def test_device(self):
-        self.assertEqual(self.adapter.device, torch.device("cpu"))
-
-    def test_dtype(self):
-        self.assertEqual(self.adapter.dtype, torch.float32)
-
-    def test_scheduler_is_pipe_scheduler(self):
-        self.assertIs(self.adapter.scheduler, self.pipe.scheduler)
-
-
-class TestCogVideoXAdapterEncodeVideo(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = CogVideoXAdapter(_cogvideox_pipe())
-
-    def test_output_shape(self):
-        frames = _random_frames(n=T)
-        lat    = self.adapter.encode_video(frames)
-        # Mock VAE keeps spatial dims; shape should be (1, LAT_C, T, H, W)
-        self.assertEqual(lat.shape, (B, LAT_C, T, H, W))
-
-    def test_scaled_by_factor(self):
-        """Raw latents (all zero from mock) scaled by SCALE_F should still be 0; check non-zero case."""
-        # Patch the mock VAE to return a known non-zero latent
-        adapter  = CogVideoXAdapter(_cogvideox_pipe())
-        sentinel = torch.full((1, LAT_C, T, H, W), 2.0)
-        adapter.pipe.vae.encode = lambda x: _VAEEncodeResult(sentinel)
-
-        lat = adapter.encode_video(_random_frames())
-        expected = sentinel * SCALE_F
-        torch.testing.assert_close(lat, expected)
-
-
-class TestCogVideoXAdapterDecodeLatents(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = CogVideoXAdapter(_cogvideox_pipe())
-
-    def test_output_list_length(self):
-        # Mock VAE decode returns (1, C_IMG=3, T, H, W) — standard (B,C,T,H,W) layout.
-        lat = _random_latents(t=T)
-        frames = self.adapter.decode_latents(lat)
-        self.assertEqual(len(frames), T)
-
-    def test_output_frame_dtype_shape(self):
-        lat = _random_latents(t=3)
-        frames = self.adapter.decode_latents(lat)
-        for f in frames:
-            self.assertEqual(f.dtype, np.uint8)
-            self.assertEqual(f.shape[2], 3)     # BGR channels
-
-    def test_unscales_before_decode(self):
-        """The value passed to vae.decode should be lat / scaling_factor."""
-        received = {}
-        def _spy_decode(x):
-            received["x"] = x.clone()
-            return _VAEDecodeResult(torch.zeros(1, C_IMG, x.shape[2], H, W))
-        adapter = CogVideoXAdapter(_cogvideox_pipe())
-        adapter.pipe.vae.decode = _spy_decode
-
-        lat = torch.full((1, LAT_C, T, H, W), SCALE_F)
-        adapter.decode_latents(lat)
-        expected_input = lat / SCALE_F   # should be all-ones
-        torch.testing.assert_close(received["x"], expected_input)
-
-    def test_handles_btchw_layout(self):
-        """If VAE returns (1, T, C=3, H, W), the adapter must permute to (1, C, T, H, W)."""
-        def _decode_btchw(x):
-            T_ = x.shape[2]
-            # Return (1, T, 3, H, W) — note: shape[1]=T ≠ 3, shape[2]=3
-            return _VAEDecodeResult(torch.zeros(1, T_, C_IMG, H, W))
-        adapter = CogVideoXAdapter(_cogvideox_pipe())
-        adapter.pipe.vae.decode = _decode_btchw
-
-        lat    = _random_latents(t=T)   # T=4, so mock returns (1,4,3,H,W)
-        frames = adapter.decode_latents(lat)
-        self.assertEqual(len(frames), T)
-        for f in frames:
-            self.assertEqual(f.shape, (H, W, 3))
-
-
-class TestCogVideoXAdapterEncodeImageCond(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = CogVideoXAdapter(_cogvideox_pipe())
-
-    def test_output_shape_single_frame(self):
-        frame = np.random.randint(0, 256, (H, W, 3), dtype=np.uint8)
-        cond  = self.adapter.encode_image_cond(frame)
-        # Should be (1, LAT_C, 1, H, W)  — T=1 single conditioning frame
-        self.assertEqual(cond.shape, (1, LAT_C, 1, H, W))
-
-    def test_scaled_by_factor(self):
-        sentinel = torch.full((1, LAT_C, 1, H, W), 3.0)
-        adapter  = CogVideoXAdapter(_cogvideox_pipe())
-        adapter.pipe.vae.encode = lambda x: _VAEEncodeResult(sentinel)
-
-        frame = np.zeros((H, W, 3), dtype=np.uint8)
-        cond  = adapter.encode_image_cond(frame)
-        torch.testing.assert_close(cond, sentinel * SCALE_F)
-
-
-class TestCogVideoXAdapterEncodeText(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = CogVideoXAdapter(_cogvideox_pipe())
-
-    def test_output_is_tensor(self):
-        emb = self.adapter.encode_text("a moving car")
-        self.assertIsInstance(emb, torch.Tensor)
-
-    def test_output_shape(self):
-        emb = self.adapter.encode_text("")
-        # (1, TEXT_LEN, TEXT_D) from our mock
-        self.assertEqual(emb.shape, (1, TEXT_LEN, TEXT_D))
-
-
-def _cogvx_spy_transformer(received: dict, out_shape):
-    """Return a CogVideoX transformer class whose __call__ records kwargs."""
-    class _Spy(_MockCogVideoXTransformer):
-        def __call__(self, **kwargs):
-            received.update(kwargs)
-            return (torch.zeros(*out_shape),)
-    return _Spy()
-
-
-class TestCogVideoXAdapterForwardTransformer(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = CogVideoXAdapter(_cogvideox_pipe())
-
-    def test_output_shape(self):
-        noisy    = _random_latents()
-        img_cond = torch.zeros(1, LAT_C, 1, LAT_H, LAT_W)
-        text     = torch.zeros(1, TEXT_LEN, TEXT_D)
-        t        = torch.tensor([500])
-        out = self.adapter.forward_transformer(noisy, t, text, img_cond)
-        self.assertEqual(out.shape, noisy.shape)   # (1, LAT_C, T, lH, lW)
-
-    def test_transformer_receives_doubled_channels(self):
-        """Transformer hidden_states should have 2*LAT_C channels."""
-        received = {}
-        adapter  = CogVideoXAdapter(_cogvideox_pipe())
-        adapter.pipe.transformer = _cogvx_spy_transformer(received, (1, LAT_C, T, LAT_H, LAT_W))
-
-        noisy = _random_latents()
-        img   = torch.zeros(1, LAT_C, 1, LAT_H, LAT_W)
-        adapter.forward_transformer(noisy, torch.tensor([1]), torch.zeros(1, TEXT_LEN, TEXT_D), img)
-        self.assertEqual(received["hidden_states"].shape[1], 2 * LAT_C)
-
-    def test_image_cond_expanded_over_all_frames(self):
-        """Image latent should be expanded to T frames before concat."""
-        received = {}
-        adapter  = CogVideoXAdapter(_cogvideox_pipe())
-        adapter.pipe.transformer = _cogvx_spy_transformer(received, (1, LAT_C, T, LAT_H, LAT_W))
-
-        noisy    = torch.zeros(1, LAT_C, T, LAT_H, LAT_W)
-        img_cond = torch.ones(1, LAT_C, 1, LAT_H, LAT_W)   # non-zero sentinel
-        adapter.forward_transformer(noisy, torch.tensor([1]), torch.zeros(1, TEXT_LEN, TEXT_D), img_cond)
-
-        hs = received["hidden_states"]
-        # Channels [LAT_C:] = image latent (all-ones), all frames
-        self.assertTrue((hs[0, LAT_C:, :, :, :] == 1.0).all())
-
-    def test_scalar_timestep_gets_batch_dim(self):
-        """Scalar timestep should be unsqueezed to (1,) before passing to transformer."""
-        received = {}
-        adapter  = CogVideoXAdapter(_cogvideox_pipe())
-        adapter.pipe.transformer = _cogvx_spy_transformer(received, (1, LAT_C, T, LAT_H, LAT_W))
-
-        noisy    = _random_latents()
-        img      = torch.zeros(1, LAT_C, 1, LAT_H, LAT_W)
-        scalar_t = torch.tensor(500)    # ndim == 0
-        adapter.forward_transformer(noisy, scalar_t, torch.zeros(1, TEXT_LEN, TEXT_D), img)
-        self.assertGreaterEqual(received["timestep"].ndim, 1)
 
 
 # =========================================================================== #
@@ -1020,11 +796,6 @@ class TestWanVACEAdapter(unittest.TestCase):
 
 class TestCreateAdapter(unittest.TestCase):
 
-    def test_cogvideox_class_name(self):
-        pipe    = _cogvideox_pipe()
-        adapter = create_adapter(pipe)
-        self.assertIsInstance(adapter, CogVideoXAdapter)
-
     def test_wan_class_name(self):
         pipe    = _wan_pipe()
         adapter = create_adapter(pipe)
@@ -1045,7 +816,7 @@ class TestCreateAdapter(unittest.TestCase):
             forward = _wan_fwd
             dtype   = torch.float32
 
-        class SomeUnknownPipeline:      # name ∉ _COGVIDEOX_CLASSES, _WAN_CLASSES
+        class SomeUnknownPipeline:      # name ∉ _WAN_CLASSES
             transformer = _WanLikeTransformer()
             scheduler   = _MockScheduler()
 
@@ -1070,26 +841,8 @@ class TestCreateAdapter(unittest.TestCase):
         adapter = create_adapter(SomeUnknownPipeline())
         self.assertIsInstance(adapter, WanVACEAdapter)
 
-    def test_heuristic_cogvideox_signature(self):
-        """Unknown class with CogVideoX-like transformer signature → CogVideoXAdapter."""
-        def _cogvx_fwd(hidden_states, encoder_hidden_states, timestep,
-                       image_rotary_emb=None, return_dict=True):
-            pass
-
-        class _CogVXLikeTransformer:
-            forward = _cogvx_fwd
-            dtype   = torch.float32
-            config  = SimpleNamespace(use_rotary_positional_embeddings=False)
-
-        class AnotherUnknownPipeline:
-            transformer = _CogVXLikeTransformer()
-            scheduler   = _MockScheduler()
-
-        adapter = create_adapter(AnotherUnknownPipeline())
-        self.assertIsInstance(adapter, CogVideoXAdapter)
-
     def test_returns_model_adapter_subclass(self):
-        for pipe in [_cogvideox_pipe(), _wan_pipe()]:
+        for pipe in [_wan_pipe()]:
             adapter = create_adapter(pipe)
             self.assertIsInstance(adapter, ModelAdapter)
 
