@@ -115,10 +115,24 @@ def run_sdedit(
     # ------------------------------------------------------------------ #
     # 步骤 2：分别编码正负向图像条件（论文设计：仅第 0 帧，差异只在红点）  #
     # ------------------------------------------------------------------ #
-    # c_edited：第 0 帧带红点的单帧 latent
-    cond_edited   = adapter.encode_image_cond(frames_bgr_edited[0])
-    # c_original：第 0 帧不带红点的单帧 latent（唯一变量是红点的有无）
+    # c_original：第 0 帧不带红点，直接 VAE 编码
     cond_original = adapter.encode_image_cond(frame_bgr_original)
+    # c_edited：从整段视频 latent 取第 0 帧（已含标记），再在 latent 空间
+    # 强制叠加标记信号——VAE 8× 压缩使 4px 标记退化，latent 注入确保信号可感知
+    cond_edited = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
+    if query_point is not None:
+        _, _, _, lH, lW = cond_edited.shape
+        H_px = frames_bgr_edited[0].shape[0]
+        vae_stride = H_px // lH  # typically 8
+        lx = int(query_point[0] / vae_stride)
+        ly = int(query_point[1] / vae_stride)
+        r  = max(1, 4 // vae_stride)  # latent 空间半径，至少 1
+        lx = max(r, min(lW - r - 1, lx))
+        ly = max(r, min(lH - r - 1, ly))
+        # 标记强度：latent 均值绝对值的 2 倍，确保信号显著但不破坏整体分布
+        signal_strength = cond_edited.abs().mean().item() * 2.0
+        cond_edited = cond_edited.clone()
+        cond_edited[:, :, :, ly-r:ly+r+1, lx-r:lx+r+1] += signal_strength
     print(f"[DEBUG] cond_edited:   shape={cond_edited.shape} "
           f"min={cond_edited.min():.3f} max={cond_edited.max():.3f}")
     print(f"[DEBUG] cond_original: shape={cond_original.shape} "
