@@ -199,6 +199,7 @@ def run_sdedit(
             image_cond_edited=cond_edited,
             image_cond_original=cond_original,
             lam=lam,
+            n_frames_px=len(frames_bgr_edited),
         )
         latents = adapter.scheduler_step(v_guided, t, latents, t_next)
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):

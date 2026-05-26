@@ -138,7 +138,7 @@ def run_debug(args):
     text_cond = adapter.encode_text("")   # None（T5 未加载），forward_transformer 内部补全零向量
 
     # [诊断] 打印第一步的 control_hidden_states 统计量，确认 _build_control 是否正常
-    _ctrl = adapter._build_control(latents, image_cond)
+    _ctrl = adapter._build_control(latents, image_cond, n_frames_px=len(frames))
     print(f"[diag] control shape={_ctrl.shape} "
           f"norm={_ctrl.norm():.1f} mean={_ctrl.mean():.4f} "
           f"video_ctrl norm={_ctrl[:, :32].norm():.1f}  "
@@ -158,6 +158,7 @@ def run_debug(args):
                 timestep=t_batch,
                 text_cond=text_cond,
                 image_cond=image_cond,
+                n_frames_px=len(frames),
             )
 
         latents = adapter.scheduler_step(velocity, t, latents, t_next)

@@ -110,6 +110,7 @@ class ModelAdapter(ABC):
         timestep: torch.Tensor,
         text_cond: Any,
         image_cond: Any,
+        n_frames_px: int = 9,
     ) -> torch.Tensor:
         """单步去噪器前向传播，返回速度场 (1, C, T, H, W)。"""
         ...
@@ -123,13 +124,14 @@ class ModelAdapter(ABC):
         image_cond_edited: Any,
         image_cond_original: Any,
         lam: float = 8.0,
+        n_frames_px: int = 9,
     ) -> torch.Tensor:
         """反事实增强引导（论文公式 3）。
 
         v̂ = (λ+1) · v(c_edited) - λ · v(c_original)
         """
-        v_e = self.forward_transformer(noisy_latents, timestep, text_cond, image_cond_edited)
-        v_o = self.forward_transformer(noisy_latents, timestep, text_cond, image_cond_original)
+        v_e = self.forward_transformer(noisy_latents, timestep, text_cond, image_cond_edited, n_frames_px)
+        v_o = self.forward_transformer(noisy_latents, timestep, text_cond, image_cond_original, n_frames_px)
         return (lam + 1.0) * v_e - lam * v_o
 
     def set_timesteps(self, n_steps: int) -> None:
@@ -266,24 +268,15 @@ class WanVACEAdapter(ModelAdapter):
         self,
         noisy_latents: torch.Tensor,
         image_cond: torch.Tensor,
+        n_frames_px: int = 9,
     ) -> torch.Tensor:
-        """构建 VACE control_hidden_states，对齐官方 pipeline_wan_vace.py。
+        """构建 VACE control_hidden_states，严格对齐官方 prepare_masks。
 
-        官方结构（prepare_latents_vace + prepare_masks）：
-          inactive = video * (1-mask) → VAE encode → normalize → C ch
-          reactive = video * mask     → VAE encode → normalize → C ch
-          video_ctrl = cat([inactive, reactive], dim=1)  → 2C ch
-
-          mask_patches：像素空间 mask (T, H, W) 经 spatial patch flatten
-            view(T, lH, 8, lW, 8) → permute(2,4,0,1,3) → flatten(0,1)
-            → (64, T, lH, lW) → interpolate to (64, lT, lH, lW)
-
-          control = cat([video_ctrl, mask_patches], dim=1) → 2C+64 ch
-
-        Point Prompting 的场景（第 0 帧已知，其余帧待生成）：
-          mask = 0 on frame 0（已知），1 on frames 1..T-1（待生成）
-          inactive = video * (1-mask)：仅第 0 帧有内容（image_cond），其余为零
-          reactive = video * mask：全零（待生成帧内容未知）
+        官方 prepare_masks 输入是像素空间原始帧数 T_px（如9），
+        不是 lT*4 的近似值。patch_size[1]=2，所以：
+          new_height = H_px // (vae_s * patch_size) * patch_size = lH // patch_size * patch_size
+          view(T_px, new_height, vae_s, new_width, vae_s) → permute(2,4,0,1,3) → flatten(0,1)
+          → interpolate(nearest-exact) to (new_T, new_H, new_W)
         """
         _, C, lT, lH, lW = noisy_latents.shape
         dev, dt = self.device, self.dtype
@@ -294,19 +287,22 @@ class WanVACEAdapter(ModelAdapter):
         reactive = torch.zeros_like(inactive)
         video_ctrl = torch.cat([inactive, reactive], dim=1)  # (1, 2C, lT, lH, lW)
 
-        # --- mask patches（官方 spatial patch flatten，64ch）---
+        # --- mask patches（严格对齐官方 prepare_masks）---
+        vae_s = 8          # vae_scale_factor_spatial
+        p = 2              # transformer patch_size[1] = patch_size[2] = 2
+        # 官方用 new_height = H_px // (vae_s * p) * p，等价于 lH // p * p
+        new_H = lH // p * p
+        new_W = lW // p * p
         # 像素空间 mask：(T_px, H_px, W_px)，第 0 帧=0，其余=1
-        vae_s = 8  # vae_scale_factor_spatial
-        T_px, H_px, W_px = lT * 4, lH * vae_s, lW * vae_s  # 近似像素空间尺寸
-        mask_px = torch.ones(T_px, H_px, W_px, device=dev, dtype=dt)
-        mask_px[0] = 0.0  # 第 0 像素帧已知
-        # spatial patch flatten：(T, H, W) → (64, T, lH, lW)
-        mask_px = mask_px.view(T_px, lH, vae_s, lW, vae_s)
-        mask_px = mask_px.permute(2, 4, 0, 1, 3).flatten(0, 1)  # (64, T_px, lH, lW)
-        # 时序插值到 latent 帧数
+        H_px, W_px = new_H * vae_s, new_W * vae_s
+        mask_px = torch.ones(n_frames_px, H_px, W_px, device=dev, dtype=dt)
+        mask_px[0] = 0.0  # 第 0 帧已知
+        # spatial patch flatten：与官方完全相同
+        mask_px = mask_px.view(n_frames_px, new_H, vae_s, new_W, vae_s)
+        mask_px = mask_px.permute(2, 4, 0, 1, 3).flatten(0, 1)  # (64, T_px, new_H, new_W)
         mask_patches = torch.nn.functional.interpolate(
-            mask_px.unsqueeze(0), size=(lT, lH, lW), mode="nearest"
-        )  # (1, 64, lT, lH, lW)
+            mask_px.unsqueeze(0), size=(lT, new_H, new_W), mode="nearest-exact"
+        )  # (1, 64, lT, new_H, new_W)
 
         return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 2C+64, lT, lH, lW)
 
@@ -316,8 +312,9 @@ class WanVACEAdapter(ModelAdapter):
         timestep: torch.Tensor,
         text_cond: torch.Tensor,
         image_cond: torch.Tensor,
+        n_frames_px: int = 9,
     ) -> torch.Tensor:
-        control_hidden_states = self._build_control(noisy_latents, image_cond)
+        control_hidden_states = self._build_control(noisy_latents, image_cond, n_frames_px)
 
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
