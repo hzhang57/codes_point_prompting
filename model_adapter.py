@@ -325,8 +325,8 @@ class WanVACEAdapter(ModelAdapter):
         # encoder_hidden_states 是必填项；text_cond=None 时用全零占位
         # Wan-1.3B text_dim=512，seq_len 取 transformer config 或默认 512
         if text_cond is None:
-            text_dim = getattr(self.pipe.transformer.config, "text_dim", 512)
-            seq_len  = getattr(self.pipe.transformer.config, "max_text_seq_len", 512)
+            text_dim = getattr(self.pipe.transformer.config, "text_dim", 4096)
+            seq_len  = getattr(self.pipe.transformer.config, "max_text_seq_len", 226)
             text_cond = torch.zeros(1, seq_len, text_dim,
                                     device=self.device, dtype=self.dtype)
         out = self.pipe.transformer(

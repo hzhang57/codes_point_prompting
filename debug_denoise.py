@@ -134,9 +134,15 @@ def run_debug(args):
     # ------------------------------------------------------------------ #
     # 5. 无引导去噪循环                                                    #
     # ------------------------------------------------------------------ #
-    # 用第 0 帧作为 image_cond（无标记），与正向/负向相同，引导差 = 0
     image_cond = adapter.encode_image_cond(frames[0], latents_clean)
-    text_cond = adapter.encode_text("")   # None（T5 未加载）
+    text_cond = adapter.encode_text("")   # None（T5 未加载），forward_transformer 内部补全零向量
+
+    # [诊断] 打印第一步的 control_hidden_states 统计量，确认 _build_control 是否正常
+    _ctrl = adapter._build_control(latents, image_cond)
+    print(f"[diag] control shape={_ctrl.shape} "
+          f"norm={_ctrl.norm():.1f} mean={_ctrl.mean():.4f} "
+          f"video_ctrl norm={_ctrl[:, :32].norm():.1f}  "
+          f"mask_patches norm={_ctrl[:, 32:].norm():.1f}")
 
     timesteps_run = timesteps[start_idx:]
     print(f"[denoise] 去噪步数={len(timesteps_run)}  "
