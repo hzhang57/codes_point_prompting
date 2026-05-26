@@ -137,12 +137,28 @@ def run_debug(args):
     image_cond = adapter.encode_image_cond(frames[0], latents_clean)
     text_cond = adapter.encode_text("")   # None（T5 未加载），forward_transformer 内部补全零向量
 
-    # [诊断] 打印第一步的 control_hidden_states 统计量，确认 _build_control 是否正常
+    # [诊断] control 统计量
     _ctrl = adapter._build_control(latents, image_cond, n_frames_px=len(frames))
-    print(f"[diag] control shape={_ctrl.shape} "
-          f"norm={_ctrl.norm():.1f} mean={_ctrl.mean():.4f} "
-          f"video_ctrl norm={_ctrl[:, :32].norm():.1f}  "
-          f"mask_patches norm={_ctrl[:, 32:].norm():.1f}")
+    C = latents.shape[1]
+    print(f"[diag] control shape={_ctrl.shape} norm={_ctrl.norm():.1f} mean={_ctrl.mean():.4f}")
+    print(f"[diag]   video_ctrl  (ch 0..{2*C-1})  norm={_ctrl[:, :2*C].norm():.1f}")
+    print(f"[diag]   mask_patches(ch {2*C}..95)   norm={_ctrl[:, 2*C:].norm():.1f} "
+          f"min={_ctrl[:, 2*C:].min():.3f} max={_ctrl[:, 2*C:].max():.3f} "
+          f"mean={_ctrl[:, 2*C:].mean():.3f}")
+
+    # [诊断] 用全零 control 对比，isolate control 对 v_norm 的影响
+    print(f"[diag] --- 用全零 control 跑一步，对比 v_norm ---")
+    _zero_ctrl = torch.zeros_like(_ctrl)
+    with torch.no_grad():
+        _v_zero = adapter.pipe.transformer(
+            hidden_states=latents,
+            timestep=timesteps_run[0].unsqueeze(0).to(adapter.device),
+            encoder_hidden_states=torch.zeros(1, 226, 4096, device=adapter.device, dtype=adapter.dtype),
+            control_hidden_states=_zero_ctrl,
+            return_dict=False,
+        )[0]
+    print(f"[diag] v_norm with zero control = {_v_zero.norm():.3f}")
+    del _zero_ctrl, _v_zero
 
     timesteps_run = timesteps[start_idx:]
     print(f"[denoise] 去噪步数={len(timesteps_run)}  "
