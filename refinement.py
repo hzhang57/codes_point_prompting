@@ -116,11 +116,7 @@ def refine_tracks(
     t_start     = timesteps[start_idx]
 
     noise     = torch.randn_like(lat_gen, generator=generator)
-    lat_noisy = adapter.scheduler.add_noise(
-        lat_gen,
-        noise,
-        t_start[None] if t_start.ndim == 0 else t_start,
-    )
+    lat_noisy = adapter.scheduler.scale_noise(lat_gen, t_start, noise)
     # 掩码内用噪声潜变量，掩码外直接用原始潜变量（无需去噪）
     lat_start = mask_lat * lat_noisy + (1.0 - mask_lat) * lat_orig
 
