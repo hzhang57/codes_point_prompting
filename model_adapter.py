@@ -260,9 +260,22 @@ class WanVACEAdapter(ModelAdapter):
             lat = self.pipe.vae.encode(img_t).latent_dist.mean
         return self._normalize(lat).to(device=self.device, dtype=self.dtype)
 
-    def encode_text(self, prompt: str) -> Optional[torch.Tensor]:  # noqa: ARG002
-        # T5 未加载（Point Prompting 用空 prompt），返回 None
-        return None
+    def encode_text(self, prompt: str) -> torch.Tensor:
+        """用 T5 编码文本，返回 (1, seq_len, 4096)。空字符串返回 EOS embedding。"""
+        # 临时把 T5 移到 GPU 编码，完成后移回 CPU 释放显存
+        t5_device = self.device
+        self.pipe.text_encoder.to(t5_device)
+        with torch.no_grad():
+            embeds = self.pipe._get_t5_prompt_embeds(
+                prompt=prompt,
+                num_videos_per_prompt=1,
+                max_sequence_length=226,
+                device=t5_device,
+            )
+        self.pipe.text_encoder.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return embeds
 
     def _build_control(
         self,
@@ -349,10 +362,11 @@ def create_adapter(pipe) -> ModelAdapter:
 
 def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
                        device: str = "cuda") -> Any:
-    """加载 Wan2.1-VACE-1.3B pipeline（bfloat16），跳过 T5 文本编码器。
+    """加载 Wan2.1-VACE-1.3B pipeline（bfloat16），包含 T5 文本编码器。
 
-    Point Prompting 使用空字符串 prompt，不需要文本编码器。
-    跳过 T5 节省约 9.4GB 显存，transformer(2.6GB) + VAE(1GB) 轻松放入单卡。
+    T5 是必须的：全零 text_cond 会让 transformer 输出巨大的固定偏置
+    velocity（v_norm≈604），导致去噪完全失效。
+    T5 编码空字符串后放到 CPU，推理时按需移到 GPU，常驻显存约 1.4GB。
     """
     import os
     from diffusers import WanVACEPipeline
@@ -361,8 +375,6 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
     pipe = WanVACEPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
-        text_encoder=None,   # 跳过 T5，节省 ~9.4GB 显存
-        tokenizer=None,
     )
 
     if str(device).startswith("cuda"):
@@ -382,6 +394,8 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
         else:
             pipe.transformer.to("cuda:0")
         pipe.vae.to("cuda:0", dtype=torch.bfloat16)
+        # T5 放到 CPU，推理时按需移到 GPU（节省常驻显存）
+        pipe.text_encoder.to("cpu")
         for i in range(n_gpus if n_gpus >= 2 else 1):
             free = torch.cuda.mem_get_info(i)[0] / 1024**3
             total = torch.cuda.get_device_properties(i).total_memory // 1024**3
