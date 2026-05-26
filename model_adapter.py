@@ -300,8 +300,10 @@ class WanVACEAdapter(ModelAdapter):
         # spatial patch flatten：与官方完全相同
         mask_px = mask_px.view(n_frames_px, new_H, vae_s, new_W, vae_s)
         mask_px = mask_px.permute(2, 4, 0, 1, 3).flatten(0, 1)  # (64, T_px, new_H, new_W)
+        # nearest-exact 在 9→3 时把第0帧映射到输入帧1（坐标系偏移），
+        # nearest 才能正确保留第0帧的零值（floor(0 * 9/3) = 0）
         mask_patches = torch.nn.functional.interpolate(
-            mask_px.unsqueeze(0), size=(lT, new_H, new_W), mode="nearest-exact"
+            mask_px.unsqueeze(0), size=(lT, new_H, new_W), mode="nearest"
         )  # (1, 64, lT, new_H, new_W)
 
         return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 2C+64, lT, lH, lW)

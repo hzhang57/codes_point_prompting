@@ -137,6 +137,8 @@ def run_debug(args):
     image_cond = adapter.encode_image_cond(frames[0], latents_clean)
     text_cond = adapter.encode_text("")   # None（T5 未加载），forward_transformer 内部补全零向量
 
+    timesteps_run = timesteps[start_idx:]
+
     # [诊断] control 统计量
     _ctrl = adapter._build_control(latents, image_cond, n_frames_px=len(frames))
     C = latents.shape[1]
@@ -159,8 +161,6 @@ def run_debug(args):
         )[0]
     print(f"[diag] v_norm with zero control = {_v_zero.norm():.3f}")
     del _zero_ctrl, _v_zero
-
-    timesteps_run = timesteps[start_idx:]
     print(f"[denoise] 去噪步数={len(timesteps_run)}  "
           f"t: {timesteps_run[0].item():.0f} → {timesteps_run[-1].item():.0f}")
 
