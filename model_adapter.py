@@ -48,9 +48,6 @@ def _pipe_device(pipe) -> torch.device:
 
     Skips VAE — it may be intentionally pinned to a different device.
     """
-    d = getattr(pipe, "_execution_device", None)
-    if d is not None:
-        return d
     for attr in ("transformer", "unet"):
         mod = getattr(pipe, attr, None)
         if mod is not None:
@@ -58,6 +55,9 @@ def _pipe_device(pipe) -> torch.device:
                 return next(mod.parameters()).device
             except StopIteration:
                 pass
+    d = getattr(pipe, "_execution_device", None)
+    if d is not None:
+        return torch.device(d)
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -373,6 +373,13 @@ class WanVACEAdapter(ModelAdapter):
         image_cond: torch.Tensor,
         n_frames_px: int = 9,
     ) -> torch.Tensor:
+        noisy_latents = noisy_latents.to(device=self.device, dtype=self.dtype)
+        timestep = timestep.to(device=self.device)
+        if image_cond is not None:
+            image_cond = image_cond.to(device=self.device, dtype=self.dtype)
+        if text_cond is not None:
+            text_cond = text_cond.to(device=self.device, dtype=self.dtype)
+
         control_hidden_states = self._build_control(noisy_latents, image_cond, n_frames_px)
 
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
