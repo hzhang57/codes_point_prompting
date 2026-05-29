@@ -1,14 +1,19 @@
 # Point Prompting: Counterfactual Tracking with Video Diffusion Models
 
-**v2.0** — 2026-05-24
+**v2.1** — 2026-05-27
 
 An unofficial third-party implementation of [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://openreview.net/forum?id=6FFQ007qLX) (ICLR 2026 Poster).
 
 ## Changelog
 
+### v2.1 (2026-05-27)
+- Switch Wan2.1-VACE-1.3B sampling to the official Diffusers `UniPCMultistepScheduler`
+- Use `flow_prediction` / flow sigmas from model config with default `flow_shift=3.0` for 480P
+- Add `--flow-shift` for 720P-style runs (`5.0`) and scheduler experiments
+
 ### v2.0 (2026-05-24)
 - Enable counterfactual guidance loop (paper Eq. 3): `v̂ = (λ+1)·v(c_edited) − λ·v(c_original)`
-- Fix CogVideoX VAE frame count: valid T = 4k+1 (5, 9, 13, …, 49); auto-clip input frames
+- Fix VAE frame count handling: valid T = 4k+1; auto-clip input frames
 - Fix VAE tiling: `enable_slicing()` only — `enable_tiling()` causes checkerboard artifacts
 - Replace all MP4 debug saves with PNG sequences for reliable viewing on Kaggle
 - Fix `refine_gamma`: higher value = less noise = more conservative (was inverted in v1)
@@ -16,7 +21,7 @@ An unofficial third-party implementation of [*Point Prompting: Counterfactual Tr
 
 ### v1.0 (2026-05-23)
 - Full pipeline: color rebalance → marker insert → SDEdit → marker detection → inpainting refinement
-- CogVideoX-5B-I2V backbone via unified `ModelAdapter`
+- Video diffusion backbone via unified `ModelAdapter`
 - Dual-GPU support (2× T4 15 GiB)
 
 ## Overview
@@ -44,6 +49,7 @@ accelerate>=0.30.0
 opencv-python>=4.9.0
 pillow>=10.0.0
 numpy>=1.24.0
+scipy>=1.10.0
 ```
 
 ## Quick Start
@@ -52,11 +58,11 @@ numpy>=1.24.0
 python demo.py \
   --video input.mp4 \
   --points "320,240" \
-  --model-id THUDM/CogVideoX-5b-I2V \
-  --max-frames 49
+  --model-id Wan-AI/Wan2.1-VACE-1.3B-diffusers \
+  --max-frames 81
 ```
 
-CogVideoX requires T = 4k+1 frames (5, 9, 13, …, 49). `--max-frames 49` matches the VAE's native 49-frame window.
+Wan VACE uses a temporal VAE stride where valid input counts follow T = 4k+1. The default `--max-frames 81` matches the Wan2.1-VACE 480P workflow used by this repo.
 
 ## CLI Reference
 
@@ -64,14 +70,15 @@ CogVideoX requires T = 4k+1 frames (5, 9, 13, …, 49). `--max-frames 49` matche
 |---|---|---|
 | `--video` | required | Input video path |
 | `--points` | required | Query point(s) as `x,y` in frame-0 pixel coords |
-| `--model-id` | `THUDM/CogVideoX-5b-I2V` | HuggingFace model ID |
+| `--model-id` | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | HuggingFace model ID |
 | `--output` | `tracked.mp4` | Output video path |
 | `--gamma` | `0.5` | SDEdit noise ratio γ (paper default) |
 | `--lam` | `8.0` | Counterfactual guidance weight λ (paper default) |
 | `--scheduler-steps` | `100` | Total scheduler timesteps (paper default) |
+| `--flow-shift` | `3.0` | UniPC flow shift; use `5.0` for 720P-style Wan runs |
 | `--no-refine` | off | Skip inpainting refinement (faster) |
 | `--seed` | `42` | Random seed |
-| `--max-frames` | `49` | Max frames; must satisfy T = 4k+1 |
+| `--max-frames` | `81` | Max frames; must satisfy T = 4k+1 |
 | `--device` | `cuda` | Compute device |
 
 ## PointPrompterConfig
@@ -90,6 +97,16 @@ CogVideoX requires T = 4k+1 frames (5, 9, 13, …, 49). `--max-frames 49` matche
 | `model_height` | `480` | Max height fed to diffusion model |
 | `model_stride` | `16` | Spatial alignment stride |
 
+## Wan VACE Scheduler
+
+This repo follows the official Wan2.1-VACE-1.3B Diffusers setup:
+
+```python
+UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=3.0)
+```
+
+The model config provides `prediction_type="flow_prediction"` and `use_flow_sigmas=True`. The default `flow_shift=3.0` targets 480P; pass `--flow-shift 5.0` for 720P-style settings.
+
 ## File Structure
 
 ```
@@ -99,7 +116,7 @@ CogVideoX requires T = 4k+1 frames (5, 9, 13, …, 49). `--max-frames 49` matche
 ├── marker.py          # Red marker insertion and detection
 ├── color_rebalance.py # HSV saturation clamp for natural reds
 ├── refinement.py      # Inpainting refinement pass
-├── model_adapter.py   # CogVideoX adapter + pipeline loader
+├── model_adapter.py   # Wan VACE adapter + pipeline loader
 └── requirements.txt
 ```
 

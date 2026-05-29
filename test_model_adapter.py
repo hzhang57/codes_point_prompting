@@ -1,18 +1,4 @@
-"""
-Unit tests for model_adapter.py.
-
-All tests run on CPU without any real model weights.
-Each adapter is tested against a minimal mock pipeline whose components
-return tensors of known, predictable shapes.
-
-Run:
-    python -m pytest test_model_adapter.py -v
-  or
-    python test_model_adapter.py
-"""
-
 import sys
-import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,41 +10,23 @@ sys.path.insert(0, ".")
 
 from model_adapter import (
     ModelAdapter,
-    WanAdapter,
     WanVACEAdapter,
     create_adapter,
-    load_wan_pipe,
-    _bgr_to_pil,
+    load_wan_vace_pipe,
     _frames_to_tensor,
     _tensor_to_frames,
 )
 
 
-# =========================================================================== #
-#  Shared test dimensions                                                       #
-# =========================================================================== #
+B, C_IMG, T, H, W = 1, 3, 5, 32, 48
+LAT_C = 4
+TEXT_LEN = 226
+TEXT_D = 64
 
-B, C_IMG, T, H, W = 1, 3, 4, 32, 32   # pixel-space
-LAT_C    = 4                            # latent channels
-LAT_H    = H // 8                       # 4
-LAT_W    = W // 8                       # 4
-SCALE_F  = 0.18215                      # VAE scaling factor
-CLIP_N   = 16                           # CLIP token count
-CLIP_D   = 64                           # CLIP embedding dim
-TEXT_LEN = 32                           # tokenizer max length
-TEXT_D   = 64                           # text embedding dim
-
-
-# =========================================================================== #
-#  Mock building blocks                                                         #
-# =========================================================================== #
 
 class _LatentDist:
-    """Mimics VAE latent distribution (.latent_dist.sample())."""
-    def __init__(self, data: torch.Tensor):
-        self._data = data
-    def sample(self, generator=None):
-        return self._data.clone()
+    def __init__(self, data):
+        self.mean = data
 
 
 class _VAEEncodeResult:
@@ -72,806 +40,267 @@ class _VAEDecodeResult:
 
 
 class _MockVAE:
-    """
-    Identity-like VAE: encode keeps spatial dims, decode restores channel count.
-    encode: (1, C_in, T, H, W)  →  latent_dist.sample() → (1, LAT_C, T, H, W)
-    decode: (1, LAT_C, T, H, W) →  sample              → (1, C_IMG, T, H, W)
-    """
-    def __init__(self, lat_c=LAT_C, scale=SCALE_F):
-        self.config = SimpleNamespace(scaling_factor=scale)
-        self._lat_c  = lat_c
+    def __init__(self, dtype=torch.float32):
+        self.config = SimpleNamespace(
+            z_dim=LAT_C,
+            latents_mean=[0.0] * LAT_C,
+            latents_std=[1.0] * LAT_C,
+        )
+        self._param = torch.nn.Parameter(torch.empty(0, dtype=dtype))
+        self.slicing_enabled = False
+        self.tiling_enabled = False
 
-    def encode(self, x: torch.Tensor):
-        B_, _, T_, H_, W_ = x.shape
-        lat = torch.zeros(B_, self._lat_c, T_, H_, W_, dtype=x.dtype)
+    def parameters(self):
+        return iter([self._param])
+
+    def to(self, device=None, dtype=None):
+        if dtype is not None:
+            self._param.data = self._param.data.to(dtype=dtype)
+        if device is not None:
+            self._param.data = self._param.data.to(device=device)
+        return self
+
+    def encode(self, x):
+        b, _, t, h, w = x.shape
+        lat = torch.zeros(b, LAT_C, t, h, w, device=x.device, dtype=x.dtype)
         return _VAEEncodeResult(lat)
 
-    def decode(self, x: torch.Tensor):
-        B_, _, T_, H_, W_ = x.shape
-        out = torch.zeros(B_, C_IMG, T_, H_, W_, dtype=x.dtype)
-        return _VAEDecodeResult(out)
+    def decode(self, x):
+        b, _, t, h, w = x.shape
+        sample = torch.zeros(b, C_IMG, t, h, w, device=x.device, dtype=x.dtype)
+        return _VAEDecodeResult(sample)
+
+    def enable_slicing(self):
+        self.slicing_enabled = True
+
+    def enable_tiling(self):
+        self.tiling_enabled = True
 
 
-class _FeatExtractorOutput(dict):
-    """Dict-like output from feature extractor that supports .to()."""
-    def to(self, device):
+class _MockTransformer:
+    def __init__(self, dtype=torch.float32):
+        self.dtype = dtype
+        self.config = SimpleNamespace(in_channels=LAT_C, text_dim=TEXT_D, max_text_seq_len=TEXT_LEN)
+        self._param = torch.nn.Parameter(torch.empty(0, dtype=dtype))
+        self.last_kwargs = None
+
+    def parameters(self):
+        return iter([self._param])
+
+    def to(self, device=None, dtype=None):
+        if dtype is not None:
+            self.dtype = dtype
+            self._param.data = self._param.data.to(dtype=dtype)
+        if device is not None:
+            self._param.data = self._param.data.to(device=device)
         return self
-
-
-class _MockFeatureExtractor:
-    def __call__(self, images, return_tensors="pt"):
-        return _FeatExtractorOutput(pixel_values=torch.zeros(1, 3, 224, 224))
-
-
-class _ClipOutput:
-    def __init__(self, use_last_hidden_state=True):
-        self._lhs = use_last_hidden_state
-        if use_last_hidden_state:
-            self.last_hidden_state = torch.zeros(1, CLIP_N, CLIP_D)
-        else:
-            self.image_embeds = torch.zeros(1, CLIP_D)
-
-
-class _MockImageEncoder:
-    def __init__(self, use_last_hidden_state=True):
-        self._use_lhs = use_last_hidden_state
 
     def __call__(self, **kwargs):
-        return _ClipOutput(self._use_lhs)
-
-
-class _TokOutput:
-    def __init__(self):
-        self.input_ids      = torch.zeros(1, TEXT_LEN, dtype=torch.long)
-        self.attention_mask = torch.ones(1, TEXT_LEN, dtype=torch.long)
-
-    def to(self, device):
-        return self
-
-    # Support **unpacking
-    def keys(self):
-        return ["input_ids", "attention_mask"]
-    def __getitem__(self, k):
-        return getattr(self, k)
-
-
-class _MockTokenizer:
-    def __init__(self):
-        self.model_max_length = TEXT_LEN
-
-    def __call__(self, text, **kwargs):
-        return _TokOutput()
-
-
-class _TextEncOut:
-    def __init__(self):
-        self.last_hidden_state = torch.zeros(1, TEXT_LEN, TEXT_D)
+        self.last_kwargs = kwargs
+        return (torch.zeros_like(kwargs["hidden_states"]),)
 
 
 class _MockTextEncoder:
-    def __call__(self, **kwargs):
-        return _TextEncOut()
+    def __init__(self):
+        self.device = torch.device("cpu")
+
+    def to(self, device):
+        self.device = torch.device(device)
+        return self
 
 
 class _MockScheduler:
-    def __init__(self, n=50):
+    def __init__(self, n=10):
         self.timesteps = torch.linspace(999, 1, n).long()
+        self.begin_index = None
+        self.add_noise_calls = []
 
     def set_timesteps(self, n, device=None):
-        self.timesteps = torch.linspace(999, 1, n).long()
+        self.timesteps = torch.linspace(999, 1, n, device=device).long()
 
-    def step(self, velocity, t, latents):
-        return SimpleNamespace(prev_sample=latents - 0.01 * velocity)
+    def set_begin_index(self, begin_index):
+        self.begin_index = begin_index
+
+    def add_noise(self, latents, noise, timesteps):
+        self.add_noise_calls.append((latents, noise, timesteps))
+        return latents + noise * 0.5
+
+    def step(self, velocity, timestep, sample):
+        return SimpleNamespace(prev_sample=sample - 0.01 * velocity)
 
 
-# --------------------------------------------------------------------------- #
-#  Wan mock transformer                                                         #
-# Receives (1, LAT_C, 1+T, lH, lW), returns same shape                        #
-# --------------------------------------------------------------------------- #
-
-class _MockWanTransformer:
+class _MockWanVACEPipeline:
     def __init__(self):
-        self.dtype = torch.float32
+        self.vae = _MockVAE()
+        self.transformer = _MockTransformer()
+        self.text_encoder = _MockTextEncoder()
+        self.scheduler = _MockScheduler()
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states,
-                encoder_attention_mask=None, image_embeds=None,
-                return_dict=False, **kwargs):
-        vel = torch.zeros_like(hidden_states)
-        return (vel,)
+    def _get_t5_prompt_embeds(self, prompt, num_videos_per_prompt, max_sequence_length, device):
+        return torch.zeros(num_videos_per_prompt, max_sequence_length, TEXT_D, device=device)
 
-    def __call__(self, **kwargs):
-        return self.forward(**kwargs)
-
-
-class _MockWanVACETransformer:
-    def __init__(self):
-        self.dtype = torch.float32
-        self.config = SimpleNamespace(in_channels=LAT_C, text_dim=TEXT_D)
-
-    def forward(self, hidden_states, timestep, encoder_hidden_states,
-                control_hidden_states=None, control_hidden_states_scale=1.0,
-                return_dict=False, **kwargs):
-        vel = torch.zeros_like(hidden_states)
-        return (vel,)
-
-    def __call__(self, **kwargs):
-        return self.forward(**kwargs)
-
-
-# --------------------------------------------------------------------------- #
-#  Complete mock pipelines                                                      #
-# --------------------------------------------------------------------------- #
-
-# Named exactly so that type(pipe).__name__ matches what create_adapter looks for.
-
-class WanImageToVideoPipeline:
-    """Mock Wan I2V pipeline."""
-    def __init__(self, use_lhs=True):
-        self.device            = torch.device("cpu")
-        self.vae               = _MockVAE()
-        self.transformer       = _MockWanTransformer()
-        self.tokenizer         = _MockTokenizer()
-        self.text_encoder      = _MockTextEncoder()
-        self.image_encoder     = _MockImageEncoder(use_lhs)
-        self.feature_extractor = _MockFeatureExtractor()
-        self.scheduler         = _MockScheduler()
-
-
-class WanVACEPipeline:
-    """Mock Wan VACE pipeline."""
-    def __init__(self):
-        self.device         = torch.device("cpu")
-        self.vae            = _MockVAE()
-        self.transformer    = _MockWanVACETransformer()
-        self.tokenizer      = _MockTokenizer()
-        self.text_encoder   = _MockTextEncoder()
-        self.scheduler      = _MockScheduler()
-
-
-def _wan_pipe(use_lhs=True) -> WanImageToVideoPipeline:
-    return WanImageToVideoPipeline(use_lhs)
-
-
-def _wan_vace_pipe() -> WanVACEPipeline:
-    return WanVACEPipeline()
-
-
-# --------------------------------------------------------------------------- #
-#  Helpers for making synthetic test data                                       #
-# --------------------------------------------------------------------------- #
-
-def _random_frames(n=T, h=H, w=W) -> list:
-    """n random (h, w, 3) BGR uint8 frames."""
-    return [np.random.randint(0, 256, (h, w, 3), dtype=np.uint8) for _ in range(n)]
-
-
-def _random_latents(t=T) -> torch.Tensor:
-    return torch.randn(B, LAT_C, t, LAT_H, LAT_W)
-
-
-# =========================================================================== #
-#  Tests: shared tensor helpers                                                 #
-# =========================================================================== #
-
-class TestBgrToPil(unittest.TestCase):
-
-    def test_channel_swap(self):
-        """BGR input → PIL should have R and B channels swapped."""
-        arr = np.zeros((8, 8, 3), dtype=np.uint8)
-        arr[:, :, 0] = 10   # B
-        arr[:, :, 2] = 200  # R
-        pil = _bgr_to_pil(arr)
-        pil_arr = np.array(pil)
-        self.assertEqual(pil_arr[0, 0, 0], 200)  # PIL R == original B channel 2
-        self.assertEqual(pil_arr[0, 0, 2], 10)   # PIL B == original B channel 0
-
-    def test_output_is_rgb(self):
-        from PIL import Image
-        arr = np.random.randint(0, 256, (16, 16, 3), dtype=np.uint8)
-        pil = _bgr_to_pil(arr)
-        self.assertIsInstance(pil, Image.Image)
-        self.assertEqual(pil.mode, "RGB")
-
-    def test_does_not_mutate_input(self):
-        arr = np.random.randint(0, 256, (8, 8, 3), dtype=np.uint8)
-        before = arr.copy()
-        _bgr_to_pil(arr)
-        np.testing.assert_array_equal(arr, before)
-
-
-class TestFramesToTensor(unittest.TestCase):
-
-    def test_output_shape(self):
-        frames = _random_frames(n=3, h=16, w=24)
-        t = _frames_to_tensor(frames, torch.device("cpu"), torch.float32)
-        self.assertEqual(t.shape, (1, 3, 3, 16, 24))   # (B, C, T, H, W)
-
-    def test_value_range(self):
-        frames = _random_frames()
-        t = _frames_to_tensor(frames, torch.device("cpu"), torch.float32)
-        self.assertGreaterEqual(t.min().item(), -1.0 - 1e-5)
-        self.assertLessEqual(   t.max().item(),  1.0 + 1e-5)
-
-    def test_channel_order_rgb(self):
-        """A pure-red BGR frame should have positive R (dim 0) and near-zero B (dim 2)."""
-        frame = np.zeros((8, 8, 3), dtype=np.uint8)
-        frame[:, :, 2] = 255   # red in BGR = channel index 2
-        t = _frames_to_tensor([frame], torch.device("cpu"), torch.float32)
-        # After BGR→RGB flip: channel 0 = R = 255/127.5-1 = 1.0
-        self.assertAlmostEqual(t[0, 0, 0, 0, 0].item(),  1.0, places=3)  # R
-        self.assertAlmostEqual(t[0, 2, 0, 0, 0].item(), -1.0, places=3)  # B
-
-    def test_dtype_cast(self):
-        frames = _random_frames(n=2)
-        t16 = _frames_to_tensor(frames, torch.device("cpu"), torch.float16)
-        self.assertEqual(t16.dtype, torch.float16)
-
-    def test_single_frame(self):
-        frames = _random_frames(n=1)
-        t = _frames_to_tensor(frames, torch.device("cpu"), torch.float32)
-        self.assertEqual(t.shape, (1, 3, 1, H, W))
-
-
-class TestTensorToFrames(unittest.TestCase):
-
-    def test_output_length(self):
-        t = torch.zeros(1, 3, T, H, W)
-        frames = _tensor_to_frames(t)
-        self.assertEqual(len(frames), T)
-
-    def test_output_dtype_shape(self):
-        t = torch.zeros(1, 3, 2, H, W)
-        frames = _tensor_to_frames(t)
-        for f in frames:
-            self.assertEqual(f.dtype, np.uint8)
-            self.assertEqual(f.shape, (H, W, 3))
-
-    def test_value_clipping(self):
-        """Values outside [-1,1] must be clipped to [0,255]."""
-        t = torch.full((1, 3, 1, 4, 4), fill_value=5.0)    # >> 1
-        frames = _tensor_to_frames(t)
-        self.assertTrue((frames[0] == 255).all())
-
-        t2 = torch.full((1, 3, 1, 4, 4), fill_value=-5.0)  # << -1
-        frames2 = _tensor_to_frames(t2)
-        self.assertTrue((frames2[0] == 0).all())
-
-    def test_channel_order_bgr(self):
-        """Tensor channel 0 = R should end up in BGR index 2."""
-        # Fill everything with -1.0 (→ 0 in uint8), then set channel 0 (R) to 1.0 (→ 255).
-        t = torch.full((1, 3, 1, 4, 4), -1.0)
-        t[0, 0] = 1.0    # R channel = 1.0 → pixel value 255
-        frames = _tensor_to_frames(t)
-        # After BGR reversal: BGR[2] = R = 255, BGR[0] = B = 0
-        self.assertEqual(int(frames[0][0, 0, 2]), 255)
-        self.assertEqual(int(frames[0][0, 0, 0]),   0)   # B
-
-
-class TestRoundtrip(unittest.TestCase):
-
-    def test_frames_tensor_frames_roundtrip(self):
-        """Encode then decode should recover original frames within ±1 (uint8 rounding)."""
-        frames = _random_frames(n=3)
-        t = _frames_to_tensor(frames, torch.device("cpu"), torch.float32)
-        recovered = _tensor_to_frames(t)
-        for orig, rec in zip(frames, recovered):
-            np.testing.assert_allclose(
-                orig.astype(np.int32), rec.astype(np.int32), atol=1,
-                err_msg="roundtrip should be lossless up to 1-level uint8 rounding",
-            )
-
-
-# =========================================================================== #
-#  Tests: ModelAdapter shared concrete methods (via minimal subclass)           #
-# =========================================================================== #
 
 class _MinimalAdapter(ModelAdapter):
-    """Concrete subclass that wires the shared methods to a mock scheduler."""
-
     def __init__(self, sched=None):
         self._sched = sched or _MockScheduler()
+        self._dpm_step = None
 
     @property
-    def device(self): return torch.device("cpu")
+    def device(self):
+        return torch.device("cpu")
+
     @property
-    def dtype(self):  return torch.float32
+    def dtype(self):
+        return torch.float32
+
     @property
-    def scheduler(self): return self._sched
+    def scheduler(self):
+        return self._sched
 
-    def encode_video(self, f): raise NotImplementedError
-    def decode_latents(self, l): raise NotImplementedError
-    def encode_image_cond(self, f): raise NotImplementedError
-    def encode_text(self, p): raise NotImplementedError
+    def encode_video(self, frames_bgr):
+        raise NotImplementedError
 
-    def forward_transformer(self, noisy, t, text, img):
-        # Returns constant velocity of 1s so we can verify guidance math exactly
-        return torch.ones_like(noisy)
+    def decode_latents(self, latents):
+        raise NotImplementedError
 
+    def encode_image_cond(self, frame_bgr, video_latent=None):
+        raise NotImplementedError
 
-class TestAddNoise(unittest.TestCase):
+    def encode_text(self, prompt):
+        raise NotImplementedError
 
-    def setUp(self):
-        self.adapter = _MinimalAdapter()
-
-    def test_gamma_zero_returns_latents(self):
-        x   = torch.ones(1, 4, 3, 4, 4) * 0.5
-        eps = torch.ones(1, 4, 3, 4, 4) * 2.0
-        out = self.adapter.add_noise(x, eps, gamma=0.0)
-        torch.testing.assert_close(out, x)
-
-    def test_gamma_one_returns_noise(self):
-        x   = torch.ones(1, 4, 3, 4, 4) * 0.5
-        eps = torch.ones(1, 4, 3, 4, 4) * 2.0
-        out = self.adapter.add_noise(x, eps, gamma=1.0)
-        torch.testing.assert_close(out, eps)
-
-    def test_gamma_half_is_midpoint(self):
-        x   = torch.zeros(1, 4, 3, 4, 4)
-        eps = torch.ones(1, 4, 3, 4, 4) * 2.0
-        out = self.adapter.add_noise(x, eps, gamma=0.5)
-        expected = 0.5 * x + 0.5 * eps
-        torch.testing.assert_close(out, expected)
-
-    def test_output_shape(self):
-        x   = _random_latents()
-        eps = torch.randn_like(x)
-        out = self.adapter.add_noise(x, eps, gamma=0.5)
-        self.assertEqual(out.shape, x.shape)
+    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond, n_frames_px=9):
+        return torch.ones_like(noisy_latents)
 
 
-class TestPredictWithGuidance(unittest.TestCase):
+class TestTensorHelpers(unittest.TestCase):
+    def test_frames_tensor_roundtrip_shape_and_channels(self):
+        frame = np.zeros((4, 5, 3), dtype=np.uint8)
+        frame[..., 0] = 10
+        frame[..., 1] = 20
+        frame[..., 2] = 30
 
-    def setUp(self):
-        self.adapter = _MinimalAdapter()
+        tensor = _frames_to_tensor([frame], torch.device("cpu"), torch.float32)
+        out = _tensor_to_frames(tensor)
 
-    def _adapter_with_velocities(self, v_edited, v_original):
-        """Return an adapter whose forward_transformer returns v_e or v_o based on cond."""
-        class _A(_MinimalAdapter):
-            def forward_transformer(self, noisy, t, text, img):
-                return v_edited if img == "edited" else v_original
-        return _A()
-
-    def test_formula_numerically(self):
-        """v̂ = (λ+1)*v_e - λ*v_o  with λ=8."""
-        lam = 8.0
-        v_e = torch.full((1, 4, 3, 4, 4), 2.0)
-        v_o = torch.full((1, 4, 3, 4, 4), 1.0)
-        adapter = self._adapter_with_velocities(v_e, v_o)
-
-        noisy = _random_latents()
-        t     = torch.tensor([500])
-        out   = adapter.predict_with_guidance(noisy, t, "txt", "edited", "original", lam=lam)
-
-        expected = (lam + 1) * v_e - lam * v_o
-        torch.testing.assert_close(out, expected)
-
-    def test_lam_zero_equals_v_edited(self):
-        """When λ=0, guidance formula reduces to v_edited."""
-        v_e = torch.randn(1, 4, 3, 4, 4)
-        v_o = torch.randn(1, 4, 3, 4, 4)
-        adapter = self._adapter_with_velocities(v_e, v_o)
-        noisy   = _random_latents()
-        out = adapter.predict_with_guidance(noisy, torch.tensor([1]), "txt", "edited", "original", lam=0.0)
-        torch.testing.assert_close(out, v_e)
-
-    def test_equal_velocities_returns_v(self):
-        """When v_edited == v_original, guidance has no effect."""
-        v = torch.ones(1, 4, 3, 4, 4) * 3.14
-        adapter = self._adapter_with_velocities(v, v)
-        noisy   = _random_latents()
-        out = adapter.predict_with_guidance(noisy, torch.tensor([1]), "txt", "edited", "original", lam=8.0)
-        torch.testing.assert_close(out, v)
-
-    def test_output_shape_matches_latents(self):
-        noisy   = _random_latents()          # shape (1, LAT_C, T, LAT_H, LAT_W)
-        v = torch.zeros_like(noisy)
-        adapter = self._adapter_with_velocities(v, v)
-        out = adapter.predict_with_guidance(noisy, torch.tensor([1]), "txt", "edited", "original")
-        self.assertEqual(out.shape, noisy.shape)
+        self.assertEqual(tensor.shape, (1, 3, 1, 4, 5))
+        np.testing.assert_allclose(out[0], frame, atol=1)
 
 
-class TestSchedulerWrappers(unittest.TestCase):
-
-    def test_set_timesteps(self):
-        sched   = _MockScheduler(n=50)
+class TestSchedulerHelpers(unittest.TestCase):
+    def test_prepare_denoise_start_sets_begin_index_and_returns_slice(self):
+        sched = _MockScheduler(n=12)
         adapter = _MinimalAdapter(sched)
-        adapter.set_timesteps(20)
+
+        timesteps_run = adapter.prepare_denoise_start(20, 7)
+
         self.assertEqual(len(adapter.timesteps), 20)
+        self.assertEqual(sched.begin_index, 7)
+        torch.testing.assert_close(timesteps_run, adapter.timesteps[7:])
 
-    def test_timesteps_property(self):
-        sched   = _MockScheduler(n=30)
+    def test_add_noise_at_timestep_uses_scheduler_add_noise(self):
+        sched = _MockScheduler()
         adapter = _MinimalAdapter(sched)
-        self.assertEqual(len(adapter.timesteps), 30)
-        self.assertIsInstance(adapter.timesteps, torch.Tensor)
+        latents = torch.zeros(1, LAT_C, 2, 4, 4)
+        noise = torch.ones_like(latents)
 
-    def test_scheduler_step(self):
-        sched   = _MockScheduler()
-        adapter = _MinimalAdapter(sched)
-        lat     = torch.ones(1, 4, 3, 4, 4)
-        vel     = torch.zeros(1, 4, 3, 4, 4)
-        t       = torch.tensor(500)
-        out     = adapter.scheduler_step(vel, t, lat)
-        # Our mock: prev_sample = latents - 0.01*velocity = latents when vel=0
-        torch.testing.assert_close(out, lat)
+        out = adapter.add_noise_at_timestep(latents, noise, torch.tensor(500))
 
+        torch.testing.assert_close(out, torch.full_like(latents, 0.5))
+        self.assertEqual(len(sched.add_noise_calls), 1)
+        self.assertEqual(sched.add_noise_calls[0][2].shape, (1,))
 
-# =========================================================================== #
-#  Tests: WanAdapter                                                            #
-# =========================================================================== #
+    def test_scheduler_step_uses_generic_step_for_unipc_style_scheduler(self):
+        adapter = _MinimalAdapter(_MockScheduler())
+        latents = torch.ones(1, LAT_C, 2, 4, 4)
+        velocity = torch.ones_like(latents)
 
-class TestWanAdapterProperties(unittest.TestCase):
+        out = adapter.scheduler_step(velocity, torch.tensor(1), latents)
 
-    def setUp(self):
-        self.pipe    = _wan_pipe()
-        self.adapter = WanAdapter(self.pipe)
+        torch.testing.assert_close(out, latents - 0.01)
 
-    def test_device(self):
-        self.assertEqual(self.adapter.device, torch.device("cpu"))
-
-    def test_dtype(self):
-        self.assertEqual(self.adapter.dtype, torch.float32)
-
-    def test_default_img_lat_frames(self):
-        self.assertEqual(self.adapter._img_lat_frames, 1)
-
-
-class TestWanAdapterVaeScale(unittest.TestCase):
-
-    def test_reads_config(self):
-        pipe          = _wan_pipe()
-        pipe.vae.config.scaling_factor = 0.5
-        adapter       = WanAdapter(pipe)
-        self.assertAlmostEqual(adapter._vae_scale(), 0.5)
-
-    def test_default_fallback(self):
-        pipe          = _wan_pipe()
-        del pipe.vae.config.scaling_factor
-        adapter       = WanAdapter(pipe)
-        self.assertAlmostEqual(adapter._vae_scale(), 1.0)
-
-
-class TestWanAdapterEncodeVideo(unittest.TestCase):
-
-    def test_output_shape(self):
-        adapter = WanAdapter(_wan_pipe())
-        frames  = _random_frames(n=T)
-        lat     = adapter.encode_video(frames)
-        self.assertEqual(lat.shape, (B, LAT_C, T, H, W))
-
-
-class TestWanAdapterDecodeLatents(unittest.TestCase):
-
-    def test_strips_image_frame(self):
-        """decode_latents receives T+1 frames (with prepended image) → outputs T frames."""
-        adapter    = WanAdapter(_wan_pipe())
-        lat_with_img = _random_latents(t=T + 1)  # 1 image frame + T video frames
-        frames = adapter.decode_latents(lat_with_img)
-        self.assertEqual(len(frames), T)
-
-    def test_output_dtype_shape(self):
-        adapter = WanAdapter(_wan_pipe())
-        lat     = _random_latents(t=T + 1)
-        frames  = adapter.decode_latents(lat)
-        for f in frames:
-            self.assertEqual(f.dtype, np.uint8)
-            self.assertEqual(f.shape[2], 3)
-
-    def test_unscales_video_latent_only(self):
-        """Only the video portion (frames 1:) should be unscaled before decode."""
-        received = {}
-        def _spy_decode(x):
-            received["x"] = x.clone()
-            return _VAEDecodeResult(torch.zeros(1, C_IMG, x.shape[2], H, W))
-
-        adapter = WanAdapter(_wan_pipe())
-        adapter.pipe.vae.decode = _spy_decode
-        adapter.pipe.vae.config.scaling_factor = 2.0
-
-        lat_with_img = torch.full((1, LAT_C, T + 1, H, W), 2.0)
-        adapter.decode_latents(lat_with_img)
-
-        # Passed to decode: lat[1:] / 2.0 = 1.0
-        self.assertAlmostEqual(received["x"].mean().item(), 1.0, places=5)
-
-
-class TestWanAdapterEncodeImageCond(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = WanAdapter(_wan_pipe())
-
-    def test_returns_dict_with_correct_keys(self):
-        frame = np.random.randint(0, 256, (H, W, 3), dtype=np.uint8)
-        cond  = self.adapter.encode_image_cond(frame)
-        self.assertIn("clip_emb",   cond)
-        self.assertIn("vae_latent", cond)
-
-    def test_vae_latent_shape(self):
-        frame = np.zeros((H, W, 3), dtype=np.uint8)
-        cond  = self.adapter.encode_image_cond(frame)
-        self.assertEqual(cond["vae_latent"].shape, (1, LAT_C, 1, H, W))
-
-    def test_clip_emb_shape_last_hidden_state(self):
-        """When image_encoder returns last_hidden_state → (1, N_tokens, D)."""
-        adapter = WanAdapter(_wan_pipe(use_lhs=True))
-        frame   = np.zeros((H, W, 3), dtype=np.uint8)
-        cond    = adapter.encode_image_cond(frame)
-        self.assertEqual(cond["clip_emb"].shape, (1, CLIP_N, CLIP_D))
-
-    def test_clip_emb_shape_image_embeds(self):
-        """When image_encoder returns image_embeds → unsqueezed to (1, 1, D)."""
-        adapter = WanAdapter(_wan_pipe(use_lhs=False))
-        frame   = np.zeros((H, W, 3), dtype=np.uint8)
-        cond    = adapter.encode_image_cond(frame)
-        self.assertEqual(cond["clip_emb"].shape, (1, 1, CLIP_D))
-
-
-class TestWanAdapterEncodeText(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = WanAdapter(_wan_pipe())
-
-    def test_returns_dict_with_correct_keys(self):
-        out = self.adapter.encode_text("")
-        self.assertIn("embeds", out)
-        self.assertIn("mask",   out)
-
-    def test_embeds_shape(self):
-        out = self.adapter.encode_text("a cat")
-        self.assertEqual(out["embeds"].shape, (1, TEXT_LEN, TEXT_D))
-
-    def test_mask_shape(self):
-        out = self.adapter.encode_text("test")
-        self.assertEqual(out["mask"].shape, (1, TEXT_LEN))
-
-
-class TestWanAdapterPrependImageLatent(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = WanAdapter(_wan_pipe())
-
-    def test_temporal_dim_increases_by_one(self):
-        noisy    = _random_latents(t=T)
-        img_cond = {"vae_latent": torch.zeros(1, LAT_C, 1, LAT_H, LAT_W)}
-        out = self.adapter._prepend_image_latent(noisy, img_cond)
-        self.assertEqual(out.shape[2], T + 1)
-
-    def test_first_frame_is_image_latent(self):
-        noisy    = torch.zeros(1, LAT_C, T, LAT_H, LAT_W)
-        img_lat  = torch.ones(1, LAT_C, 1, LAT_H, LAT_W) * 7.0
-        img_cond = {"vae_latent": img_lat}
-        out = self.adapter._prepend_image_latent(noisy, img_cond)
-        torch.testing.assert_close(out[:, :, 0:1, :, :], img_lat)
-        torch.testing.assert_close(out[:, :, 1:,  :, :], noisy)
-
-    def test_spatial_interpolation_when_sizes_differ(self):
-        """If image latent has different spatial dims, it should be resized."""
-        noisy    = torch.zeros(1, LAT_C, T, LAT_H, LAT_W)          # lH x lW
-        img_lat  = torch.ones(1,  LAT_C, 1, LAT_H * 2, LAT_W * 2)  # 2x bigger
-        img_cond = {"vae_latent": img_lat}
-        out = self.adapter._prepend_image_latent(noisy, img_cond)
-        # After resize, spatial dims should match noisy
-        self.assertEqual(out.shape[3], LAT_H)
-        self.assertEqual(out.shape[4], LAT_W)
-
-
-class TestWanAdapterForwardTransformer(unittest.TestCase):
-
-    def setUp(self):
-        self.adapter = WanAdapter(_wan_pipe())
-
-    def _make_cond(self):
-        return {
-            "clip_emb":   torch.zeros(1, CLIP_N, CLIP_D),
-            "vae_latent": torch.zeros(1, LAT_C, 1, LAT_H, LAT_W),
-        }
-
-    def _make_text(self):
-        return {
-            "embeds": torch.zeros(1, TEXT_LEN, TEXT_D),
-            "mask":   torch.ones(1, TEXT_LEN, dtype=torch.long),
-        }
-
-    def test_output_shape_strips_image_frame(self):
-        noisy = _random_latents(t=T)
-        out   = self.adapter.forward_transformer(
-            noisy, torch.tensor([500]), self._make_text(), self._make_cond()
-        )
-        self.assertEqual(out.shape, noisy.shape)   # (1, LAT_C, T, lH, lW)
-
-    def test_transformer_receives_T_plus_one_frames(self):
-        """Transformer input should have T+1 temporal frames (prepended image)."""
-        received = {}
-
-        class _SpyWan(_MockWanTransformer):
-            def __call__(self, **kwargs):
-                received["T_in"] = kwargs["hidden_states"].shape[2]
-                return (torch.zeros(1, LAT_C, T + 1, LAT_H, LAT_W),)
-
-        adapter = WanAdapter(_wan_pipe())
-        adapter.pipe.transformer = _SpyWan()
-
-        noisy = _random_latents(t=T)
-        adapter.forward_transformer(noisy, torch.tensor([1]), self._make_text(), self._make_cond())
-        self.assertEqual(received["T_in"], T + 1)
-
-    def test_image_embeds_passed_to_transformer(self):
-        """clip_emb from image_cond must be forwarded as image_embeds."""
-        received = {}
-
-        class _SpyWan(_MockWanTransformer):
-            def __call__(self, **kwargs):
-                received["image_embeds"] = kwargs.get("image_embeds")
-                return (torch.zeros(1, LAT_C, T + 1, LAT_H, LAT_W),)
-
-        adapter  = WanAdapter(_wan_pipe())
-        adapter.pipe.transformer = _SpyWan()
-
-        clip_emb = torch.full((1, CLIP_N, CLIP_D), 3.14)
-        cond = {"clip_emb": clip_emb, "vae_latent": torch.zeros(1, LAT_C, 1, LAT_H, LAT_W)}
-        adapter.forward_transformer(_random_latents(), torch.tensor([1]), self._make_text(), cond)
-        torch.testing.assert_close(received["image_embeds"], clip_emb)
-
-
-# =========================================================================== #
-#  Tests: WanVACEAdapter                                                       #
-# =========================================================================== #
 
 class TestWanVACEAdapter(unittest.TestCase):
+    def test_create_adapter_returns_wan_vace_adapter(self):
+        adapter = create_adapter(_MockWanVACEPipeline())
+        self.assertIsInstance(adapter, WanVACEAdapter)
 
-    def setUp(self):
-        self.adapter = WanVACEAdapter(_wan_vace_pipe())
+    def test_encode_video_uses_vae_dtype_and_returns_transformer_dtype(self):
+        pipe = _MockWanVACEPipeline()
+        pipe.vae = _MockVAE(dtype=torch.float64)
+        pipe.transformer = _MockTransformer(dtype=torch.float32)
+        adapter = WanVACEAdapter(pipe)
+        frames = [np.zeros((H, W, 3), dtype=np.uint8) for _ in range(T)]
 
-    def _make_text(self):
-        return {
-            "embeds": torch.zeros(1, TEXT_LEN, TEXT_D),
-            "mask":   torch.ones(1, TEXT_LEN, dtype=torch.long),
-        }
+        latents = adapter.encode_video(frames)
 
-    def test_encode_video_records_shape_metadata(self):
-        frames = _random_frames(n=T)
-        lat = self.adapter.encode_video(frames)
-        self.assertEqual(lat.shape, (B, LAT_C, T, H, W))
-        self.assertEqual(self.adapter._last_num_frames, T)
-        self.assertEqual(self.adapter._last_height, H)
-        self.assertEqual(self.adapter._last_width, W)
-        self.assertEqual(self.adapter._last_latent_frames, T)
+        self.assertEqual(latents.shape, (B, LAT_C, T, H, W))
+        self.assertEqual(latents.dtype, torch.float32)
 
-    def test_fallback_image_cond_uses_vace_control_key(self):
-        self.adapter.encode_video(_random_frames(n=T))
-        cond = self.adapter.encode_image_cond(np.zeros((H, W, 3), dtype=np.uint8))
-        self.assertIn("control", cond)
-        self.assertEqual(cond["control"].shape, (B, LAT_C + 1, T, H, W))
-        mask = cond["control"][:, LAT_C:]
-        self.assertEqual(mask[0, 0, 0].max().item(), 0.0)
-        self.assertEqual(mask[0, 0, 1:].min().item(), 1.0)
+    def test_forward_transformer_passes_vace_control(self):
+        pipe = _MockWanVACEPipeline()
+        adapter = WanVACEAdapter(pipe)
+        noisy = torch.zeros(1, LAT_C, 2, 4, 6)
+        image_cond = torch.zeros(1, LAT_C, 1, 4, 6)
+        text_cond = torch.zeros(1, TEXT_LEN, TEXT_D)
 
-    def test_forward_transformer_passes_control_hidden_states(self):
-        received = {}
-
-        class _SpyVACE(_MockWanVACETransformer):
-            def __call__(self, **kwargs):
-                received["control"] = kwargs.get("control_hidden_states")
-                received["scale"] = kwargs.get("control_hidden_states_scale")
-                return (torch.zeros_like(kwargs["hidden_states"]),)
-
-        adapter = WanVACEAdapter(_wan_vace_pipe())
-        adapter.pipe.transformer = _SpyVACE()
-        control = torch.ones(1, LAT_C + 1, T, LAT_H, LAT_W)
-        cond = {"control": control, "scale": 0.75}
-
-        noisy = _random_latents(t=T)
-        out = adapter.forward_transformer(noisy, torch.tensor([1]), self._make_text(), cond)
+        out = adapter.forward_transformer(noisy, torch.tensor([1]), text_cond, image_cond, n_frames_px=5)
 
         self.assertEqual(out.shape, noisy.shape)
-        torch.testing.assert_close(received["control"], control)
-        self.assertTrue(torch.is_tensor(received["scale"]))
-        torch.testing.assert_close(received["scale"], torch.tensor([0.75]))
+        control = pipe.transformer.last_kwargs["control_hidden_states"]
+        self.assertEqual(control.shape, (1, 2 * LAT_C + 64, 2, 4, 6))
 
-    def test_encode_text_without_text_encoder_returns_zeros_for_empty_prompt(self):
-        pipe = _wan_vace_pipe()
-        pipe.text_encoder = None
-        pipe.tokenizer = None
-        adapter = WanVACEAdapter(pipe)
+    def test_encode_text_uses_t5_prompt_embeds(self):
+        adapter = WanVACEAdapter(_MockWanVACEPipeline())
+        embeds = adapter.encode_text("")
 
-        out = adapter.encode_text("")
-
-        self.assertEqual(out["embeds"].shape, (1, 512, TEXT_D))
-        self.assertEqual(out["mask"].shape, (1, 512))
-        self.assertEqual(out["embeds"].abs().sum().item(), 0.0)
-        self.assertEqual(out["mask"].sum().item(), 0)
-
-    def test_encode_text_without_text_encoder_rejects_non_empty_prompt(self):
-        pipe = _wan_vace_pipe()
-        pipe.text_encoder = None
-        pipe.tokenizer = None
-        adapter = WanVACEAdapter(pipe)
-
-        with self.assertRaisesRegex(ValueError, "text encoder"):
-            adapter.encode_text("a prompt")
+        self.assertEqual(embeds.shape, (1, TEXT_LEN, TEXT_D))
 
 
-# =========================================================================== #
-#  Tests: create_adapter factory                                                #
-# =========================================================================== #
-
-class TestCreateAdapter(unittest.TestCase):
-
-    def test_wan_class_name(self):
-        pipe    = _wan_pipe()
-        adapter = create_adapter(pipe)
-        self.assertIsInstance(adapter, WanAdapter)
-
-    def test_wan_vace_class_name(self):
-        pipe    = _wan_vace_pipe()
-        adapter = create_adapter(pipe)
-        self.assertIsInstance(adapter, WanVACEAdapter)
-
-    def test_heuristic_wan_signature(self):
-        """Unknown class but Wan-like transformer signature → WanAdapter."""
-        def _wan_fwd(hidden_states, timestep, encoder_hidden_states,
-                     encoder_attention_mask=None, image_embeds=None, return_dict=True):
-            pass
-
-        class _WanLikeTransformer:
-            forward = _wan_fwd
-            dtype   = torch.float32
-
-        class SomeUnknownPipeline:      # name ∉ _WAN_CLASSES
-            transformer = _WanLikeTransformer()
-            scheduler   = _MockScheduler()
-
-        adapter = create_adapter(SomeUnknownPipeline())
-        self.assertIsInstance(adapter, WanAdapter)
-
-    def test_heuristic_wan_vace_signature(self):
-        """Unknown class but VACE-like transformer signature → WanVACEAdapter."""
-        def _vace_fwd(hidden_states, timestep, encoder_hidden_states,
-                      control_hidden_states=None, control_hidden_states_scale=1.0,
-                      return_dict=True):
-            pass
-
-        class _VaceLikeTransformer:
-            forward = _vace_fwd
-            dtype   = torch.float32
-
-        class SomeUnknownPipeline:
-            transformer = _VaceLikeTransformer()
-            scheduler   = _MockScheduler()
-
-        adapter = create_adapter(SomeUnknownPipeline())
-        self.assertIsInstance(adapter, WanVACEAdapter)
-
-    def test_returns_model_adapter_subclass(self):
-        for pipe in [_wan_pipe()]:
-            adapter = create_adapter(pipe)
-            self.assertIsInstance(adapter, ModelAdapter)
-
-    def test_loads_vace_pipeline_class(self):
-        class LoadableWanVACEPipeline(WanVACEPipeline):
+class TestWanVACELoader(unittest.TestCase):
+    def test_loader_uses_official_unipc_scheduler_with_flow_shift(self):
+        class FakeAutoencoderKLWan:
             @classmethod
-            def from_pretrained(cls, model_id, torch_dtype=None, **kwargs):
+            def from_pretrained(cls, model_id, subfolder=None, torch_dtype=None):
+                vae = _MockVAE(dtype=torch_dtype)
+                vae.model_id = model_id
+                vae.subfolder = subfolder
+                return vae
+
+        class FakeUniPCMultistepScheduler:
+            @classmethod
+            def from_config(cls, config, flow_shift=None):
+                sched = _MockScheduler()
+                sched.config = config
+                sched.flow_shift = flow_shift
+                return sched
+
+        class FakeWanVACEPipeline(_MockWanVACEPipeline):
+            @classmethod
+            def from_pretrained(cls, model_id, vae=None, torch_dtype=None, **kwargs):
                 pipe = cls()
                 pipe.model_id = model_id
-                pipe.torch_dtype = torch_dtype
-                pipe.from_pretrained_kwargs = kwargs
-                pipe.to_device = None
+                pipe.vae = vae
+                pipe.transformer = _MockTransformer(dtype=torch_dtype)
+                pipe.scheduler.config = {"prediction_type": "flow_prediction"}
                 return pipe
 
-            def to(self, device):
-                self.to_device = device
-                return self
+        fake_diffusers = SimpleNamespace(
+            AutoencoderKLWan=FakeAutoencoderKLWan,
+            UniPCMultistepScheduler=FakeUniPCMultistepScheduler,
+            WanVACEPipeline=FakeWanVACEPipeline,
+        )
 
-            def enable_model_cpu_offload(self):
-                self.cpu_offload = True
-
-        fake_diffusers = SimpleNamespace(WanVACEPipeline=LoadableWanVACEPipeline)
         with patch.dict(sys.modules, {"diffusers": fake_diffusers}):
-            pipe = load_wan_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers", device="cpu")
+            pipe = load_wan_vace_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers", device="cpu", flow_shift=3.0)
 
-        self.assertIsInstance(pipe, LoadableWanVACEPipeline)
-        self.assertEqual(pipe.model_id, "Wan-AI/Wan2.1-VACE-1.3B-diffusers")
-        self.assertIsNone(pipe.from_pretrained_kwargs["text_encoder"])
-        self.assertIsNone(pipe.from_pretrained_kwargs["tokenizer"])
+        self.assertIsInstance(pipe, FakeWanVACEPipeline)
+        self.assertEqual(pipe.vae.subfolder, "vae")
+        self.assertEqual(next(pipe.vae.parameters()).dtype, torch.float32)
+        self.assertEqual(pipe.transformer.dtype, torch.bfloat16)
+        self.assertEqual(pipe.scheduler.flow_shift, 3.0)
+        self.assertTrue(pipe.vae.slicing_enabled)
+        self.assertTrue(pipe.vae.tiling_enabled)
 
 
 if __name__ == "__main__":

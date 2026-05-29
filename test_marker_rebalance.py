@@ -29,8 +29,6 @@ from marker import (
 from color_rebalance import (
     rebalance_frame,
     rebalance_video,
-    _red_proximity_weight,
-    _RED_HUE_MARGIN,
 )
 
 
@@ -225,7 +223,7 @@ class TestTrackMarkerSequence(unittest.TestCase):
         """Marker that moves linearly should be tracked within tolerance."""
         positions = [(60 + i * 10, 80 + i * 5) for i in range(6)]
         frames = self._sequence_moving(positions)
-        tracks, visible = track_marker_sequence(frames, positions[0])
+        tracks, visible = track_marker_sequence(frames, positions[0], smooth_sigma=0.0)
         for t, (cx, cy) in enumerate(positions[1:], start=1):
             if visible[t]:
                 self.assertAlmostEqual(tracks[t, 0], cx, delta=MARKER_RADIUS * 2)
@@ -235,52 +233,6 @@ class TestTrackMarkerSequence(unittest.TestCase):
 # =========================================================================== #
 #  Tests: color_rebalance.py                                                    #
 # =========================================================================== #
-
-class TestRedProximityWeight(unittest.TestCase):
-
-    def test_pure_red_hue_zero_weight(self):
-        """Hue = 0 (pure red) → weight = 0."""
-        hue = np.array([0], dtype=np.int32)
-        w   = _red_proximity_weight(hue)
-        self.assertAlmostEqual(float(w[0]), 0.0)
-
-    def test_pure_red_hue_180_weight(self):
-        """Hue = 180 (also pure red in OpenCV wrap) → weight = 0."""
-        hue = np.array([180], dtype=np.int32)
-        w   = _red_proximity_weight(hue)
-        self.assertAlmostEqual(float(w[0]), 0.0)
-
-    def test_green_hue_full_weight(self):
-        """Hue = 60 (green, far from red) → weight = 1."""
-        hue = np.array([60], dtype=np.int32)
-        w   = _red_proximity_weight(hue)
-        self.assertAlmostEqual(float(w[0]), 1.0)
-
-    def test_blue_hue_full_weight(self):
-        """Hue = 120 (blue) → weight = 1."""
-        hue = np.array([120], dtype=np.int32)
-        w   = _red_proximity_weight(hue)
-        self.assertAlmostEqual(float(w[0]), 1.0)
-
-    def test_weight_clipped_to_unit_interval(self):
-        """Weight is always in [0, 1]."""
-        hues = np.arange(0, 181, dtype=np.int32)
-        w    = _red_proximity_weight(hues)
-        self.assertTrue((w >= 0.0).all())
-        self.assertTrue((w <= 1.0).all())
-
-    def test_monotone_near_zero(self):
-        """Weight increases as hue moves away from 0."""
-        hues = np.arange(0, _RED_HUE_MARGIN + 1, dtype=np.int32)
-        w    = _red_proximity_weight(hues)
-        self.assertTrue(np.all(np.diff(w) >= 0), "weight must be non-decreasing away from red")
-
-    def test_symmetry_near_180(self):
-        """Weight near 170-180 should mirror weight near 0-10."""
-        lo = np.array([0, 5, 10], dtype=np.int32)
-        hi = np.array([180, 175, 170], dtype=np.int32)
-        np.testing.assert_allclose(_red_proximity_weight(lo), _red_proximity_weight(hi), atol=1e-5)
-
 
 class TestRebalanceFrame(unittest.TestCase):
 

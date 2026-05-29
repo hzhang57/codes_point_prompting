@@ -155,35 +155,31 @@ def run_sdedit(
 
     # ------------------------------------------------------------------ #
     # 步骤 4：在 t ≈ γ·T_max 处加噪（SDEdit 前向过程）                   #
-    # 用 scheduler.add_noise() 确保与 DDIM 加噪公式一致。                  #
+    # 使用 scheduler.add_noise()，并通过 set_begin_index 对齐局部去噪起点。 #
     # ------------------------------------------------------------------ #
-    noise = torch.randn_like(latents_clean, generator=generator)
-    adapter.set_timesteps(scheduler_steps)
-    timesteps = adapter.timesteps  # 从大到小，共 scheduler_steps 个时间步
-
+    noise = torch.randn(
+        latents_clean.shape,
+        generator=generator,
+        device=latents_clean.device,
+        dtype=latents_clean.dtype,
+    )
     start_idx = min(int(scheduler_steps * gamma), scheduler_steps - 1)
+    timesteps_run = adapter.prepare_denoise_start(scheduler_steps, start_idx)
+    timesteps = adapter.timesteps  # 从大到小，共 scheduler_steps 个时间步
     t_start   = timesteps[start_idx]
     print(f"[DEBUG] scheduler_steps={scheduler_steps} gamma={gamma} "
           f"start_idx={start_idx} t_start={t_start.item():.1f} "
-          f"denoise_steps={len(timesteps) - start_idx}")
+          f"denoise_steps={len(timesteps_run)}")
 
-    # FlowMatchEulerDiscrete 使用 scale_noise（线性插值）而非 DDPM add_noise：
-    # x_t = sigma * noise + (1 - sigma) * x_0，sigma 从 scheduler.sigmas 表中查找
-    # scale_noise 内部用 for t in timestep 迭代，t_start 必须是 1-dim tensor
-    latents = adapter.scheduler.scale_noise(latents_clean, t_start.unsqueeze(0), noise)
-    sigma = adapter.scheduler.sigmas[start_idx].item()
-    print(f"[DEBUG] t_start={t_start.item():.1f} sigma={sigma:.3f}")
-    print(f"[DEBUG] flow-matching 混合: content={(1-sigma):.3f} noise={sigma:.3f}")
+    latents = adapter.add_noise_at_timestep(latents_clean, noise, t_start)
+    print(f"[DEBUG] t_start={t_start.item():.1f} scheduler={type(adapter.scheduler).__name__}")
     print(f"[DEBUG] latents_clean norm: {latents_clean.norm():.3f}  noise norm: {noise.norm():.3f}")
-    print(f"[DEBUG] latents after scale_noise: "
+    print(f"[DEBUG] latents after add_noise: "
           f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f} norm={latents.norm():.3f}")
 
     # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
     _save_frames(adapter.decode_latents(latents), "debug_noisy_input")
     print(f"[DEBUG] debug_noisy_input saved")
-
-    # 从 start_idx 去噪到序列末尾（共 scheduler_steps - start_idx 步）
-    timesteps_run = timesteps[start_idx:]
 
     # ------------------------------------------------------------------ #
     # 步骤 5：反事实引导去噪循环（论文公式 3）                              #

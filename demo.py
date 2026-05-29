@@ -193,6 +193,8 @@ def main():
                         help="反事实引导权重 λ（默认：8.0）")
     parser.add_argument("--scheduler-steps", type=int, default=100,
                         help="调度器总步数，决定时间步粒度（默认：100，论文值）")
+    parser.add_argument("--flow-shift", type=float, default=3.0,
+                        help="Wan VACE UniPC flow_shift（默认：3.0/480P；720P 可用 5.0）")
     parser.add_argument("--no-refine", action="store_true",
                         help="跳过 inpainting 精细化步骤（速度更快但精度略低）")
     parser.add_argument("--marker-radius", type=int, default=2,
@@ -200,7 +202,7 @@ def main():
     parser.add_argument("--seed",    type=int,   default=42,
                         help="随机种子（默认：42）")
     parser.add_argument("--max-frames", type=int, default=None,
-                        help="最多处理的帧数（默认：49）")
+                        help="最多处理的帧数（默认：81）")
     parser.add_argument("--preprocess-width", type=int, default=None,
                         help="跟踪前先将视频缩放到此宽度（默认：720）")
     parser.add_argument("--preprocess-height", type=int, default=None,
@@ -269,7 +271,7 @@ def main():
 
     # 加载视频扩散模型
     print(f"加载模型：{model_id}  (type={args.model_type})")
-    pipe = load_wan_vace_pipe(model_id, args.device)
+    pipe = load_wan_vace_pipe(model_id, args.device, flow_shift=args.flow_shift)
 
     adapter = create_adapter(pipe)
     print(f"  已使用适配器：{type(adapter).__name__}")

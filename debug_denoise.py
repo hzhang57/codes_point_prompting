@@ -109,19 +109,16 @@ def run_debug(args):
     # ------------------------------------------------------------------ #
     N = args.scheduler_steps
     gamma = args.gamma
-    adapter.set_timesteps(N)
-    timesteps = adapter.timesteps
-
     start_idx = min(int(N * gamma), N - 1)
+    timesteps_run = adapter.prepare_denoise_start(N, start_idx)
+    timesteps = adapter.timesteps
     t_start = timesteps[start_idx]
-    sigma = adapter.scheduler.sigmas[start_idx].item()
     print(f"[noise] N={N} gamma={gamma} start_idx={start_idx} "
-          f"t_start={t_start.item():.1f} sigma={sigma:.3f}")
-    print(f"[noise] 混合比例: content={(1-sigma):.3f}  noise={sigma:.3f}")
+          f"t_start={t_start.item():.1f} scheduler={type(adapter.scheduler).__name__}")
 
     torch.manual_seed(args.seed)
     noise = torch.randn_like(latents_clean)
-    latents = adapter.scheduler.scale_noise(latents_clean, t_start.unsqueeze(0), noise)
+    latents = adapter.add_noise_at_timestep(latents_clean, noise, t_start)
     print(f"[noise] latents_noisy: min={latents.min():.3f} max={latents.max():.3f} "
           f"norm={latents.norm():.1f}")
 
@@ -136,8 +133,6 @@ def run_debug(args):
     # ------------------------------------------------------------------ #
     image_cond = adapter.encode_image_cond(frames[0], latents_clean)
     text_cond = adapter.encode_text("")   # None（T5 未加载），forward_transformer 内部补全零向量
-
-    timesteps_run = timesteps[start_idx:]
 
     # [诊断] control 统计量
     _ctrl = adapter._build_control(latents, image_cond, n_frames_px=len(frames))

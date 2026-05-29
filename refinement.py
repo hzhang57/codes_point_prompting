@@ -109,14 +109,19 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 3：掩码内区域加噪，掩码外保留原始干净潜变量                     #
     # ------------------------------------------------------------------ #
-    adapter.set_timesteps(scheduler_steps)
-    timesteps   = adapter.timesteps
     start_idx   = int(scheduler_steps * gamma)
     start_idx   = min(start_idx, scheduler_steps - 1)
+    timesteps_run = adapter.prepare_denoise_start(scheduler_steps, start_idx)
+    timesteps   = adapter.timesteps
     t_start     = timesteps[start_idx]
 
-    noise     = torch.randn_like(lat_gen, generator=generator)
-    lat_noisy = adapter.scheduler.scale_noise(lat_gen, t_start, noise)
+    noise     = torch.randn(
+        lat_gen.shape,
+        generator=generator,
+        device=lat_gen.device,
+        dtype=lat_gen.dtype,
+    )
+    lat_noisy = adapter.add_noise_at_timestep(lat_gen, noise, t_start)
     # 掩码内用噪声潜变量，掩码外直接用原始潜变量（无需去噪）
     lat_start = mask_lat * lat_noisy + (1.0 - mask_lat) * lat_orig
 
@@ -129,8 +134,6 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 5：仅运行后 γ 比例的去噪步骤                                    #
     # ------------------------------------------------------------------ #
-    timesteps_run = timesteps[start_idx:]
-
     latents = lat_start.clone()
 
     for i, t in enumerate(timesteps_run):

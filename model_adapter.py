@@ -137,9 +137,29 @@ class ModelAdapter(ABC):
     def set_timesteps(self, n_steps: int) -> None:
         self.scheduler.set_timesteps(n_steps, device=self.device)
 
+    def prepare_denoise_start(self, n_steps: int, start_idx: int) -> torch.Tensor:
+        self.set_timesteps(n_steps)
+        timesteps = self.timesteps
+        start_idx = max(0, min(int(start_idx), len(timesteps) - 1))
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(start_idx)
+        return timesteps[start_idx:]
+
     @property
     def timesteps(self) -> torch.Tensor:
         return self.scheduler.timesteps
+
+    def add_noise_at_timestep(
+        self,
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        if not hasattr(self.scheduler, "add_noise"):
+            raise AttributeError(f"{type(self.scheduler).__name__} does not implement add_noise()")
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+        return self.scheduler.add_noise(latents, noise, timestep.to(device=latents.device))
 
     def scheduler_step(
         self,
@@ -148,7 +168,7 @@ class ModelAdapter(ABC):
         latents: torch.Tensor,
         t_next: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self._dpm_step is None:
+        if getattr(self, "_dpm_step", None) is None:
             import inspect
             params = inspect.signature(self.scheduler.step).parameters
             self._dpm_step = "timestep_back" in params
@@ -212,6 +232,10 @@ class WanVACEAdapter(ModelAdapter):
         return self.pipe.transformer.dtype
 
     @property
+    def _vae_dtype(self) -> torch.dtype:
+        return next(self.pipe.vae.parameters()).dtype
+
+    @property
     def scheduler(self):
         return self.pipe.scheduler
 
@@ -224,7 +248,7 @@ class WanVACEAdapter(ModelAdapter):
 
     def encode_video(self, frames_bgr: list) -> torch.Tensor:
         vae_dev = self._vae_device
-        t = _frames_to_tensor(frames_bgr, vae_dev, self.dtype)
+        t = _frames_to_tensor(frames_bgr, vae_dev, self._vae_dtype)
         T_in = t.shape[2]
         print(f"[DEBUG] encode_video input: shape={t.shape} (T={T_in} → expect lT={(T_in-1)//4 + 1})")
         with torch.no_grad():
@@ -240,7 +264,7 @@ class WanVACEAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         vae_dev = self._vae_device
-        lat = self._denormalize(latents).to(vae_dev, dtype=self.dtype)
+        lat = self._denormalize(latents).to(vae_dev, dtype=self._vae_dtype)
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
         print(f"[DEBUG] decode_latents: decoded shape={decoded.shape}")
@@ -255,7 +279,7 @@ class WanVACEAdapter(ModelAdapter):
         if video_latent is not None:
             return video_latent[:, :, :1, :, :].clone()
         vae_dev = self._vae_device
-        img_t = _frames_to_tensor([frame_bgr], vae_dev, self.dtype)
+        img_t = _frames_to_tensor([frame_bgr], vae_dev, self._vae_dtype)
         with torch.no_grad():
             lat = self.pipe.vae.encode(img_t).latent_dist.mean
         return self._normalize(lat).to(device=self.device, dtype=self.dtype)
@@ -361,7 +385,8 @@ def create_adapter(pipe) -> ModelAdapter:
 
 
 def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
-                       device: str = "cuda") -> Any:
+                       device: str = "cuda",
+                       flow_shift: float = 3.0) -> Any:
     """加载 Wan2.1-VACE-1.3B pipeline（bfloat16），包含 T5 文本编码器。
 
     T5 是必须的：全零 text_cond 会让 transformer 输出巨大的固定偏置
@@ -369,11 +394,17 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
     T5 编码空字符串后放到 CPU，推理时按需移到 GPU，常驻显存约 1.4GB。
     """
     import os
-    from diffusers import WanVACEPipeline
+    from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanVACEPipeline
     os.environ["TQDM_DISABLE"] = "1"
 
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id,
+        subfolder="vae",
+        torch_dtype=torch.float32,
+    )
     pipe = WanVACEPipeline.from_pretrained(
         model_id,
+        vae=vae,
         torch_dtype=torch.bfloat16,
     )
 
@@ -393,7 +424,7 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
                 pipe.transformer.to("cuda:0")
         else:
             pipe.transformer.to("cuda:0")
-        pipe.vae.to("cuda:0", dtype=torch.bfloat16)
+        pipe.vae.to("cuda:0", dtype=torch.float32)
         # T5 放到 CPU，推理时按需移到 GPU（节省常驻显存）
         pipe.text_encoder.to("cpu")
         for i in range(n_gpus if n_gpus >= 2 else 1):
@@ -401,9 +432,8 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
             total = torch.cuda.get_device_properties(i).total_memory // 1024**3
             print(f"[load] GPU {i} free: {free:.1f} GiB / {total} GiB")
 
-    from diffusers import FlowMatchEulerDiscreteScheduler
-    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
-    print(f"[load] scheduler: FlowMatchEulerDiscreteScheduler")
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=flow_shift)
+    print(f"[load] scheduler: UniPCMultistepScheduler (flow_shift={flow_shift})")
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
     os.environ.pop("TQDM_DISABLE", None)
