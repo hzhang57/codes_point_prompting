@@ -197,6 +197,9 @@ class WanVACEAdapter(ModelAdapter):
         # 缓存 VAE 标准化参数（与官方 pipeline 对齐）
         self._latents_mean: Optional[torch.Tensor] = None
         self._latents_std: Optional[torch.Tensor] = None
+        # T5 编码用的 GPU：优先放到第二张卡（cuda:1），避开常被 transformer/VAE
+        # 占满的 cuda:0，否则 T5 临时上卡时会 OOM。由 load_wan_vace_pipe 设置。
+        self._t5_device: Optional[torch.device] = getattr(pipe, "_t5_device", None)
 
     def _get_vae_norm(self, device):
         """获取 VAE 标准化参数（惰性初始化，缓存复用）。"""
@@ -288,8 +291,10 @@ class WanVACEAdapter(ModelAdapter):
     def encode_text(self, prompt: str) -> torch.Tensor:
         """用 T5 编码文本，返回 (1, seq_len, 4096)。空字符串返回 EOS embedding。"""
         self._ensure_prompt_clean_dependencies()
-        # 临时把 T5 移到 GPU 编码，完成后移回 CPU 释放显存
-        t5_device = self.device
+        # 临时把 T5 移到 GPU 编码，完成后移回 CPU 释放显存。
+        # 优先用 _t5_device（通常是空闲的 cuda:1），避开被 transformer/VAE
+        # 占满的 self.device（cuda:0），否则 T5 上卡时会 OOM。
+        t5_device = self._t5_device or self.device
         self.pipe.text_encoder.to(t5_device)
         with torch.no_grad():
             embeds = self.pipe._get_t5_prompt_embeds(
@@ -301,7 +306,8 @@ class WanVACEAdapter(ModelAdapter):
         self.pipe.text_encoder.to("cpu")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return embeds
+        # 移回主计算设备，供下游 transformer 使用（跨卡时必需）
+        return embeds.to(device=self.device)
 
     def _ensure_prompt_clean_dependencies(self) -> None:
         """Patch optional prompt-cleaning deps into older Diffusers Wan modules."""
@@ -452,8 +458,12 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
         else:
             pipe.transformer.to("cuda:0")
         pipe.vae.to("cuda:0", dtype=torch.float32)
-        # T5 放到 CPU，推理时按需移到 GPU（节省常驻显存）
+        # T5 放到 CPU，推理时按需移到 GPU（节省常驻显存）。
+        # 双卡时 T5 临时上卡放到空闲的 cuda:1，避开被 transformer+VAE
+        # 占满的 cuda:0（否则 encode_text 时 OOM）。
         pipe.text_encoder.to("cpu")
+        pipe._t5_device = torch.device("cuda:1" if n_gpus >= 2 else "cuda:0")
+        print(f"[load] T5 encode device: {pipe._t5_device}")
         for i in range(n_gpus if n_gpus >= 2 else 1):
             free = torch.cuda.mem_get_info(i)[0] / 1024**3
             total = torch.cuda.get_device_properties(i).total_memory // 1024**3
