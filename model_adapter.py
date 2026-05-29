@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 import numpy as np
+import importlib
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from PIL import Image
@@ -286,6 +287,7 @@ class WanVACEAdapter(ModelAdapter):
 
     def encode_text(self, prompt: str) -> torch.Tensor:
         """用 T5 编码文本，返回 (1, seq_len, 4096)。空字符串返回 EOS embedding。"""
+        self._ensure_prompt_clean_dependencies()
         # 临时把 T5 移到 GPU 编码，完成后移回 CPU 释放显存
         t5_device = self.device
         self.pipe.text_encoder.to(t5_device)
@@ -300,6 +302,24 @@ class WanVACEAdapter(ModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return embeds
+
+    def _ensure_prompt_clean_dependencies(self) -> None:
+        """Patch optional prompt-cleaning deps into older Diffusers Wan modules."""
+        module_name = self.pipe._get_t5_prompt_embeds.__module__
+        if not module_name.startswith("diffusers."):
+            return
+
+        try:
+            ftfy = importlib.import_module("ftfy")
+        except ImportError as exc:
+            raise ImportError(
+                "WanVACEPipeline prompt cleaning requires ftfy. "
+                "Install it with `pip install ftfy` or `pip install -r requirements.txt`."
+            ) from exc
+
+        prompt_module = importlib.import_module(module_name)
+        if getattr(prompt_module, "ftfy", None) is None:
+            setattr(prompt_module, "ftfy", ftfy)
 
     def _build_control(
         self,
