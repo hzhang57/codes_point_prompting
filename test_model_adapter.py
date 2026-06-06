@@ -12,7 +12,9 @@ from model_adapter import (
     ModelAdapter,
     WanVACEAdapter,
     create_adapter,
+    denoise_step_count,
     load_wan_vace_pipe,
+    noise_strength_to_start_idx,
     _frames_to_tensor,
     _tensor_to_frames,
 )
@@ -103,9 +105,14 @@ class _MockTransformer:
 class _MockTextEncoder:
     def __init__(self):
         self.device = torch.device("cpu")
+        self.weight = torch.nn.Parameter(torch.zeros(1))
 
-    def to(self, device):
+    def parameters(self):
+        return iter([self.weight])
+
+    def to(self, device=None, dtype=None):
         self.device = torch.device(device)
+        self.weight.data = self.weight.data.to(device=device, dtype=dtype)
         return self
 
 
@@ -188,6 +195,22 @@ class TestTensorHelpers(unittest.TestCase):
 
 
 class TestSchedulerHelpers(unittest.TestCase):
+    def test_noise_strength_maps_to_descending_scheduler_index(self):
+        self.assertEqual(noise_strength_to_start_idx(0.0, 100), 99)
+        self.assertEqual(noise_strength_to_start_idx(0.5, 100), 50)
+        self.assertEqual(noise_strength_to_start_idx(1.0, 100), 0)
+        self.assertEqual(denoise_step_count(0.0, 100), 0)
+        self.assertEqual(denoise_step_count(0.5, 100), 50)
+        self.assertEqual(denoise_step_count(1.0, 100), 100)
+
+    def test_noise_strength_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            noise_strength_to_start_idx(-0.1, 100)
+        with self.assertRaises(ValueError):
+            noise_strength_to_start_idx(1.1, 100)
+        with self.assertRaises(ValueError):
+            noise_strength_to_start_idx(0.5, 0)
+
     def test_prepare_denoise_start_sets_begin_index_and_returns_slice(self):
         sched = _MockScheduler(n=12)
         adapter = _MinimalAdapter(sched)

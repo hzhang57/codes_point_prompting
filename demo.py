@@ -188,7 +188,7 @@ def main():
     parser.add_argument("--output",  default="tracked.mp4",
                         help="输出视频路径（默认：tracked.mp4）")
     parser.add_argument("--gamma",   type=float, default=0.5,
-                        help="SDEdit 加噪比例 γ（默认：0.5）")
+                        help="SDEdit 噪声强度 γ，0=无噪声，1=最大噪声（默认：0.5）")
     parser.add_argument("--lam",     type=float, default=8.0,
                         help="反事实引导权重 λ（默认：8.0）")
     parser.add_argument("--scheduler-steps", type=int, default=100,

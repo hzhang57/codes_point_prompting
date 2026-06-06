@@ -24,7 +24,7 @@ from color_rebalance import rebalance_video
 from marker import insert_marker, track_marker_sequence
 from sdedit import run_sdedit
 from refinement import refine_tracks
-from model_adapter import ModelAdapter, create_adapter
+from model_adapter import ModelAdapter, create_adapter, denoise_step_count
 
 
 @dataclass
@@ -38,12 +38,12 @@ class TrackResult:
 @dataclass
 class PointPrompterConfig:
     """跟踪器超参数配置。"""
-    gamma: float = 0.5             # SDEdit 加噪比例（论文默认 0.5）
+    gamma: float = 0.5             # SDEdit 噪声强度（0=无噪声，1=最大噪声）
     lam: float = 8.0               # 反事实引导权重 λ（论文默认 8）
     scheduler_steps: int = 100     # 调度器总步数，决定时间步粒度（论文默认 100）
     marker_radius: int = 2         # 插入标记的圆形半径（像素）；论文消融最优值为 2px
     do_refine: bool = True         # 是否执行 inpainting 精细化
-    refine_gamma: float = 0.7      # 精细化阶段的加噪比例（> gamma，噪声更小，编辑更保守）
+    refine_gamma: float = 0.3      # 精细化阶段噪声强度（< gamma，更保守）
     prompt: str = ""               # 文本提示（论文零样本设置为空字符串）
     seed: Optional[int] = None     # 随机种子，None 表示不固定
     model_width: int = 832         # 扩散模型输入的最大宽度，防止高分辨率视频 OOM
@@ -132,7 +132,7 @@ class PointPrompter:
         total_stages = 2 if cfg.do_refine else 1
 
         # ---- 步骤 3：反事实 SDEdit 生成含标记轨迹的视频 ----
-        denoise_steps = cfg.scheduler_steps - int(cfg.scheduler_steps * cfg.gamma)
+        denoise_steps = denoise_step_count(cfg.gamma, cfg.scheduler_steps)
         print(f"  [阶段 1/{total_stages}] SDEdit 生成（调度器 {cfg.scheduler_steps} 步 / 去噪 {denoise_steps} 步）…")
         generated = run_sdedit(
             adapter=self.adapter,
@@ -152,7 +152,7 @@ class PointPrompter:
 
         # ---- 步骤 5：可选 inpainting 精细化 ----
         if cfg.do_refine:
-            refine_denoise_steps = cfg.scheduler_steps - int(cfg.scheduler_steps * cfg.refine_gamma)
+            refine_denoise_steps = denoise_step_count(cfg.refine_gamma, cfg.scheduler_steps)
             print(f"  [阶段 2/{total_stages}] Inpainting 精细化（调度器 {cfg.scheduler_steps} 步 / 去噪 {refine_denoise_steps} 步）…")
             refined = refine_tracks(
                 adapter=self.adapter,

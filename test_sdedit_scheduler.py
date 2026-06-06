@@ -101,6 +101,23 @@ class TestSDEditSchedulerUsage(unittest.TestCase):
         self.assertEqual(adapter.scheduler.begin_index, 2)
         self.assertEqual(adapter.add_noise_timestep.item(), adapter.timesteps[2].item())
 
+    def test_zero_noise_strength_skips_noise_and_denoising(self):
+        adapter = _FakeAdapter()
+        frames = [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(5)]
+
+        with patch("sdedit._save_frames"), patch("sdedit._save_mp4"), patch("sdedit.cv2.imwrite"):
+            out = run_sdedit(
+                adapter,
+                frames_bgr_edited=frames,
+                frame_bgr_original=frames[0],
+                gamma=0.0,
+                scheduler_steps=4,
+            )
+
+        self.assertEqual(len(out), 5)
+        self.assertFalse(adapter.scheduler.add_noise_called)
+        self.assertEqual(adapter.scheduler.begin_index, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

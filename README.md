@@ -6,6 +6,10 @@ An unofficial third-party implementation of [*Point Prompting: Counterfactual Tr
 
 ## Changelog
 
+### Current
+- Define `gamma` as intuitive noise strength (`0` = none, `1` = maximum)
+- Add multi-strength SDEdit reconstruction experiment with denoised MP4 output
+
 ### v2.1 (2026-05-27)
 - Switch Wan2.1-VACE-1.3B sampling to the official Diffusers `UniPCMultistepScheduler`
 - Use `flow_prediction` / flow sigmas from model config with default `flow_shift=3.0` for 480P
@@ -16,7 +20,7 @@ An unofficial third-party implementation of [*Point Prompting: Counterfactual Tr
 - Fix VAE frame count handling: valid T = 4k+1; auto-clip input frames
 - Fix VAE tiling: `enable_slicing()` only — `enable_tiling()` causes checkerboard artifacts
 - Replace all MP4 debug saves with PNG sequences for reliable viewing on Kaggle
-- Fix `refine_gamma`: higher value = less noise = more conservative (was inverted in v1)
+- Add configurable refinement noise level
 - Debug per-step full-frame decode to verify denoising progress
 
 ### v1.0 (2026-05-23)
@@ -72,7 +76,7 @@ Wan VACE uses a temporal VAE stride where valid input counts follow T = 4k+1. Th
 | `--points` | required | Query point(s) as `x,y` in frame-0 pixel coords |
 | `--model-id` | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | HuggingFace model ID |
 | `--output` | `tracked.mp4` | Output video path |
-| `--gamma` | `0.5` | SDEdit noise ratio γ (paper default) |
+| `--gamma` | `0.5` | SDEdit noise strength: `0` = none, `1` = maximum |
 | `--lam` | `8.0` | Counterfactual guidance weight λ (paper default) |
 | `--scheduler-steps` | `100` | Total scheduler timesteps (paper default) |
 | `--flow-shift` | `3.0` | UniPC flow shift; use `5.0` for 720P-style Wan runs |
@@ -85,12 +89,12 @@ Wan VACE uses a temporal VAE stride where valid input counts follow T = 4k+1. Th
 
 | Parameter | Default | Description |
 |---|---|---|
-| `gamma` | `0.5` | SDEdit noise ratio (paper default) |
+| `gamma` | `0.5` | SDEdit noise strength: `0` = none, `1` = maximum |
 | `lam` | `8.0` | Counterfactual guidance weight (paper default) |
 | `scheduler_steps` | `100` | Total scheduler timesteps |
 | `marker_radius` | `2` | Red marker radius in pixels (paper ablation optimum) |
 | `do_refine` | `True` | Enable inpainting refinement pass |
-| `refine_gamma` | `0.7` | Noise ratio for refinement (must be > gamma for less noise) |
+| `refine_gamma` | `0.3` | Lower noise strength for conservative refinement |
 | `prompt` | `""` | Text prompt (paper uses empty string) |
 | `seed` | `None` | Random seed for reproducibility |
 | `model_width` | `832` | Max width fed to diffusion model |
@@ -106,6 +110,21 @@ UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=3.0)
 ```
 
 The model config provides `prediction_type="flow_prediction"` and `use_flow_sigmas=True`. The default `flow_shift=3.0` targets 480P; pass `--flow-shift 5.0` for 720P-style settings.
+
+## SDEdit Reconstruction Check
+
+Use `debug_denoise.py` to scan noise strengths and verify that denoising recovers
+a clean input video:
+
+```bash
+python debug_denoise.py --video input.mp4 --max-frames 9
+```
+
+Results are written under `outputs/debug_denoise/`. Each
+`gamma_<value>/denoised.mp4` is the fully denoised video; the same directory
+also contains `noisy.mp4`, denoised PNG frames, and a three-column
+`compare.mp4`. Aggregate PSNR and latent MSE results are saved in
+`summary.csv` and `summary.json`.
 
 ## File Structure
 

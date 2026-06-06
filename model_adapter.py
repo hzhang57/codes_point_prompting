@@ -19,6 +19,22 @@ from PIL import Image
 #  共用张量转换工具                                                             #
 # --------------------------------------------------------------------------- #
 
+def noise_strength_to_start_idx(noise_strength: float, n_steps: int) -> int:
+    """Map intuitive noise strength [0, 1] to a descending scheduler index."""
+    if not 0.0 <= noise_strength <= 1.0:
+        raise ValueError(f"noise_strength must be in [0, 1], got {noise_strength}")
+    if n_steps < 1:
+        raise ValueError(f"n_steps must be positive, got {n_steps}")
+    return min(round((1.0 - noise_strength) * n_steps), n_steps - 1)
+
+
+def denoise_step_count(noise_strength: float, n_steps: int) -> int:
+    """Return reverse-step count for an intuitive noise strength."""
+    if noise_strength == 0.0:
+        return 0
+    return n_steps - noise_strength_to_start_idx(noise_strength, n_steps)
+
+
 def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
     """BGR numpy 数组 → RGB PIL 图像（cv2 与 PIL 的通道顺序相反）。"""
     return Image.fromarray(arr[..., ::-1].copy())

@@ -10,7 +10,7 @@ Point Prompting 核心：带反事实增强引导的 SDEdit 去噪。
     c_edited   = 含红色标记的第 0 帧作为图像条件（正向）
     c_original = 不含标记的原始第 0 帧作为图像条件（负向）
     λ          = 引导权重（默认 8）
-    γ          = SDEdit 加噪比例（默认 0.5）
+    γ          = SDEdit 噪声强度（默认 0.5；0=无噪声，1=最大噪声）
 
 直觉：用原始帧作为"负提示"，迫使扩散模型在生成时保留标记，
 而不是把标记当成噪声去除掉。
@@ -24,7 +24,7 @@ import numpy as np
 import cv2
 from typing import Optional
 
-from model_adapter import ModelAdapter
+from model_adapter import ModelAdapter, noise_strength_to_start_idx
 from marker import track_marker_sequence
 
 
@@ -89,9 +89,9 @@ def run_sdedit(
         adapter:            ModelAdapter
         frames_bgr_edited:  frame[0] 含红色标记的完整视频帧列表（用于加噪）
         frame_bgr_original: 第 0 帧不含标记的原始图像（负向条件）
-        gamma:              SDEdit 加噪比例 γ ∈ (0, 1]，越大生成越自由
+        gamma:              SDEdit 噪声强度 γ ∈ [0, 1]，越大生成越自由
         lam:                反事实引导权重 λ，越大标记越显著
-        scheduler_steps:    调度器总步数（论文：100）；从 gamma*N 处开始去噪到末尾
+        scheduler_steps:    调度器总步数（论文：100）
         prompt:             文本提示（论文零样本设置为空字符串）
         generator:          可复现性用的随机数生成器
 
@@ -163,15 +163,21 @@ def run_sdedit(
         device=latents_clean.device,
         dtype=latents_clean.dtype,
     )
-    start_idx = min(int(scheduler_steps * gamma), scheduler_steps - 1)
+    start_idx = noise_strength_to_start_idx(gamma, scheduler_steps)
     timesteps_run = adapter.prepare_denoise_start(scheduler_steps, start_idx)
     timesteps = adapter.timesteps  # 从大到小，共 scheduler_steps 个时间步
     t_start   = timesteps[start_idx]
+    if gamma == 0.0:
+        timesteps_run = timesteps_run[:0]
     print(f"[DEBUG] scheduler_steps={scheduler_steps} gamma={gamma} "
           f"start_idx={start_idx} t_start={t_start.item():.1f} "
           f"denoise_steps={len(timesteps_run)}")
 
-    latents = adapter.add_noise_at_timestep(latents_clean, noise, t_start)
+    latents = (
+        latents_clean.clone()
+        if gamma == 0.0
+        else adapter.add_noise_at_timestep(latents_clean, noise, t_start)
+    )
     print(f"[DEBUG] t_start={t_start.item():.1f} scheduler={type(adapter.scheduler).__name__}")
     print(f"[DEBUG] latents_clean norm: {latents_clean.norm():.3f}  noise norm: {noise.norm():.3f}")
     print(f"[DEBUG] latents after add_noise: "

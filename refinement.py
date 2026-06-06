@@ -16,7 +16,7 @@ import numpy as np
 import torch.nn.functional as F
 from typing import Optional
 
-from model_adapter import ModelAdapter
+from model_adapter import ModelAdapter, noise_strength_to_start_idx
 
 
 # 每个跟踪点周围重新去噪的圆形区域半径（像素）
@@ -65,7 +65,7 @@ def refine_tracks(
     frames_bgr_generated: list,
     frames_bgr_original: list,
     tracks: np.ndarray,              # (T, 2) 粗跟踪阶段检测到的标记坐标
-    gamma: float = 0.3,              # 精细化加噪比例，小于主 SDEdit 的 γ
+    gamma: float = 0.3,              # 精细化噪声强度，小于主 SDEdit 的 γ
     scheduler_steps: int = 100,
     prompt: str = "",
     generator: Optional[torch.Generator] = None,
@@ -80,7 +80,7 @@ def refine_tracks(
         frames_bgr_generated: 初次 SDEdit 生成的帧（含标记）
         frames_bgr_original:  颜色重平衡后的原始帧（不含标记）
         tracks:               (T, 2) 粗跟踪坐标，用于定位掩码中心
-        gamma:                精细化的 SDEdit 加噪比例（应 < 主流程 γ）
+        gamma:                精细化的 SDEdit 噪声强度（应 < 主流程 γ）
         prompt:               文本提示
         generator:            可复现性随机数生成器
 
@@ -109,8 +109,7 @@ def refine_tracks(
     # ------------------------------------------------------------------ #
     # 步骤 3：掩码内区域加噪，掩码外保留原始干净潜变量                     #
     # ------------------------------------------------------------------ #
-    start_idx   = int(scheduler_steps * gamma)
-    start_idx   = min(start_idx, scheduler_steps - 1)
+    start_idx   = noise_strength_to_start_idx(gamma, scheduler_steps)
     timesteps_run = adapter.prepare_denoise_start(scheduler_steps, start_idx)
     timesteps   = adapter.timesteps
     t_start     = timesteps[start_idx]
@@ -121,7 +120,13 @@ def refine_tracks(
         device=lat_gen.device,
         dtype=lat_gen.dtype,
     )
-    lat_noisy = adapter.add_noise_at_timestep(lat_gen, noise, t_start)
+    lat_noisy = (
+        lat_gen.clone()
+        if gamma == 0.0
+        else adapter.add_noise_at_timestep(lat_gen, noise, t_start)
+    )
+    if gamma == 0.0:
+        timesteps_run = timesteps_run[:0]
     # 掩码内用噪声潜变量，掩码外直接用原始潜变量（无需去噪）
     lat_start = mask_lat * lat_noisy + (1.0 - mask_lat) * lat_orig
 
@@ -132,7 +137,7 @@ def refine_tracks(
     image_cond = adapter.encode_image_cond(frames_bgr_generated[0])  # 以生成帧第 0 帧为条件
 
     # ------------------------------------------------------------------ #
-    # 步骤 5：仅运行后 γ 比例的去噪步骤                                    #
+    # 步骤 5：按噪声强度运行对应数量的去噪步骤                              #
     # ------------------------------------------------------------------ #
     latents = lat_start.clone()
 
