@@ -548,7 +548,7 @@ def create_adapter(pipe) -> ModelAdapter:
 def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
                        device: str = "cuda",
                        flow_shift: float = 3.0,
-                       low_cpu_memory: bool = False) -> Any:
+                       low_cpu_memory: bool = True) -> Any:
     """加载 Wan2.1-VACE-1.3B pipeline（bfloat16），包含 T5 文本编码器。
 
     T5 是必须的：全零 text_cond 会让 transformer 输出巨大的固定偏置

@@ -69,6 +69,8 @@ python demo.py \
 ```
 
 Wan VACE uses a temporal VAE stride where valid input counts follow T = 4k+1. The default `--max-frames 81` matches the Wan2.1-VACE 480P workflow used by this repo.
+Model loading enables Diffusers `low_cpu_mem_usage` by default, which is
+required by current Wan VACE releases and reduces Kaggle host-memory usage.
 
 ## CLI Reference
 

@@ -390,6 +390,13 @@ class TestWanVACEAdapter(unittest.TestCase):
 
 
 class TestWanVACELoader(unittest.TestCase):
+    def test_loader_defaults_to_low_cpu_memory(self):
+        import inspect
+
+        signature = inspect.signature(load_wan_vace_pipe)
+
+        self.assertTrue(signature.parameters["low_cpu_memory"].default)
+
     def test_loader_uses_official_unipc_scheduler_with_flow_shift(self):
         class FakeAutoencoderKLWan:
             @classmethod

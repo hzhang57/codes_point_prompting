@@ -271,7 +271,12 @@ def main():
 
     # 加载视频扩散模型
     print(f"加载模型：{model_id}  (type={args.model_type})")
-    pipe = load_wan_vace_pipe(model_id, args.device, flow_shift=args.flow_shift)
+    pipe = load_wan_vace_pipe(
+        model_id,
+        args.device,
+        flow_shift=args.flow_shift,
+        low_cpu_memory=True,
+    )
 
     adapter = create_adapter(pipe)
     print(f"  已使用适配器：{type(adapter).__name__}")
