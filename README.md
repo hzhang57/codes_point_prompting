@@ -96,7 +96,7 @@ required by current Wan VACE releases and reduces Kaggle host-memory usage.
 | `gamma` | `0.5` | SDEdit noise strength: `0` = none, `1` = maximum |
 | `lam` | `8.0` | Counterfactual guidance weight (paper default) |
 | `scheduler_steps` | `100` | Total scheduler timesteps |
-| `marker_radius` | `2` | Red marker radius in pixels (paper ablation optimum) |
+| `marker_radius` | `6` | Red marker radius in pixels; pass `2` to reproduce the paper ablation setting |
 | `do_refine` | `True` | Enable inpainting refinement pass |
 | `refine_gamma` | `0.3` | Lower noise strength for conservative refinement |
 | `prompt` | `""` | Text prompt (paper uses empty string) |

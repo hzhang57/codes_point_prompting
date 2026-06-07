@@ -25,7 +25,7 @@ _VAL_LO, _VAL_HI = 80, 255      # 亮度范围：排除过暗像素
 # ---- 搜索窗口参数 ----
 DEFAULT_SEARCH_RADIUS = 50   # 默认以上一帧位置为中心的搜索半径（像素）；缩小可减少误检跳变
 MAX_SEARCH_RADIUS = 100      # 连续丢失帧时搜索半径的最大扩展值
-_REFINE_RADIUS = 20          # 质心精炼：仅聚合距最近红色像素 20px 以内的像素
+MAX_ACCEPTED_JUMP = 35       # 单帧最大可信位移；更大的红色检测视为误检
 _MIN_RED_PIXELS = 3          # 有效检测所需的最小红色像素数；过滤单像素噪声
 
 
@@ -81,23 +81,24 @@ def detect_marker(
     crop = frame_bgr[y1:y2, x1:x2]
 
     mask = _red_mask(crop)
-    ys, xs = np.where(mask > 0)
-    if len(xs) < _MIN_RED_PIXELS:
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+    candidates = []
+    crop_px, crop_py = px - x1, py - y1
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < _MIN_RED_PIXELS:
+            continue
+        cx, cy = centroids[label]
+        dist = float(np.hypot(cx - crop_px, cy - crop_py))
+        candidates.append((dist, -area, float(cx) + x1, float(cy) + y1))
+
+    if not candidates:
         return None  # 红色像素不足，视为丢失（过滤单像素噪声）
 
-    # 找距上一帧位置最近的红色像素作为锚点（裁剪坐标系）
-    crop_px, crop_py = px - x1, py - y1
-    dists = np.sqrt((xs - crop_px) ** 2 + (ys - crop_py) ** 2)
-    anchor_idx = int(np.argmin(dists))
-    anchor_x, anchor_y = xs[anchor_idx], ys[anchor_idx]
-
-    # 仅聚合锚点 _REFINE_RADIUS 范围内的红色像素，抑制离群点
-    near = np.sqrt((xs - anchor_x) ** 2 + (ys - anchor_y) ** 2) <= _REFINE_RADIUS
-    # 锚点附近像素也需满足最小数量，否则回退到全部像素
-    if near.sum() < _MIN_RED_PIXELS:
-        near = np.ones(len(xs), dtype=bool)
-    cx = float(xs[near].mean()) + x1
-    cy = float(ys[near].mean()) + y1
+    candidates.sort()
+    _, _, cx, cy = candidates[0]
     return (cx, cy)
 
 
@@ -156,7 +157,7 @@ def track_marker_sequence(
 
     for t in range(1, T):
         result = detect_marker(frames_bgr[t], prev, search_radius)
-        if result is not None:
+        if result is not None and np.hypot(result[0] - prev[0], result[1] - prev[1]) <= MAX_ACCEPTED_JUMP:
             # 检测成功：更新位置，重置搜索半径
             tracks[t]  = result
             visible[t] = True

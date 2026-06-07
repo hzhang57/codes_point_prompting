@@ -41,7 +41,7 @@ class PointPrompterConfig:
     gamma: float = 0.5             # SDEdit 噪声强度（0=无噪声，1=最大噪声）
     lam: float = 8.0               # 反事实引导权重 λ（论文默认 8）
     scheduler_steps: int = 100     # 调度器总步数，决定时间步粒度（论文默认 100）
-    marker_radius: int = 2         # 插入标记的圆形半径（像素）；论文消融最优值为 2px
+    marker_radius: int = 6         # 插入标记的圆形半径（像素）；官方 reference 路径下 2px 信号偏弱
     do_refine: bool = True         # 是否执行 inpainting 精细化
     refine_gamma: float = 0.3      # 精细化阶段噪声强度（< gamma，更保守）
     prompt: str = ""               # 文本提示（论文零样本设置为空字符串）

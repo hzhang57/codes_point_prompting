@@ -229,6 +229,23 @@ class TestTrackMarkerSequence(unittest.TestCase):
                 self.assertAlmostEqual(tracks[t, 0], cx, delta=MARKER_RADIUS * 2)
                 self.assertAlmostEqual(tracks[t, 1], cy, delta=MARKER_RADIUS * 2)
 
+    def test_rejects_large_red_jump_as_false_positive(self):
+        """A distant red blob should not make the track jump in one frame."""
+        start = (80, 80)
+        frames = [
+            _frame_with_marker(*start),
+            _frame_with_marker(145, 80),
+            _gray_frame(),
+        ]
+        cv2.circle(frames[2], (145, 80), 8, MARKER_COLOR_BGR, -1)
+
+        tracks, visible = track_marker_sequence(frames, start, smooth_sigma=0.0)
+
+        self.assertFalse(visible[1])
+        self.assertFalse(visible[2])
+        np.testing.assert_allclose(tracks[1], start, atol=1.0)
+        np.testing.assert_allclose(tracks[2], start, atol=1.0)
+
 
 # =========================================================================== #
 #  Tests: color_rebalance.py                                                    #

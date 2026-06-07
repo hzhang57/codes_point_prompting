@@ -197,8 +197,8 @@ def main():
                         help="Wan VACE UniPC flow_shift（默认：3.0/480P；720P 可用 5.0）")
     parser.add_argument("--no-refine", action="store_true",
                         help="跳过 inpainting 精细化步骤（速度更快但精度略低）")
-    parser.add_argument("--marker-radius", type=int, default=2,
-                        help="插入标记的圆形半径（像素，默认：2，论文最优值）")
+    parser.add_argument("--marker-radius", type=int, default=6,
+                        help="插入标记的圆形半径（像素，默认：6；官方 reference 路径下更稳定）")
     parser.add_argument("--seed",    type=int,   default=42,
                         help="随机种子（默认：42）")
     parser.add_argument("--max-frames", type=int, default=None,
