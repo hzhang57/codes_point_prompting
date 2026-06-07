@@ -82,7 +82,12 @@ class _MockVAE:
 class _MockTransformer:
     def __init__(self, dtype=torch.float32):
         self.dtype = dtype
-        self.config = SimpleNamespace(in_channels=LAT_C, text_dim=TEXT_D, max_text_seq_len=TEXT_LEN)
+        self.config = SimpleNamespace(
+            in_channels=LAT_C,
+            text_dim=TEXT_D,
+            max_text_seq_len=TEXT_LEN,
+            vace_layers=[0, 1, 2],
+        )
         self._param = torch.nn.Parameter(torch.empty(0, dtype=dtype))
         self.last_kwargs = None
 
@@ -146,6 +151,23 @@ class _MockWanVACEPipeline:
     def _get_t5_prompt_embeds(self, prompt, num_videos_per_prompt, max_sequence_length, device):
         return torch.zeros(num_videos_per_prompt, max_sequence_length, TEXT_D, device=device)
 
+    def preprocess_conditions(
+        self, video, mask, reference_images, batch_size, height, width, num_frames, dtype, device
+    ):
+        video = torch.zeros(batch_size, 3, num_frames, height, width, dtype=dtype, device=device)
+        mask = torch.ones_like(video)
+        reference = torch.ones(3, height, width, dtype=dtype, device=device)
+        return video, mask, [[reference]]
+
+    def prepare_video_latents(self, video, mask, reference_images, generator, device):
+        t = video.shape[2]
+        latents = torch.zeros(1, 2 * LAT_C, t + 1, video.shape[3], video.shape[4], device=device)
+        latents[:, :LAT_C, :1] = 7
+        return latents
+
+    def prepare_masks(self, mask, reference_images, generator):
+        return torch.zeros(1, 64, mask.shape[2] + 1, mask.shape[3], mask.shape[4])
+
 
 class _MinimalAdapter(ModelAdapter):
     def __init__(self, sched=None):
@@ -176,7 +198,10 @@ class _MinimalAdapter(ModelAdapter):
     def encode_text(self, prompt):
         raise NotImplementedError
 
-    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond, n_frames_px=9):
+    def forward_transformer(
+        self, noisy_latents, timestep, text_cond, image_cond, n_frames_px=9,
+        conditioning_scale=1.0,
+    ):
         return torch.ones_like(noisy_latents)
 
 
@@ -272,6 +297,54 @@ class TestWanVACEAdapter(unittest.TestCase):
         self.assertEqual(out.shape, noisy.shape)
         control = pipe.transformer.last_kwargs["control_hidden_states"]
         self.assertEqual(control.shape, (1, 2 * LAT_C + 64, 2, 4, 6))
+        torch.testing.assert_close(
+            pipe.transformer.last_kwargs["control_hidden_states_scale"],
+            torch.ones(3),
+        )
+
+    def test_prepare_reference_condition_uses_reference_only_official_helpers(self):
+        pipe = _MockWanVACEPipeline()
+        adapter = WanVACEAdapter(pipe)
+        frame = np.zeros((H, W, 3), dtype=np.uint8)
+
+        condition = adapter.prepare_reference_condition(frame, T, H, W)
+
+        self.assertEqual(condition["mode"], "reference")
+        self.assertEqual(condition["reference_latent_slots"], 1)
+        self.assertEqual(condition["reference_latents"].shape, (1, LAT_C, 1, H, W))
+        torch.testing.assert_close(
+            condition["reference_latents"], torch.full_like(condition["reference_latents"], 7)
+        )
+        self.assertEqual(
+            condition["control_hidden_states"].shape,
+            (1, 2 * LAT_C + 64, T + 1, H, W),
+        )
+        # The video part is the reference-only path's zero-video condition.
+        self.assertEqual(
+            condition["control_hidden_states"][:, : 2 * LAT_C, 1:].count_nonzero().item(),
+            0,
+        )
+
+    def test_forward_transformer_accepts_prebuilt_reference_control(self):
+        pipe = _MockWanVACEPipeline()
+        adapter = WanVACEAdapter(pipe)
+        noisy = torch.zeros(1, LAT_C, 3, 4, 6)
+        control = torch.zeros(1, 2 * LAT_C + 64, 3, 4, 6)
+        condition = {"control_hidden_states": control}
+
+        adapter.forward_transformer(
+            noisy,
+            torch.tensor([1]),
+            torch.zeros(1, TEXT_LEN, TEXT_D),
+            condition,
+            conditioning_scale=0.75,
+        )
+
+        self.assertIs(pipe.transformer.last_kwargs["control_hidden_states"], control)
+        torch.testing.assert_close(
+            pipe.transformer.last_kwargs["control_hidden_states_scale"],
+            torch.full((3,), 0.75),
+        )
 
     def test_encode_text_uses_t5_prompt_embeds(self):
         adapter = WanVACEAdapter(_MockWanVACEPipeline())

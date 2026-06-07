@@ -120,6 +120,12 @@ a clean input video:
 python debug_denoise.py --video input.mp4 --max-frames 9
 ```
 
+By default, the clean first frame is passed through VACE's official single
+`reference_images` path. The complete clean video is encoded independently,
+noised as the SDEdit state, and never supplied to the VACE control branch.
+Use `--condition-mode legacy-first-frame` to compare against the previous
+first-frame-plus-zero-video control.
+
 Results are written under `outputs/debug_denoise/`. Each
 `gamma_<value>/denoised.mp4` is the fully denoised video; the same directory
 also contains `noisy.mp4`, denoised PNG frames, and a three-column
@@ -132,7 +138,7 @@ float32, and T5 is released after prompt encoding. For a constrained notebook,
 start with one strength and fewer pixels:
 
 ```bash
-python debug_denoise.py --video input.mp4 --max-frames 5 --width 512 --height 288 --gammas 0.5
+python debug_denoise.py --video input.mp4 --max-frames 5 --width 512 --height 288 --gammas 0.5 --conditioning-scale 1.0
 ```
 
 ## File Structure

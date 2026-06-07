@@ -21,15 +21,22 @@ class _FakeAdapter:
         self.dtype = torch.float32
         self.scheduler = _FakeScheduler()
         self.text_encoder_released = False
+        self.full_video_latent = None
+        self.image_cond_video_latent = None
+        self.add_noise_latents = []
+        self.transformer_latent_shapes = []
+        self.decoded_latent_shapes = []
 
     @property
     def timesteps(self):
         return self.scheduler.timesteps
 
     def encode_video(self, frames):
-        return torch.zeros(1, 1, len(frames), 2, 2)
+        self.full_video_latent = torch.zeros(1, 1, len(frames), 2, 2)
+        return self.full_video_latent
 
     def decode_latents(self, latents):
+        self.decoded_latent_shapes.append(tuple(latents.shape))
         value = int(min(255, max(0, latents.mean().item() * 10)))
         return [
             np.full((4, 4, 3), value, dtype=np.uint8)
@@ -37,7 +44,16 @@ class _FakeAdapter:
         ]
 
     def encode_image_cond(self, frame, video_latent=None):
+        self.image_cond_video_latent = video_latent
         return torch.zeros(1, 1, 1, 2, 2)
+
+    def prepare_reference_condition(self, frame, n_frames_px, height, width):
+        return {
+            "mode": "reference",
+            "reference_latent_slots": 1,
+            "reference_latents": torch.full((1, 1, 1, 2, 2), 7.0),
+            "control_hidden_states": torch.zeros(1, 66, n_frames_px + 1, 2, 2),
+        }
 
     def encode_text(self, prompt):
         return torch.zeros(1, 1, 1)
@@ -50,9 +66,14 @@ class _FakeAdapter:
         return self.scheduler.timesteps[start_idx:]
 
     def add_noise_at_timestep(self, latents, noise, timestep):
+        self.add_noise_latents.append(latents)
         return latents + noise * 0.1
 
-    def forward_transformer(self, noisy_latents, timestep, text_cond, image_cond, n_frames_px):
+    def forward_transformer(
+        self, noisy_latents, timestep, text_cond, image_cond, n_frames_px,
+        conditioning_scale=1.0,
+    ):
+        self.transformer_latent_shapes.append(tuple(noisy_latents.shape))
         return torch.zeros_like(noisy_latents)
 
     def scheduler_step(self, velocity, timestep, latents, timestep_next):
@@ -91,6 +112,8 @@ class TestDebugDenoise(unittest.TestCase):
             scheduler_steps=4,
             flow_shift=3.0,
             prompt="",
+            condition_mode="reference",
+            conditioning_scale=1.0,
             seed=42,
             output_dir=None,
             low_memory=True,
@@ -98,9 +121,10 @@ class TestDebugDenoise(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output_dir:
             args.output_dir = output_dir
+            fake_adapter = _FakeAdapter()
             with patch("debug_denoise.load_video", return_value=(frames, 12.0)), \
                     patch("debug_denoise.load_wan_vace_pipe", return_value=object()) as loader_mock, \
-                    patch("debug_denoise.create_adapter", return_value=_FakeAdapter()) as adapter_mock, \
+                    patch("debug_denoise.create_adapter", return_value=fake_adapter), \
                     patch("debug_denoise.save_video") as save_video_mock, \
                     patch("debug_denoise.save_frames"):
                 debug_denoise.run_debug(args)
@@ -108,7 +132,16 @@ class TestDebugDenoise(unittest.TestCase):
             loader_mock.assert_called_once_with(
                 "fake", device="cpu", flow_shift=3.0, low_cpu_memory=True
             )
-            self.assertTrue(adapter_mock.text_encoder_released)
+            self.assertTrue(fake_adapter.text_encoder_released)
+            self.assertIsNone(fake_adapter.image_cond_video_latent)
+            self.assertTrue(fake_adapter.add_noise_latents)
+            self.assertTrue(all(
+                latent.shape[2] == fake_adapter.full_video_latent.shape[2] + 1
+                for latent in fake_adapter.add_noise_latents
+            ))
+            self.assertTrue(fake_adapter.transformer_latent_shapes)
+            self.assertTrue(all(shape[2] == len(frames) + 1 for shape in fake_adapter.transformer_latent_shapes))
+            self.assertTrue(all(shape[2] == len(frames) for shape in fake_adapter.decoded_latent_shapes))
             saved_paths = [call.args[1] for call in save_video_mock.call_args_list]
             for gamma in args.gammas:
                 expected = debug_denoise.os.path.join(
@@ -122,6 +155,41 @@ class TestDebugDenoise(unittest.TestCase):
             self.assertTrue(debug_denoise.os.path.exists(
                 debug_denoise.os.path.join(output_dir, "summary.json")
             ))
+
+    def test_legacy_mode_uses_full_video_first_frame_condition(self):
+        frames = [np.zeros((4, 4, 3), dtype=np.uint8) for _ in range(5)]
+        args = SimpleNamespace(
+            video="input.mp4",
+            model_id="fake",
+            device="cpu",
+            max_frames=5,
+            height=4,
+            width=4,
+            gammas=[0.5],
+            scheduler_steps=4,
+            flow_shift=3.0,
+            prompt="",
+            condition_mode="legacy-first-frame",
+            conditioning_scale=1.0,
+            seed=42,
+            output_dir=None,
+            low_memory=True,
+        )
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            args.output_dir = output_dir
+            fake_adapter = _FakeAdapter()
+            with patch("debug_denoise.load_video", return_value=(frames, 12.0)), \
+                    patch("debug_denoise.load_wan_vace_pipe", return_value=object()), \
+                    patch("debug_denoise.create_adapter", return_value=fake_adapter), \
+                    patch("debug_denoise.save_video"), \
+                    patch("debug_denoise.save_frames"):
+                debug_denoise.run_debug(args)
+
+        self.assertIs(fake_adapter.image_cond_video_latent, fake_adapter.full_video_latent)
+        self.assertTrue(all(
+            latent is fake_adapter.full_video_latent for latent in fake_adapter.add_noise_latents
+        ))
 
 
 if __name__ == "__main__":

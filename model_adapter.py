@@ -128,6 +128,7 @@ class ModelAdapter(ABC):
         text_cond: Any,
         image_cond: Any,
         n_frames_px: int = 9,
+        conditioning_scale: float = 1.0,
     ) -> torch.Tensor:
         """单步去噪器前向传播，返回速度场 (1, C, T, H, W)。"""
         ...
@@ -417,22 +418,89 @@ class WanVACEAdapter(ModelAdapter):
 
         return torch.cat([video_ctrl, mask_patches], dim=1)  # (1, 2C+64, lT, lH, lW)
 
+    @torch.no_grad()
+    def prepare_reference_condition(
+        self,
+        frame_bgr: np.ndarray,
+        n_frames_px: int,
+        height: int,
+        width: int,
+    ) -> dict:
+        """Prepare one reference image with the official WanVACE helpers.
+
+        No clean video is supplied to the control branch. The official
+        reference-only path creates an all-zero video with an all-one mask,
+        then prepends one encoded reference slot to the control stream.
+        """
+        reference_image = _bgr_to_pil(frame_bgr)
+        video, mask, reference_images = self.pipe.preprocess_conditions(
+            video=None,
+            mask=None,
+            reference_images=reference_image,
+            batch_size=1,
+            height=height,
+            width=width,
+            num_frames=n_frames_px,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        conditioning_latents = self.pipe.prepare_video_latents(
+            video, mask, reference_images, generator=None, device=self.device
+        )
+        mask_latents = self.pipe.prepare_masks(mask, reference_images, generator=None)
+        control_hidden_states = torch.cat([conditioning_latents, mask_latents], dim=1)
+        reference_slots = len(reference_images[0])
+        reference_latents = conditioning_latents[
+            :, : self.pipe.vae.config.z_dim, :reference_slots
+        ].clone()
+        return {
+            "mode": "reference",
+            "control_hidden_states": control_hidden_states.to(
+                device=self.device, dtype=self.dtype
+            ),
+            "reference_latents": reference_latents.to(
+                device=self.device, dtype=self.dtype
+            ),
+            "reference_latent_slots": reference_slots,
+        }
+
     def forward_transformer(
         self,
         noisy_latents: torch.Tensor,
         timestep: torch.Tensor,
         text_cond: torch.Tensor,
-        image_cond: torch.Tensor,
+        image_cond: Any,
         n_frames_px: int = 9,
+        conditioning_scale: float = 1.0,
     ) -> torch.Tensor:
         noisy_latents = noisy_latents.to(device=self.device, dtype=self.dtype)
         timestep = timestep.to(device=self.device)
-        if image_cond is not None:
+        if isinstance(image_cond, dict):
+            control_hidden_states = image_cond["control_hidden_states"].to(
+                device=self.device, dtype=self.dtype
+            )
+        elif image_cond is not None:
             image_cond = image_cond.to(device=self.device, dtype=self.dtype)
+            control_hidden_states = self._build_control(
+                noisy_latents, image_cond, n_frames_px
+            )
+        else:
+            raise ValueError("image_cond must contain a VACE condition")
         if text_cond is not None:
             text_cond = text_cond.to(device=self.device, dtype=self.dtype)
 
-        control_hidden_states = self._build_control(noisy_latents, image_cond, n_frames_px)
+        if control_hidden_states.shape[2] != noisy_latents.shape[2]:
+            raise ValueError(
+                "VACE control and noisy latent temporal lengths differ: "
+                f"control={control_hidden_states.shape[2]} latent={noisy_latents.shape[2]}"
+            )
+        vace_layers = self.pipe.transformer.config.vace_layers
+        conditioning_scale = torch.full(
+            (len(vace_layers),),
+            float(conditioning_scale),
+            device=self.device,
+            dtype=self.dtype,
+        )
 
         t_b = timestep if timestep.ndim >= 1 else timestep.unsqueeze(0)
 
@@ -449,6 +517,7 @@ class WanVACEAdapter(ModelAdapter):
             timestep=t_b,
             encoder_hidden_states=text_cond,
             control_hidden_states=control_hidden_states,
+            control_hidden_states_scale=conditioning_scale,
             return_dict=False,
         )
         return out[0]  # (1, C, lT, lH, lW) BCTHW
