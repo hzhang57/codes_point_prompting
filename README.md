@@ -40,6 +40,8 @@ Insert a small red circular marker at a query point in frame 0, then use **count
    ```
    v̂ = (λ+1) · v(c_edited) − λ · v(c_original)
    ```
+   Both conditions use the official VACE `reference_images` path. The demo
+   does not fall back to the legacy first-frame latent control.
 4. **Marker detection** — detect red marker centroid per frame via HSV thresholding
 5. **Inpainting refinement** (optional) — re-denoise a small patch around each detected position at lower noise level for sub-pixel accuracy
 
@@ -123,8 +125,9 @@ python debug_denoise.py --video input.mp4 --max-frames 9
 By default, the clean first frame is passed through VACE's official single
 `reference_images` path. The complete clean video is encoded independently,
 noised as the SDEdit state, and never supplied to the VACE control branch.
-Use `--condition-mode legacy-first-frame` to compare against the previous
-first-frame-plus-zero-video control.
+The extra reference-time latent slot follows the official temporal layout. It
+does not contain the reference image latent; the SDEdit experiment uses a
+neutral zero `x0` for that slot before scheduler noise is applied.
 
 Results are written under `outputs/debug_denoise/`. Each
 `gamma_<value>/denoised.mp4` is the fully denoised video; the same directory

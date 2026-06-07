@@ -275,6 +275,9 @@ def main():
 
     adapter = create_adapter(pipe)
     print(f"  已使用适配器：{type(adapter).__name__}")
+    if not hasattr(adapter, "prepare_reference_condition"):
+        sys.exit("错误：demo 仅支持官方 VACE reference_images 条件。")
+    print("  条件模式：official VACE reference_images（无 legacy fallback）")
 
     # 构建跟踪器（传入超参数配置）
     cfg = PointPrompterConfig(

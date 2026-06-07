@@ -16,7 +16,12 @@ import numpy as np
 import torch.nn.functional as F
 from typing import Optional
 
-from model_adapter import ModelAdapter, noise_strength_to_start_idx
+from model_adapter import (
+    ModelAdapter,
+    noise_strength_to_start_idx,
+    prepend_reference_slots,
+    remove_reference_slots,
+)
 
 
 # 每个跟踪点周围重新去噪的圆形区域半径（像素）
@@ -107,7 +112,25 @@ def refine_tracks(
     mask_lat = _downsample_mask(mask_px, T, lH, lW, device, dtype)  # (1,1,T,lH,lW)
 
     # ------------------------------------------------------------------ #
-    # 步骤 3：掩码内区域加噪，掩码外保留原始干净潜变量                     #
+    # 步骤 3：通过官方 reference_images 路径构建条件                      #
+    # ------------------------------------------------------------------ #
+    if not hasattr(adapter, "prepare_reference_condition"):
+        raise TypeError("Refinement requires official VACE reference_images conditioning")
+    reference_condition = adapter.prepare_reference_condition(
+        frames_bgr_generated[0], len(frames_bgr_generated), H, W
+    )
+    reference_slots = reference_condition["reference_latent_slots"]
+    model_lat_gen = prepend_reference_slots(lat_gen, reference_slots)
+    model_lat_orig = prepend_reference_slots(lat_orig, reference_slots)
+    reference_mask = torch.ones_like(mask_lat[:, :, :1]).repeat(
+        1, 1, reference_slots, 1, 1
+    )
+    model_mask_lat = torch.cat([reference_mask, mask_lat], dim=2)
+    if reference_condition["control_hidden_states"].shape[2] != model_lat_gen.shape[2]:
+        raise ValueError("Official reference control does not match refinement latent length")
+
+    # ------------------------------------------------------------------ #
+    # 步骤 4：掩码内区域加噪，掩码外保留原始干净潜变量                     #
     # ------------------------------------------------------------------ #
     start_idx   = noise_strength_to_start_idx(gamma, scheduler_steps)
     timesteps_run = adapter.prepare_denoise_start(scheduler_steps, start_idx)
@@ -115,29 +138,28 @@ def refine_tracks(
     t_start     = timesteps[start_idx]
 
     noise     = torch.randn(
-        lat_gen.shape,
+        model_lat_gen.shape,
         generator=generator,
-        device=lat_gen.device,
-        dtype=lat_gen.dtype,
+        device=model_lat_gen.device,
+        dtype=model_lat_gen.dtype,
     )
     lat_noisy = (
-        lat_gen.clone()
+        model_lat_gen.clone()
         if gamma == 0.0
-        else adapter.add_noise_at_timestep(lat_gen, noise, t_start)
+        else adapter.add_noise_at_timestep(model_lat_gen, noise, t_start)
     )
     if gamma == 0.0:
         timesteps_run = timesteps_run[:0]
     # 掩码内用噪声潜变量，掩码外直接用原始潜变量（无需去噪）
-    lat_start = mask_lat * lat_noisy + (1.0 - mask_lat) * lat_orig
+    lat_start = model_mask_lat * lat_noisy + (1.0 - model_mask_lat) * model_lat_orig
 
     # ------------------------------------------------------------------ #
-    # 步骤 4：编码条件信息                                                  #
+    # 步骤 5：编码文本条件                                                  #
     # ------------------------------------------------------------------ #
     text_cond  = adapter.encode_text(prompt)
-    image_cond = adapter.encode_image_cond(frames_bgr_generated[0])  # 以生成帧第 0 帧为条件
 
     # ------------------------------------------------------------------ #
-    # 步骤 5：按噪声强度运行对应数量的去噪步骤                              #
+    # 步骤 6：按噪声强度运行对应数量的去噪步骤                              #
     # ------------------------------------------------------------------ #
     latents = lat_start.clone()
 
@@ -145,14 +167,20 @@ def refine_tracks(
         t_batch = t.unsqueeze(0).to(device)
         t_next  = timesteps_run[i + 1] if i + 1 < len(timesteps_run) else torch.zeros_like(t)
         with torch.no_grad():
-            v = adapter.forward_transformer(latents, t_batch, text_cond, image_cond)
+            v = adapter.forward_transformer(
+                latents,
+                t_batch,
+                text_cond,
+                reference_condition,
+                n_frames_px=len(frames_bgr_generated),
+            )
         latents = adapter.scheduler_step(v, t, latents, t_next)
 
         # 关键：每步去噪后将掩码外的区域替换回原始潜变量
         # 确保精细化只影响标记附近，避免其他区域被模型随机改变
-        latents = mask_lat * latents + (1.0 - mask_lat) * lat_orig
+        latents = model_mask_lat * latents + (1.0 - model_mask_lat) * model_lat_orig
 
     # ------------------------------------------------------------------ #
-    # 步骤 6：解码最终潜变量为像素帧                                        #
+    # 步骤 7：解码最终潜变量为像素帧                                        #
     # ------------------------------------------------------------------ #
-    return adapter.decode_latents(latents)
+    return adapter.decode_latents(remove_reference_slots(latents, reference_slots))

@@ -22,7 +22,6 @@ class _FakeAdapter:
         self.scheduler = _FakeScheduler()
         self.text_encoder_released = False
         self.full_video_latent = None
-        self.image_cond_video_latent = None
         self.add_noise_latents = []
         self.transformer_latent_shapes = []
         self.decoded_latent_shapes = []
@@ -43,15 +42,10 @@ class _FakeAdapter:
             for _ in range(latents.shape[2])
         ]
 
-    def encode_image_cond(self, frame, video_latent=None):
-        self.image_cond_video_latent = video_latent
-        return torch.zeros(1, 1, 1, 2, 2)
-
     def prepare_reference_condition(self, frame, n_frames_px, height, width):
         return {
             "mode": "reference",
             "reference_latent_slots": 1,
-            "reference_latents": torch.full((1, 1, 1, 2, 2), 7.0),
             "control_hidden_states": torch.zeros(1, 66, n_frames_px + 1, 2, 2),
         }
 
@@ -112,7 +106,6 @@ class TestDebugDenoise(unittest.TestCase):
             scheduler_steps=4,
             flow_shift=3.0,
             prompt="",
-            condition_mode="reference",
             conditioning_scale=1.0,
             seed=42,
             output_dir=None,
@@ -133,10 +126,13 @@ class TestDebugDenoise(unittest.TestCase):
                 "fake", device="cpu", flow_shift=3.0, low_cpu_memory=True
             )
             self.assertTrue(fake_adapter.text_encoder_released)
-            self.assertIsNone(fake_adapter.image_cond_video_latent)
             self.assertTrue(fake_adapter.add_noise_latents)
             self.assertTrue(all(
                 latent.shape[2] == fake_adapter.full_video_latent.shape[2] + 1
+                for latent in fake_adapter.add_noise_latents
+            ))
+            self.assertTrue(all(
+                torch.count_nonzero(latent[:, :, :1]).item() == 0
                 for latent in fake_adapter.add_noise_latents
             ))
             self.assertTrue(fake_adapter.transformer_latent_shapes)
@@ -156,41 +152,14 @@ class TestDebugDenoise(unittest.TestCase):
                 debug_denoise.os.path.join(output_dir, "summary.json")
             ))
 
-    def test_legacy_mode_uses_full_video_first_frame_condition(self):
-        frames = [np.zeros((4, 4, 3), dtype=np.uint8) for _ in range(5)]
-        args = SimpleNamespace(
-            video="input.mp4",
-            model_id="fake",
-            device="cpu",
-            max_frames=5,
-            height=4,
-            width=4,
-            gammas=[0.5],
-            scheduler_steps=4,
-            flow_shift=3.0,
-            prompt="",
-            condition_mode="legacy-first-frame",
-            conditioning_scale=1.0,
-            seed=42,
-            output_dir=None,
-            low_memory=True,
-        )
+    def test_prepend_reference_slots_keeps_video_and_uses_zero_slots(self):
+        video = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 2, 2)
 
-        with tempfile.TemporaryDirectory() as output_dir:
-            args.output_dir = output_dir
-            fake_adapter = _FakeAdapter()
-            with patch("debug_denoise.load_video", return_value=(frames, 12.0)), \
-                    patch("debug_denoise.load_wan_vace_pipe", return_value=object()), \
-                    patch("debug_denoise.create_adapter", return_value=fake_adapter), \
-                    patch("debug_denoise.save_video"), \
-                    patch("debug_denoise.save_frames"):
-                debug_denoise.run_debug(args)
+        model_latents = debug_denoise.prepend_reference_slots(video, 2)
 
-        self.assertIs(fake_adapter.image_cond_video_latent, fake_adapter.full_video_latent)
-        self.assertTrue(all(
-            latent is fake_adapter.full_video_latent for latent in fake_adapter.add_noise_latents
-        ))
-
+        self.assertEqual(model_latents.shape, (1, 1, 5, 2, 2))
+        self.assertEqual(model_latents[:, :, :2].count_nonzero().item(), 0)
+        torch.testing.assert_close(model_latents[:, :, 2:], video)
 
 if __name__ == "__main__":
     unittest.main()

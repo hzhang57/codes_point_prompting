@@ -35,6 +35,25 @@ def denoise_step_count(noise_strength: float, n_steps: int) -> int:
     return n_steps - noise_strength_to_start_idx(noise_strength, n_steps)
 
 
+def prepend_reference_slots(video_latents: torch.Tensor, count: int) -> torch.Tensor:
+    """Prepend neutral zero x0 slots required by official reference conditions."""
+    if count < 0:
+        raise ValueError(f"Reference slot count must be non-negative, got {count}")
+    if count == 0:
+        return video_latents
+    slots = torch.zeros_like(video_latents[:, :, :1]).repeat(1, 1, count, 1, 1)
+    return torch.cat([slots, video_latents], dim=2)
+
+
+def remove_reference_slots(model_latents: torch.Tensor, count: int) -> torch.Tensor:
+    """Remove official reference-time slots before video decoding."""
+    if count < 0 or count > model_latents.shape[2]:
+        raise ValueError(
+            f"Invalid reference slot count {count} for temporal length {model_latents.shape[2]}"
+        )
+    return model_latents[:, :, count:]
+
+
 def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
     """BGR numpy 数组 → RGB PIL 图像（cv2 与 PIL 的通道顺序相反）。"""
     return Image.fromarray(arr[..., ::-1].copy())
@@ -450,15 +469,9 @@ class WanVACEAdapter(ModelAdapter):
         mask_latents = self.pipe.prepare_masks(mask, reference_images, generator=None)
         control_hidden_states = torch.cat([conditioning_latents, mask_latents], dim=1)
         reference_slots = len(reference_images[0])
-        reference_latents = conditioning_latents[
-            :, : self.pipe.vae.config.z_dim, :reference_slots
-        ].clone()
         return {
             "mode": "reference",
             "control_hidden_states": control_hidden_states.to(
-                device=self.device, dtype=self.dtype
-            ),
-            "reference_latents": reference_latents.to(
                 device=self.device, dtype=self.dtype
             ),
             "reference_latent_slots": reference_slots,

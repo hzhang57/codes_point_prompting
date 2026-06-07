@@ -24,7 +24,12 @@ import numpy as np
 import cv2
 from typing import Optional
 
-from model_adapter import ModelAdapter, noise_strength_to_start_idx
+from model_adapter import (
+    ModelAdapter,
+    noise_strength_to_start_idx,
+    prepend_reference_slots,
+    remove_reference_slots,
+)
 from marker import track_marker_sequence
 
 
@@ -113,39 +118,33 @@ def run_sdedit(
     print(f"[DEBUG] debug_input_frames saved ({len(frames_bgr_edited)} frames)")
 
     # ------------------------------------------------------------------ #
-    # 步骤 2：分别编码正负向图像条件（论文设计：仅第 0 帧，差异只在红点）  #
+    # 步骤 2：通过官方 reference_images 路径构建正负向条件              #
     # ------------------------------------------------------------------ #
-    # c_original：第 0 帧不带红点，直接 VAE 编码
-    cond_original = adapter.encode_image_cond(frame_bgr_original)
-    # c_edited：从整段视频 latent 取第 0 帧（VAE 已含标记信息），再在 latent 空间
-    # 强制叠加标记信号——VAE 8× 压缩使 2px 标记退化为亚像素，latent 注入确保信号可感知
-    cond_edited = adapter.encode_image_cond(frames_bgr_edited[0], latents_clean)
-    if query_point is not None:
-        _, _, _, lH, lW = cond_edited.shape
-        H_px = frames_bgr_edited[0].shape[0]
-        vae_stride = H_px // lH          # 空间下采样倍数，通常为 8
-        lx = int(query_point[0] / vae_stride)
-        ly = int(query_point[1] / vae_stride)
-        r  = max(1, 4 // vae_stride)     # latent 空间半径，至少 1 格
-        lx = max(r, min(lW - r - 1, lx))
-        ly = max(r, min(lH - r - 1, ly))
-        # 注入强度：latent 均值绝对值的 2 倍，信号显著但不破坏整体分布
-        signal_strength = cond_edited.abs().mean().item() * 2.0
-        cond_edited = cond_edited.clone()
-        cond_edited[:, :, :, ly-r:ly+r+1, lx-r:lx+r+1] += signal_strength
-        print(f"[DEBUG] latent marker injected at ({lx},{ly}) r={r} "
-              f"strength={signal_strength:.4f}")
-    print(f"[DEBUG] cond_edited:   shape={cond_edited.shape} "
-          f"min={cond_edited.min():.3f} max={cond_edited.max():.3f}")
-    print(f"[DEBUG] cond_original: shape={cond_original.shape} "
-          f"min={cond_original.min():.3f} max={cond_original.max():.3f}")
-    print(f"[DEBUG] cond diff (edited-original): "
-          f"mean abs={(cond_edited - cond_original).abs().mean():.4f}")
-
-    # [DEBUG] 解码确认标记保留
-    cv2.imwrite("debug_cond_edited.png",   adapter.decode_latents(cond_edited)[0])
-    cv2.imwrite("debug_cond_original.png", adapter.decode_latents(cond_original)[0])
-    print(f"[DEBUG] debug_cond_edited.png / debug_cond_original.png saved")
+    if not hasattr(adapter, "prepare_reference_condition"):
+        raise TypeError("SDEdit requires official VACE reference_images conditioning")
+    height, width = frames_bgr_edited[0].shape[:2]
+    cond_edited = adapter.prepare_reference_condition(
+        frames_bgr_edited[0], len(frames_bgr_edited), height, width
+    )
+    cond_original = adapter.prepare_reference_condition(
+        frame_bgr_original, len(frames_bgr_edited), height, width
+    )
+    reference_slots = cond_edited["reference_latent_slots"]
+    if cond_original["reference_latent_slots"] != reference_slots:
+        raise ValueError("Edited and original reference conditions use different slot counts")
+    edited_control = cond_edited["control_hidden_states"]
+    original_control = cond_original["control_hidden_states"]
+    if edited_control.shape != original_control.shape:
+        raise ValueError("Edited and original reference controls have different shapes")
+    model_latents_clean = prepend_reference_slots(latents_clean, reference_slots)
+    if edited_control.shape[2] != model_latents_clean.shape[2]:
+        raise ValueError("Official reference control does not match model latent length")
+    control_diff = (edited_control.float() - original_control.float()).abs()
+    print(
+        "[DEBUG] official reference_images counterfactual conditions: "
+        f"slots={reference_slots} control_diff_mean={control_diff.mean().item():.6f} "
+        f"control_diff_max={control_diff.max().item():.6f}"
+    )
 
     # ------------------------------------------------------------------ #
     # 步骤 3：编码文本提示                                                  #
@@ -158,10 +157,10 @@ def run_sdedit(
     # 使用 scheduler.add_noise()，并通过 set_begin_index 对齐局部去噪起点。 #
     # ------------------------------------------------------------------ #
     noise = torch.randn(
-        latents_clean.shape,
+        model_latents_clean.shape,
         generator=generator,
-        device=latents_clean.device,
-        dtype=latents_clean.dtype,
+        device=model_latents_clean.device,
+        dtype=model_latents_clean.dtype,
     )
     start_idx = noise_strength_to_start_idx(gamma, scheduler_steps)
     timesteps_run = adapter.prepare_denoise_start(scheduler_steps, start_idx)
@@ -174,17 +173,20 @@ def run_sdedit(
           f"denoise_steps={len(timesteps_run)}")
 
     latents = (
-        latents_clean.clone()
+        model_latents_clean.clone()
         if gamma == 0.0
-        else adapter.add_noise_at_timestep(latents_clean, noise, t_start)
+        else adapter.add_noise_at_timestep(model_latents_clean, noise, t_start)
     )
     print(f"[DEBUG] t_start={t_start.item():.1f} scheduler={type(adapter.scheduler).__name__}")
-    print(f"[DEBUG] latents_clean norm: {latents_clean.norm():.3f}  noise norm: {noise.norm():.3f}")
+    print(f"[DEBUG] model_latents_clean norm: {model_latents_clean.norm():.3f}  noise norm: {noise.norm():.3f}")
     print(f"[DEBUG] latents after add_noise: "
           f"min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f} norm={latents.norm():.3f}")
 
     # [DEBUG] 将加噪后的 latent 解码，直观看噪声程度
-    _save_frames(adapter.decode_latents(latents), "debug_noisy_input")
+    _save_frames(
+        adapter.decode_latents(remove_reference_slots(latents, reference_slots)),
+        "debug_noisy_input",
+    )
     print(f"[DEBUG] debug_noisy_input saved")
 
     # ------------------------------------------------------------------ #
@@ -207,13 +209,13 @@ def run_sdedit(
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(f"[DEBUG] step {i+1}/{len(timesteps_run)} t={t.item():.1f} "
                   f"latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
-            _frames = adapter.decode_latents(latents)
+            _frames = adapter.decode_latents(remove_reference_slots(latents, reference_slots))
             _save_mp4(_frames, f"generated_step_{i+1:03d}.mp4", query_point=query_point)
 
     # ------------------------------------------------------------------ #
     # 步骤 6：解码潜变量 → 像素帧                                          #
     # ------------------------------------------------------------------ #
     print(f"[DEBUG] final latents: min={latents.min():.3f} max={latents.max():.3f} mean={latents.mean():.3f}")
-    frames_out = adapter.decode_latents(latents)
+    frames_out = adapter.decode_latents(remove_reference_slots(latents, reference_slots))
     _save_frames(frames_out, "debug_output_frames")
     return frames_out

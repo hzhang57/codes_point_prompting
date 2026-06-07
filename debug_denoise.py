@@ -23,6 +23,8 @@ from model_adapter import (
     create_adapter,
     load_wan_vace_pipe,
     noise_strength_to_start_idx,
+    prepend_reference_slots,
+    remove_reference_slots,
 )
 
 
@@ -128,7 +130,7 @@ def denoise_latents(
     adapter,
     latents,
     timesteps_run,
-    image_cond,
+    reference_condition,
     text_cond,
     n_frames_px,
     conditioning_scale,
@@ -145,7 +147,7 @@ def denoise_latents(
                 noisy_latents=latents,
                 timestep=timestep_batch,
                 text_cond=text_cond,
-                image_cond=image_cond,
+                image_cond=reference_condition,
                 n_frames_px=n_frames_px,
                 conditioning_scale=conditioning_scale,
             )
@@ -189,30 +191,19 @@ def run_debug(args):
     release_memory()
     print(f"[baseline] VAE round-trip PSNR={vae_psnr:.2f} dB")
 
-    if args.condition_mode == "reference":
-        if not hasattr(adapter, "prepare_reference_condition"):
-            raise TypeError("The selected adapter does not support official reference images")
-        image_cond = adapter.prepare_reference_condition(
-            frames[0], len(frames), args.height, args.width
-        )
-        reference_slots = image_cond["reference_latent_slots"]
-        model_latents_clean = torch.cat(
-            [image_cond["reference_latents"], latents_clean], dim=2
-        )
-        print(
-            "[control] official reference-only condition; "
-            f"reference_slots={reference_slots}"
-        )
-    else:
-        image_cond = adapter.encode_image_cond(frames[0], latents_clean)
-        reference_slots = 0
-        model_latents_clean = latents_clean
-        print("[control] legacy first-frame latent + zero video control")
+    if not hasattr(adapter, "prepare_reference_condition"):
+        raise TypeError("The selected adapter does not support official reference images")
+    reference_condition = adapter.prepare_reference_condition(
+        frames[0], len(frames), args.height, args.width
+    )
+    reference_slots = reference_condition["reference_latent_slots"]
+    model_latents_clean = prepend_reference_slots(latents_clean, reference_slots)
+    print(
+        "[control] official reference-only condition; "
+        f"reference_slots={reference_slots}"
+    )
 
-    if (
-        isinstance(image_cond, dict)
-        and image_cond["control_hidden_states"].shape[2] != model_latents_clean.shape[2]
-    ):
+    if reference_condition["control_hidden_states"].shape[2] != model_latents_clean.shape[2]:
         raise ValueError("Official reference control does not match model latent length")
     video_latent_shape = list(latents_clean.shape)
     model_latent_shape = list(model_latents_clean.shape)
@@ -244,7 +235,7 @@ def run_debug(args):
             noisy_model_latents = adapter.add_noise_at_timestep(
                 model_latents_clean, base_noise, t_start
             )
-        noisy_latents = noisy_model_latents[:, :, reference_slots:]
+        noisy_latents = remove_reference_slots(noisy_model_latents, reference_slots)
 
         noisy_frames = decode_for_output(adapter, noisy_latents)
         noisy_psnr, noisy_per_frame = mean_psnr(frames, noisy_frames)
@@ -254,13 +245,13 @@ def run_debug(args):
             adapter,
             noisy_model_latents.clone(),
             timesteps_run,
-            image_cond,
+            reference_condition,
             text_cond,
             len(frames),
             args.conditioning_scale,
         )
         denoised_model_latents = denoised_latents
-        denoised_latents = denoised_model_latents[:, :, reference_slots:]
+        denoised_latents = remove_reference_slots(denoised_model_latents, reference_slots)
         denoised_frames = decode_for_output(adapter, denoised_latents)
         denoised_psnr, denoised_per_frame = mean_psnr(frames, denoised_frames)
         save_video(denoised_frames, os.path.join(gamma_dir, "denoised.mp4"), fps)
@@ -275,7 +266,6 @@ def run_debug(args):
 
         summary = {
             "gamma": gamma,
-            "condition_mode": args.condition_mode,
             "conditioning_scale": args.conditioning_scale,
             "reference_latent_slots": reference_slots,
             "video_latent_shape": str(video_latent_shape),
@@ -310,7 +300,6 @@ def run_debug(args):
 
     csv_fields = [
         "gamma",
-        "condition_mode",
         "conditioning_scale",
         "reference_latent_slots",
         "video_latent_shape",
@@ -340,7 +329,6 @@ def run_debug(args):
         "fps": fps,
         "seed": args.seed,
         "scheduler_steps": args.scheduler_steps,
-        "condition_mode": args.condition_mode,
         "conditioning_scale": args.conditioning_scale,
         "reference_latent_slots": reference_slots,
         "video_latent_shape": video_latent_shape,
@@ -384,12 +372,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-steps", type=int, default=100)
     parser.add_argument("--flow-shift", type=float, default=3.0)
     parser.add_argument("--prompt", default="")
-    parser.add_argument(
-        "--condition-mode",
-        choices=["reference", "legacy-first-frame"],
-        default="reference",
-        help="Use official reference_images conditioning or the legacy first-frame control.",
-    )
     parser.add_argument("--conditioning-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="outputs/debug_denoise")

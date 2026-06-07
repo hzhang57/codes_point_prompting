@@ -15,6 +15,8 @@ from model_adapter import (
     denoise_step_count,
     load_wan_vace_pipe,
     noise_strength_to_start_idx,
+    prepend_reference_slots,
+    remove_reference_slots,
     _frames_to_tensor,
     _tensor_to_frames,
 )
@@ -218,6 +220,15 @@ class TestTensorHelpers(unittest.TestCase):
         self.assertEqual(tensor.shape, (1, 3, 1, 4, 5))
         np.testing.assert_allclose(out[0], frame, atol=1)
 
+    def test_reference_slot_helpers_roundtrip(self):
+        video = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 2, 2)
+
+        model_latents = prepend_reference_slots(video, 2)
+
+        self.assertEqual(model_latents.shape, (1, 1, 5, 2, 2))
+        self.assertEqual(model_latents[:, :, :2].count_nonzero().item(), 0)
+        torch.testing.assert_close(remove_reference_slots(model_latents, 2), video)
+
 
 class TestSchedulerHelpers(unittest.TestCase):
     def test_noise_strength_maps_to_descending_scheduler_index(self):
@@ -267,6 +278,35 @@ class TestSchedulerHelpers(unittest.TestCase):
 
         torch.testing.assert_close(out, latents - 0.01)
 
+    def test_counterfactual_guidance_reuses_noisy_latents_and_combines_conditions(self):
+        class GuidanceAdapter(_MinimalAdapter):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def forward_transformer(
+                self, noisy_latents, timestep, text_cond, image_cond,
+                n_frames_px=9, conditioning_scale=1.0,
+            ):
+                self.calls.append((noisy_latents, image_cond))
+                return torch.full_like(noisy_latents, image_cond["value"])
+
+        adapter = GuidanceAdapter()
+        noisy = torch.zeros(1, LAT_C, 2, 4, 4)
+
+        guided = adapter.predict_with_guidance(
+            noisy,
+            torch.tensor([1]),
+            text_cond=None,
+            image_cond_edited={"value": 2.0},
+            image_cond_original={"value": 0.5},
+            lam=3.0,
+        )
+
+        self.assertIs(adapter.calls[0][0], noisy)
+        self.assertIs(adapter.calls[1][0], noisy)
+        torch.testing.assert_close(guided, torch.full_like(noisy, 6.5))
+
 
 class TestWanVACEAdapter(unittest.TestCase):
     def test_create_adapter_returns_wan_vace_adapter(self):
@@ -311,10 +351,6 @@ class TestWanVACEAdapter(unittest.TestCase):
 
         self.assertEqual(condition["mode"], "reference")
         self.assertEqual(condition["reference_latent_slots"], 1)
-        self.assertEqual(condition["reference_latents"].shape, (1, LAT_C, 1, H, W))
-        torch.testing.assert_close(
-            condition["reference_latents"], torch.full_like(condition["reference_latents"], 7)
-        )
         self.assertEqual(
             condition["control_hidden_states"].shape,
             (1, 2 * LAT_C + 64, T + 1, H, W),
