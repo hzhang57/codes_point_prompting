@@ -287,7 +287,11 @@ class WanVACEAdapter(ModelAdapter):
         with torch.no_grad():
             decoded = self.pipe.vae.decode(lat).sample
         print(f"[DEBUG] decode_latents: decoded shape={decoded.shape}")
-        return _tensor_to_frames(decoded)
+        frames = _tensor_to_frames(decoded)
+        del lat, decoded
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return frames
 
     def encode_image_cond(self, frame_bgr: np.ndarray,
                           video_latent: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -324,9 +328,14 @@ class WanVACEAdapter(ModelAdapter):
         return embeds.to(device=self.device)
 
     def _encode_text_cpu(self, prompt: str) -> torch.Tensor:
-        """在 CPU 上用 float32 编码文本（避开双卡 OOM / cuBLAS 故障）。"""
+        """Encode text on CPU; low-memory runs preserve the loaded T5 dtype."""
         orig_dtype = next(self.pipe.text_encoder.parameters()).dtype
-        self.pipe.text_encoder.to(device="cpu", dtype=torch.float32)
+        encode_dtype = (
+            orig_dtype
+            if getattr(self.pipe, "_low_memory_text_encoder", False)
+            else torch.float32
+        )
+        self.pipe.text_encoder.to(device="cpu", dtype=encode_dtype)
         try:
             with torch.no_grad():
                 embeds = self.pipe._get_t5_prompt_embeds(
@@ -339,6 +348,12 @@ class WanVACEAdapter(ModelAdapter):
             # 还原 dtype，权重保持在 CPU 释放显存
             self.pipe.text_encoder.to(device="cpu", dtype=orig_dtype)
         return embeds.to(dtype=self.dtype)
+
+    def release_text_encoder(self) -> None:
+        """Release T5 weights after cached prompt embedding is available."""
+        self.pipe.text_encoder = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _ensure_prompt_clean_dependencies(self) -> None:
         """Patch optional prompt-cleaning deps into older Diffusers Wan modules."""
@@ -450,7 +465,8 @@ def create_adapter(pipe) -> ModelAdapter:
 
 def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
                        device: str = "cuda",
-                       flow_shift: float = 3.0) -> Any:
+                       flow_shift: float = 3.0,
+                       low_cpu_memory: bool = False) -> Any:
     """加载 Wan2.1-VACE-1.3B pipeline（bfloat16），包含 T5 文本编码器。
 
     T5 是必须的：全零 text_cond 会让 transformer 输出巨大的固定偏置
@@ -465,12 +481,15 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
         model_id,
         subfolder="vae",
         torch_dtype=torch.float32,
+        low_cpu_mem_usage=low_cpu_memory,
     )
     pipe = WanVACEPipeline.from_pretrained(
         model_id,
         vae=vae,
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=low_cpu_memory,
     )
+    pipe._low_memory_text_encoder = low_cpu_memory
 
     if str(device).startswith("cuda"):
         n_gpus = torch.cuda.device_count()
@@ -489,6 +508,7 @@ def load_wan_vace_pipe(model_id: str = "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
         else:
             pipe.transformer.to("cuda:0")
         pipe.vae.to("cuda:0", dtype=torch.float32)
+        print("[load] VAE device: cuda:0")
         # T5 常驻 CPU：transformer+VAE 已占满 cuda:0，T5 上卡会 OOM；
         # encode_text 在 CPU 上 float32 编码并缓存（零样本 prompt 恒定）。
         pipe.text_encoder.to("cpu")

@@ -126,6 +126,15 @@ also contains `noisy.mp4`, denoised PNG frames, and a three-column
 `compare.mp4`. Aggregate PSNR and latent MSE results are saved in
 `summary.csv` and `summary.json`.
 
+The reconstruction script enables low-CPU-RAM mode by default: model loading
+uses `low_cpu_mem_usage`, T5 keeps its loaded dtype instead of expanding to
+float32, and T5 is released after prompt encoding. For a constrained notebook,
+start with one strength and fewer pixels:
+
+```bash
+python debug_denoise.py --video input.mp4 --max-frames 5 --width 512 --height 288 --gammas 0.5
+```
+
 ## File Structure
 
 ```

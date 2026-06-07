@@ -284,10 +284,11 @@ class TestWanVACELoader(unittest.TestCase):
     def test_loader_uses_official_unipc_scheduler_with_flow_shift(self):
         class FakeAutoencoderKLWan:
             @classmethod
-            def from_pretrained(cls, model_id, subfolder=None, torch_dtype=None):
+            def from_pretrained(cls, model_id, subfolder=None, torch_dtype=None, **kwargs):
                 vae = _MockVAE(dtype=torch_dtype)
                 vae.model_id = model_id
                 vae.subfolder = subfolder
+                vae.low_cpu_mem_usage = kwargs.get("low_cpu_mem_usage")
                 return vae
 
         class FakeUniPCMultistepScheduler:
@@ -315,10 +316,16 @@ class TestWanVACELoader(unittest.TestCase):
         )
 
         with patch.dict(sys.modules, {"diffusers": fake_diffusers}):
-            pipe = load_wan_vace_pipe("Wan-AI/Wan2.1-VACE-1.3B-diffusers", device="cpu", flow_shift=3.0)
+            pipe = load_wan_vace_pipe(
+                "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+                device="cpu",
+                flow_shift=3.0,
+                low_cpu_memory=True,
+            )
 
         self.assertIsInstance(pipe, FakeWanVACEPipeline)
         self.assertEqual(pipe.vae.subfolder, "vae")
+        self.assertTrue(pipe.vae.low_cpu_mem_usage)
         self.assertEqual(next(pipe.vae.parameters()).dtype, torch.float32)
         self.assertEqual(pipe.transformer.dtype, torch.bfloat16)
         self.assertEqual(pipe.scheduler.flow_shift, 3.0)

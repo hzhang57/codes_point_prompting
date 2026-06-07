@@ -20,6 +20,7 @@ class _FakeAdapter:
         self.device = torch.device("cpu")
         self.dtype = torch.float32
         self.scheduler = _FakeScheduler()
+        self.text_encoder_released = False
 
     @property
     def timesteps(self):
@@ -40,6 +41,9 @@ class _FakeAdapter:
 
     def encode_text(self, prompt):
         return torch.zeros(1, 1, 1)
+
+    def release_text_encoder(self):
+        self.text_encoder_released = True
 
     def prepare_denoise_start(self, n_steps, start_idx):
         self.scheduler.timesteps = torch.linspace(999, 1, n_steps).long()
@@ -89,17 +93,22 @@ class TestDebugDenoise(unittest.TestCase):
             prompt="",
             seed=42,
             output_dir=None,
+            low_memory=True,
         )
 
         with tempfile.TemporaryDirectory() as output_dir:
             args.output_dir = output_dir
             with patch("debug_denoise.load_video", return_value=(frames, 12.0)), \
-                    patch("debug_denoise.load_wan_vace_pipe", return_value=object()), \
-                    patch("debug_denoise.create_adapter", return_value=_FakeAdapter()), \
+                    patch("debug_denoise.load_wan_vace_pipe", return_value=object()) as loader_mock, \
+                    patch("debug_denoise.create_adapter", return_value=_FakeAdapter()) as adapter_mock, \
                     patch("debug_denoise.save_video") as save_video_mock, \
                     patch("debug_denoise.save_frames"):
                 debug_denoise.run_debug(args)
 
+            loader_mock.assert_called_once_with(
+                "fake", device="cpu", flow_shift=3.0, low_cpu_memory=True
+            )
+            self.assertTrue(adapter_mock.text_encoder_released)
             saved_paths = [call.args[1] for call in save_video_mock.call_args_list]
             for gamma in args.gammas:
                 expected = debug_denoise.os.path.join(

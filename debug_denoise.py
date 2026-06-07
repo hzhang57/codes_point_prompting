@@ -11,6 +11,7 @@ Example:
 
 import argparse
 import csv
+import gc
 import json
 import os
 
@@ -91,6 +92,18 @@ def json_metric(value: float):
     return value if np.isfinite(value) else None
 
 
+def release_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def decode_for_output(adapter, latents) -> list:
+    frames = adapter.decode_latents(latents)
+    release_memory()
+    return frames
+
+
 def load_video(path: str, max_frames: int, width: int, height: int) -> tuple:
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 8.0
@@ -151,19 +164,27 @@ def run_debug(args):
     save_frames(frames, os.path.join(args.output_dir, "original_frames"))
 
     pipe = load_wan_vace_pipe(
-        args.model_id, device=args.device, flow_shift=args.flow_shift
+        args.model_id,
+        device=args.device,
+        flow_shift=args.flow_shift,
+        low_cpu_memory=args.low_memory,
     )
     adapter = create_adapter(pipe)
     print(f"[model] device={adapter.device} dtype={adapter.dtype}")
 
     latents_clean = adapter.encode_video(frames)
-    vae_frames = adapter.decode_latents(latents_clean)
+    vae_frames = decode_for_output(adapter, latents_clean)
     vae_psnr, vae_per_frame = mean_psnr(frames, vae_frames)
     save_video(vae_frames, os.path.join(args.output_dir, "vae_roundtrip.mp4"), fps)
+    del vae_frames
+    release_memory()
     print(f"[baseline] VAE round-trip PSNR={vae_psnr:.2f} dB")
 
     image_cond = adapter.encode_image_cond(frames[0], latents_clean)
     text_cond = adapter.encode_text(args.prompt)
+    if args.low_memory and hasattr(adapter, "release_text_encoder"):
+        adapter.release_text_encoder()
+    release_memory()
     torch.manual_seed(args.seed)
     base_noise = torch.randn_like(latents_clean)
     torch.save(base_noise.detach().cpu(), os.path.join(args.output_dir, "noise.pt"))
@@ -185,7 +206,7 @@ def run_debug(args):
                 latents_clean, base_noise, t_start
             )
 
-        noisy_frames = adapter.decode_latents(noisy_latents)
+        noisy_frames = decode_for_output(adapter, noisy_latents)
         noisy_psnr, noisy_per_frame = mean_psnr(frames, noisy_frames)
         save_video(noisy_frames, os.path.join(gamma_dir, "noisy.mp4"), fps)
 
@@ -197,7 +218,7 @@ def run_debug(args):
             text_cond,
             len(frames),
         )
-        denoised_frames = adapter.decode_latents(denoised_latents)
+        denoised_frames = decode_for_output(adapter, denoised_latents)
         denoised_psnr, denoised_per_frame = mean_psnr(frames, denoised_frames)
         save_video(denoised_frames, os.path.join(gamma_dir, "denoised.mp4"), fps)
         save_frames(denoised_frames, os.path.join(gamma_dir, "denoised_frames"))
@@ -235,6 +256,8 @@ def run_debug(args):
             f"denoised={denoised_psnr:.2f} dB "
             f"gain={summary['recovery_gain']:+.2f} dB"
         )
+        del noisy_latents, denoised_latents, noisy_frames, denoised_frames
+        release_memory()
 
     csv_fields = [
         "gamma",
@@ -304,6 +327,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="outputs/debug_denoise")
+    parser.add_argument(
+        "--no-low-memory",
+        dest="low_memory",
+        action="store_false",
+        help="Disable reduced-CPU-RAM model loading and T5 release.",
+    )
+    parser.set_defaults(low_memory=True)
     return parser
 
 
