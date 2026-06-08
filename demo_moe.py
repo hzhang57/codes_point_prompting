@@ -37,6 +37,8 @@ OFFICIAL_FLOW_SHIFT = 5.0
 OFFICIAL_MAX_SEQUENCE_LENGTH = 512
 OFFICIAL_LANDSCAPE_SIZE = (1280, 704)
 OFFICIAL_PORTRAIT_SIZE = (704, 1280)
+T4_LANDSCAPE_SIZE = (832, 480)
+T4_PORTRAIT_SIZE = (480, 832)
 
 
 @dataclass
@@ -112,15 +114,18 @@ def resolve_vae_device(device: str, vae_device: str) -> torch.device:
     return _resolve_cuda_device(vae_device)
 
 
-def parse_torch_dtype(dtype_name: str) -> torch.dtype:
+def parse_torch_dtype(dtype_name: str, device: str = "cuda") -> torch.dtype:
     name = dtype_name.lower()
+    if name == "auto":
+        dev = _resolve_cuda_device(device)
+        return torch.float16 if dev.type == "cuda" else torch.float32
     if name in ("float32", "fp32"):
         return torch.float32
     if name in ("float16", "fp16", "half"):
         return torch.float16
     if name in ("bfloat16", "bf16"):
         return torch.bfloat16
-    raise ValueError("--vae-dtype must be one of: float32, float16, bfloat16")
+    raise ValueError("--vae-dtype must be one of: auto, float32, float16, bfloat16")
 
 
 def _pipe_device(pipe) -> torch.device:
@@ -266,7 +271,7 @@ def load_wan_ti2v_pipe(
             "Install the current Diffusers main branch."
         ) from exc
 
-    vae_torch_dtype = parse_torch_dtype(vae_dtype)
+    vae_torch_dtype = parse_torch_dtype(vae_dtype, device=device)
     loading_kwargs = {"low_cpu_mem_usage": low_cpu_memory}
     try:
         vae = AutoencoderKLWan.from_pretrained(
@@ -406,11 +411,12 @@ def prepare_wan22_first_frame_condition(
 ) -> FirstFrameCondition:
     transformer_device = _pipe_device(pipe)
     vae_device = _vae_device(pipe)
+    vae_dtype = _vae_dtype(pipe)
     dtype = _transformer_dtype(pipe)
     image = pipe.video_processor.preprocess(
         _bgr_to_pil(first_frame_bgr), height=height, width=width
     )
-    image = image.to(device=vae_device, dtype=torch.float32)
+    image = image.to(device=vae_device, dtype=vae_dtype)
 
     outputs = pipe.prepare_latents(
         image,
@@ -419,10 +425,10 @@ def prepare_wan22_first_frame_condition(
         height=height,
         width=width,
         num_frames=num_frames,
-        dtype=torch.float32,
+        dtype=vae_dtype,
         device=vae_device,
         generator=generator,
-        latents=noisy_latents.to(device=vae_device, dtype=torch.float32),
+        latents=noisy_latents.to(device=vae_device, dtype=vae_dtype),
     )
     if len(outputs) != 3:
         raise ValueError(
@@ -763,6 +769,22 @@ def official_ti2v_size_for_aspect(width: int, height: int) -> Tuple[int, int]:
     return OFFICIAL_LANDSCAPE_SIZE
 
 
+def t4_ti2v_size_for_aspect(width: int, height: int) -> Tuple[int, int]:
+    if height > width:
+        return T4_PORTRAIT_SIZE
+    return T4_LANDSCAPE_SIZE
+
+
+def default_ti2v_size_for_preset(preset: str, width: int, height: int) -> Tuple[int, int]:
+    if preset == "official":
+        return official_ti2v_size_for_aspect(width, height)
+    if preset == "t4":
+        return t4_ti2v_size_for_aspect(width, height)
+    if preset == "custom":
+        return t4_ti2v_size_for_aspect(width, height)
+    raise ValueError("--resolution-preset must be one of: t4, official, custom")
+
+
 def draw_tracks(frames: list, tracks_list: list, visible_list: list) -> list:
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 0, 255)]
     out = []
@@ -918,6 +940,22 @@ def cuda_preflight_error(device: str) -> Optional[str]:
     )
 
 
+def cuda_oom_hint(args) -> str:
+    return (
+        "CUDA out of memory。Wan2.2-TI2V-5B 官方 720P 为 "
+        "1280x704/704x1280，单卡官方建议约 24GB VRAM；T4 15GB 很容易在 "
+        "VAE prepare_latents 阶段 OOM。\n"
+        "建议先使用默认 --resolution-preset t4，或显式传入：\n"
+        "  --resolution-preset t4 --vae-dtype auto\n"
+        "如果仍 OOM，再降到：\n"
+        "  --preprocess-width 720 --preprocess-height 416 "
+        "--model-width 720 --model-height 416 --vae-dtype float16\n"
+        f"当前设置：resolution_preset={args.resolution_preset}, "
+        f"preprocess={args.preprocess_width}x{args.preprocess_height}, "
+        f"model={args.model_width}x{args.model_height}, vae_dtype={args.vae_dtype}"
+    )
+
+
 def run_demo(args) -> dict:
     if args.guidance_scale != 1.0:
         print("[warn] demo_moe.py 首版不叠加文本 CFG，--guidance-scale 会被记录但不参与去噪")
@@ -947,17 +985,24 @@ def run_demo(args) -> dict:
 
     frames_orig = [frame.copy() for frame in frames]
     official_w, official_h = official_ti2v_size_for_aspect(orig_w, orig_h)
+    preset_w, preset_h = default_ti2v_size_for_preset(
+        args.resolution_preset, orig_w, orig_h
+    )
     if args.preprocess_width is None:
-        args.preprocess_width = official_w
+        args.preprocess_width = preset_w
     if args.preprocess_height is None:
-        args.preprocess_height = official_h
+        args.preprocess_height = preset_h
     if args.model_width is None:
-        args.model_width = official_w
+        args.model_width = preset_w
     if args.model_height is None:
-        args.model_height = official_h
+        args.model_height = preset_h
     print(
         f"  Wan2.2-TI2V-5B 官方 720P 尺寸："
         f"{official_w}x{official_h}（横屏 1280x704 / 竖屏 704x1280）"
+    )
+    print(
+        f"  当前分辨率预设：{args.resolution_preset}，默认处理尺寸："
+        f"{args.preprocess_width}x{args.preprocess_height}"
     )
     pre_w, pre_h = orig_w, orig_h
     if args.preprocess_width > 0 and args.preprocess_height > 0:
@@ -1033,6 +1078,7 @@ def run_demo(args) -> dict:
         "preprocess_height": pre_h,
         "model_width": args.model_width,
         "model_height": args.model_height,
+        "resolution_preset": args.resolution_preset,
         "official_ti2v_resolution": f"{official_w}x{official_h}",
         "fps": fps,
         "seed": args.seed,
@@ -1077,8 +1123,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vae-device", default="auto")
     parser.add_argument(
         "--vae-dtype",
-        default="float32",
-        choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+        default="auto",
+        choices=["auto", "float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+        help="VAE dtype. auto uses float16 on CUDA and float32 on CPU.",
     )
     parser.add_argument("--gamma", type=float, default=0.5)
     parser.add_argument("--lam", type=float, default=8.0)
@@ -1089,6 +1136,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-sequence-length", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-frames", type=int, default=9)
+    parser.add_argument(
+        "--resolution-preset",
+        default="t4",
+        choices=["t4", "official", "custom"],
+        help=(
+            "Default resolution policy. t4 uses 832x480/480x832 for 15GB GPUs; "
+            "official uses Wan2.2 TI2V 720P 1280x704/704x1280; custom uses "
+            "explicit --preprocess/--model sizes."
+        ),
+    )
     parser.add_argument(
         "--preprocess-width",
         type=int,
@@ -1131,8 +1188,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    args = build_parser().parse_args()
     try:
-        run_demo(build_parser().parse_args())
+        run_demo(args)
+    except torch.OutOfMemoryError as exc:
+        sys.exit(f"错误：{cuda_oom_hint(args)}\n原始错误：{exc}")
     except Exception as exc:
         sys.exit(f"错误：{exc}")
 

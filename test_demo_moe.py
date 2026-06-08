@@ -167,6 +167,8 @@ class TestDemoMOE(unittest.TestCase):
     def test_official_ti2v_size_follows_aspect(self):
         self.assertEqual(demo_moe.official_ti2v_size_for_aspect(1920, 1080), (1280, 704))
         self.assertEqual(demo_moe.official_ti2v_size_for_aspect(1080, 1920), (704, 1280))
+        self.assertEqual(demo_moe.default_ti2v_size_for_preset("t4", 1920, 1080), (832, 480))
+        self.assertEqual(demo_moe.default_ti2v_size_for_preset("official", 1920, 1080), (1280, 704))
 
     def test_validate_requires_wan_i2v_and_official_scheduler(self):
         with self.assertRaisesRegex(TypeError, "requires WanImageToVideoPipeline"):
@@ -245,6 +247,7 @@ class TestDemoMOE(unittest.TestCase):
             max_sequence_length=None,
             seed=42,
             max_frames=5,
+            resolution_preset="custom",
             preprocess_width=4,
             preprocess_height=4,
             model_width=4,
