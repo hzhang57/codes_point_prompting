@@ -168,7 +168,9 @@ python debug_denoise_moe.py \
 `debug_denoise_moe.py` defaults to
 `Wan-AI/Wan2.2-TI2V-5B-Diffusers`. The checkpoint is the dense Wan2.2 TI2V-5B
 model, not the A14B MoE variant; the script name is kept as a convenient debug
-label.
+label. On a two-GPU 15 GiB T4 notebook, keep the default `--vae-device auto`;
+it places the transformer on `cuda:0` and the VAE on `cuda:1` to avoid VAE
+encode OOM during the clean-video and first-frame condition passes.
 
 ## File Structure
 

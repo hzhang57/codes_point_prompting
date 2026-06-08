@@ -105,9 +105,38 @@ def _component_to(component, *args, **kwargs) -> None:
         component.to(*args, **kwargs)
 
 
+def _resolve_cuda_device(device: str) -> torch.device:
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        return torch.device("cuda:0")
+    return dev
+
+
+def resolve_vae_device(device: str, vae_device: str) -> torch.device:
+    main_dev = _resolve_cuda_device(device)
+    if vae_device == "auto":
+        if main_dev.type == "cuda" and torch.cuda.device_count() > 1:
+            return torch.device("cuda:1" if main_dev.index == 0 else "cuda:0")
+        return main_dev
+    return _resolve_cuda_device(vae_device)
+
+
+def parse_torch_dtype(dtype_name: str) -> torch.dtype:
+    name = dtype_name.lower()
+    if name in ("float32", "fp32"):
+        return torch.float32
+    if name in ("float16", "fp16", "half"):
+        return torch.float16
+    if name in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    raise ValueError("--vae-dtype must be one of: float32, float16, bfloat16")
+
+
 def load_wan_ti2v_pipe(
     model_id: str = DEFAULT_MODEL_ID,
     device: str = "cuda",
+    vae_device: str = "auto",
+    vae_dtype: str = "float32",
     flow_shift: float = 3.0,
     low_cpu_memory: bool = True,
 ):
@@ -130,12 +159,13 @@ def load_wan_ti2v_pipe(
     except ImportError:
         UniPCMultistepScheduler = None
 
+    vae_torch_dtype = parse_torch_dtype(vae_dtype)
     loading_kwargs = {"low_cpu_mem_usage": low_cpu_memory}
     try:
         vae = AutoencoderKLWan.from_pretrained(
             model_id,
             subfolder="vae",
-            torch_dtype=torch.float32,
+            torch_dtype=vae_torch_dtype,
             **loading_kwargs,
         )
     except ValueError as exc:
@@ -144,7 +174,7 @@ def load_wan_ti2v_pipe(
             vae = AutoencoderKLWan.from_pretrained(
                 model_id,
                 subfolder="vae",
-                torch_dtype=torch.float32,
+                torch_dtype=vae_torch_dtype,
                 **loading_kwargs,
             )
         else:
@@ -194,17 +224,21 @@ def load_wan_ti2v_pipe(
         except TypeError:
             pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
-    dev = torch.device(device)
+    dev = _resolve_cuda_device(device)
+    vae_dev = resolve_vae_device(device, vae_device)
     if dev.type == "cuda":
         _component_to(getattr(pipe, "transformer", None), dev)
         _component_to(getattr(pipe, "transformer_2", None), dev)
-        _component_to(getattr(pipe, "vae", None), dev, dtype=torch.float32)
+        _component_to(getattr(pipe, "vae", None), vae_dev, dtype=vae_torch_dtype)
         _component_to(getattr(pipe, "text_encoder", None), torch.device("cpu"))
         _component_to(getattr(pipe, "image_encoder", None), torch.device("cpu"))
     else:
         if hasattr(pipe, "to"):
             pipe.to(dev)
-        _component_to(getattr(pipe, "vae", None), dev, dtype=torch.float32)
+        _component_to(getattr(pipe, "vae", None), vae_dev, dtype=vae_torch_dtype)
+
+    if hasattr(pipe.vae, "enable_slicing"):
+        pipe.vae.enable_slicing()
 
     pipe._low_memory_text_encoder = low_cpu_memory
     return pipe
@@ -305,13 +339,14 @@ def prepare_ti2v_condition_official(
     num_frames: int,
     generator,
 ):
-    device = _pipe_device(pipe)
+    transformer_device = _pipe_device(pipe)
+    vae_device = _vae_device(pipe)
     dtype = _transformer_dtype(pipe)
     image = _bgr_to_pil(first_frame_bgr)
     if not hasattr(pipe, "video_processor"):
         raise RuntimeError("Pipeline does not expose video_processor for image preprocessing")
     image = pipe.video_processor.preprocess(image, height=height, width=width)
-    image = image.to(device=device, dtype=torch.float32)
+    image = image.to(device=vae_device, dtype=torch.float32)
 
     outputs = pipe.prepare_latents(
         image,
@@ -321,23 +356,23 @@ def prepare_ti2v_condition_official(
         width=width,
         num_frames=num_frames,
         dtype=torch.float32,
-        device=device,
+        device=vae_device,
         generator=generator,
-        latents=noisy_latents.to(device=device, dtype=torch.float32),
+        latents=noisy_latents.to(device=vae_device, dtype=torch.float32),
     )
     expand_timesteps = bool(getattr(getattr(pipe, "config", None), "expand_timesteps", False))
     if len(outputs) == 3:
         prepared_latents, condition, first_frame_mask = outputs
         expand_timesteps = True
-        first_frame_mask = first_frame_mask.to(device=device, dtype=dtype)
+        first_frame_mask = first_frame_mask.to(device=transformer_device, dtype=dtype)
     elif len(outputs) == 2:
         prepared_latents, condition = outputs
         first_frame_mask = None
     else:
         raise ValueError(f"Unexpected prepare_latents return length: {len(outputs)}")
 
-    prepared_latents = prepared_latents.to(device=device, dtype=dtype)
-    condition = condition.to(device=device, dtype=dtype)
+    prepared_latents = prepared_latents.to(device=transformer_device, dtype=dtype)
+    condition = condition.to(device=transformer_device, dtype=dtype)
     if prepared_latents.shape != noisy_latents.shape:
         raise ValueError(
             "prepare_latents changed noisy latent shape: "
@@ -510,13 +545,16 @@ def run_debug(args):
     pipe = load_wan_ti2v_pipe(
         args.model_id,
         device=args.device,
+        vae_device=args.vae_device,
+        vae_dtype=args.vae_dtype,
         flow_shift=args.flow_shift,
         low_cpu_memory=args.low_memory,
     )
     actual_model = "Wan2.2-TI2V-5B"
     print(
         f"[model] {actual_model} model_id={args.model_id} "
-        f"device={_pipe_device(pipe)} dtype={_transformer_dtype(pipe)}"
+        f"transformer_device={_pipe_device(pipe)} transformer_dtype={_transformer_dtype(pipe)} "
+        f"vae_device={_vae_device(pipe)} vae_dtype={_vae_dtype(pipe)}"
     )
 
     latents_clean = encode_video_official(pipe, frames)
@@ -684,6 +722,10 @@ def run_debug(args):
         "seed": args.seed,
         "scheduler_steps": args.scheduler_steps,
         "flow_shift": args.flow_shift,
+        "transformer_device": str(_pipe_device(pipe)),
+        "transformer_dtype": str(_transformer_dtype(pipe)),
+        "vae_device": str(_vae_device(pipe)),
+        "vae_dtype": str(_vae_dtype(pipe)),
         "guidance_scale": args.guidance_scale,
         "guidance_scale_2": args.guidance_scale_2,
         "video_latent_shape": video_latent_shape,
@@ -714,6 +756,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", required=True)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--vae-device",
+        default="auto",
+        help="VAE device. auto uses cuda:1 when multiple GPUs are visible, otherwise --device.",
+    )
+    parser.add_argument(
+        "--vae-dtype",
+        default="float32",
+        choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+        help="VAE dtype. float32 is safest; float16 can reduce memory if needed.",
+    )
     parser.add_argument("--max-frames", type=int, default=9)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)

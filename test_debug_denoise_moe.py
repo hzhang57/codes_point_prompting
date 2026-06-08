@@ -175,11 +175,28 @@ class _FakePipe:
 
 
 class TestDebugDenoiseMOE(unittest.TestCase):
+    def test_resolve_vae_device_auto_uses_second_cuda_when_available(self):
+        with patch("debug_denoise_moe.torch.cuda.device_count", return_value=2):
+            dev = debug_denoise_moe.resolve_vae_device("cuda", "auto")
+        self.assertEqual(str(dev), "cuda:1")
+
+    def test_resolve_vae_device_auto_uses_other_cuda_for_cuda1(self):
+        with patch("debug_denoise_moe.torch.cuda.device_count", return_value=2):
+            dev = debug_denoise_moe.resolve_vae_device("cuda:1", "auto")
+        self.assertEqual(str(dev), "cuda:0")
+
+    def test_resolve_vae_device_auto_follows_cpu(self):
+        with patch("debug_denoise_moe.torch.cuda.device_count", return_value=2):
+            dev = debug_denoise_moe.resolve_vae_device("cpu", "auto")
+        self.assertEqual(str(dev), "cpu")
+
     def _args(self, output_dir):
         return SimpleNamespace(
             video="input.mp4",
             model_id="fake",
             device="cpu",
+            vae_device="auto",
+            vae_dtype="float32",
             max_frames=5,
             height=4,
             width=4,
@@ -205,7 +222,12 @@ class TestDebugDenoiseMOE(unittest.TestCase):
                 patch("debug_denoise_moe.save_frames"):
             debug_denoise_moe.run_debug(args)
         loader.assert_called_once_with(
-            "fake", device="cpu", flow_shift=3.0, low_cpu_memory=True
+            "fake",
+            device="cpu",
+            vae_device="auto",
+            vae_dtype="float32",
+            flow_shift=3.0,
+            low_cpu_memory=True,
         )
         return args
 
@@ -245,6 +267,8 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             self.assertEqual(summary["guidance_scale"], 2.0)
             self.assertEqual(summary["guidance_scale_2"], 3.0)
             self.assertEqual(summary["reference_latent_slots"], 0)
+            self.assertEqual(summary["vae_device"], "cpu")
+            self.assertEqual(summary["vae_dtype"], "torch.float32")
             run = summary["runs"][1]
             self.assertTrue(run["expand_timesteps"])
             self.assertEqual(run["start_idx"], 2)
