@@ -146,6 +146,13 @@ start with one strength and fewer pixels:
 python debug_denoise.py --video input.mp4 --max-frames 5 --width 512 --height 288 --gammas 0.5 --conditioning-scale 1.0
 ```
 
+To compare against Wan VACE's official pipeline internals for conditioning,
+CFG, transformer calls, and scheduler steps, use:
+
+```bash
+python debug_denoise_vace.py --video input.mp4 --max-frames 9 --gammas 0.5
+```
+
 ## File Structure
 
 ```
