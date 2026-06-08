@@ -3,8 +3,8 @@ Wan2.2 TI2V/I2V SDEdit reconstruction experiment.
 
 This mirrors debug_denoise.py outputs, but uses the official Wan
 Image-to-Video latent condition path instead of VACE reference slots:
-prepare_latents(image, latents=...), optional expand_timesteps mask fusion,
-CFG, transformer / transformer_2 switching, and scheduler steps.
+prepare_latents(image, latents=...), expand_timesteps mask fusion, CFG, and
+the checkpoint's official scheduler.
 
 The default model is Wan-AI/Wan2.2-TI2V-5B-Diffusers. Despite this file name,
 that checkpoint is a dense 5B TI2V model; the explicitly MoE Wan2.2 checkpoints
@@ -17,12 +17,10 @@ Example:
 import argparse
 import csv
 import gc
-import inspect
 import json
 import os
 from contextlib import nullcontext
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -40,6 +38,9 @@ from model_adapter import _frames_to_tensor, _tensor_to_frames, noise_strength_t
 
 
 DEFAULT_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+OFFICIAL_SCHEDULER_CLASS = "UniPCMultistepScheduler"
+OFFICIAL_FLOW_SHIFT = 5.0
+OFFICIAL_MAX_SEQUENCE_LENGTH = 512
 
 
 def release_memory() -> None:
@@ -68,13 +69,12 @@ def clear_vae_internal_cache(pipe) -> None:
 
 
 def _pipe_device(pipe) -> torch.device:
-    for attr in ("transformer", "transformer_2"):
-        mod = getattr(pipe, attr, None)
-        if mod is not None:
-            try:
-                return next(mod.parameters()).device
-            except StopIteration:
-                pass
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is not None:
+        try:
+            return next(transformer.parameters()).device
+        except StopIteration:
+            pass
     d = getattr(pipe, "_execution_device", None)
     if d is not None:
         return torch.device(d)
@@ -82,8 +82,7 @@ def _pipe_device(pipe) -> torch.device:
 
 
 def _transformer_dtype(pipe) -> torch.dtype:
-    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "transformer_2", None)
-    return getattr(transformer, "dtype", torch.float32)
+    return getattr(pipe.transformer, "dtype", torch.float32)
 
 
 def _vae_device(pipe) -> torch.device:
@@ -132,16 +131,11 @@ def tensor_head_tail(tensor: torch.Tensor, count: int = 5) -> tuple:
     return values[:count], values[-count:]
 
 
-def print_scheduler_info(pipe, flow_shift_override) -> dict:
+def print_scheduler_info(pipe) -> dict:
     info = scheduler_info(pipe)
-    source = getattr(
-        pipe,
-        "_scheduler_source",
-        "cli_override" if flow_shift_override is not None else "checkpoint_config",
-    )
     print(
         "[scheduler] "
-        f"class={info['scheduler_class']} source={source} "
+        f"class={info['scheduler_class']} source=checkpoint_config "
         f"flow_shift={info['scheduler_flow_shift']} "
         f"prediction_type={info['scheduler_prediction_type']} "
         f"use_flow_sigmas={info['scheduler_use_flow_sigmas']} "
@@ -150,12 +144,59 @@ def print_scheduler_info(pipe, flow_shift_override) -> dict:
         f"solver_type={info['scheduler_solver_type']} "
         f"num_train_timesteps={info['scheduler_num_train_timesteps']}"
     )
-    if info["scheduler_class"] != "UniPCMultistepScheduler":
-        print(
-            "[scheduler warning] Official Wan2.2-TI2V-5B-Diffusers scheduler_config "
-            "uses UniPCMultistepScheduler; loaded scheduler differs."
+    return {**info, "scheduler_source": "checkpoint_config"}
+
+
+def validate_wan22_ti2v5b_pipeline(pipe) -> None:
+    if pipe.__class__.__name__ != "WanImageToVideoPipeline":
+        raise TypeError(
+            "debug_denoise_moe.py requires WanImageToVideoPipeline, "
+            f"got {pipe.__class__.__name__}"
         )
-    return {**info, "scheduler_source": source}
+    required = ("transformer", "vae", "scheduler", "video_processor", "prepare_latents")
+    missing = [name for name in required if not hasattr(pipe, name)]
+    if missing:
+        raise TypeError(f"Wan2.2-TI2V-5B pipeline is missing components: {missing}")
+    if not bool(_config_value(getattr(pipe, "config", None), "expand_timesteps", False)):
+        raise ValueError("Wan2.2-TI2V-5B requires pipe.config.expand_timesteps=True")
+
+    info = scheduler_info(pipe)
+    expected = {
+        "scheduler_class": OFFICIAL_SCHEDULER_CLASS,
+        "scheduler_flow_shift": OFFICIAL_FLOW_SHIFT,
+        "scheduler_prediction_type": "flow_prediction",
+        "scheduler_use_flow_sigmas": True,
+        "scheduler_timestep_spacing": "linspace",
+    }
+    mismatches = {
+        name: (info.get(name), value)
+        for name, value in expected.items()
+        if info.get(name) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "Pipeline scheduler does not match official Wan2.2-TI2V-5B config: "
+            f"{mismatches}"
+        )
+
+    patch_size = tuple(getattr(pipe.transformer.config, "patch_size", ()))
+    if len(patch_size) < 3 or tuple(patch_size[-2:]) != (2, 2):
+        raise ValueError(
+            "Wan2.2-TI2V-5B expanded timestep path requires spatial patch_size=(2, 2), "
+            f"got {patch_size}"
+        )
+
+
+def resolve_max_sequence_length(pipe, requested) -> int:
+    if requested is not None:
+        return int(requested)
+    for config in (getattr(pipe, "config", None), getattr(pipe.transformer, "config", None)):
+        value = _config_value(config, "max_sequence_length")
+        if value is None:
+            value = _config_value(config, "max_text_seq_len")
+        if value is not None:
+            return int(value)
+    return OFFICIAL_MAX_SEQUENCE_LENGTH
 
 
 def _retrieve_latents_argmax(encoder_output):
@@ -210,27 +251,16 @@ def load_wan_ti2v_pipe(
     device: str = "cuda",
     vae_device: str = "auto",
     vae_dtype: str = "float32",
-    flow_shift: float = None,
     low_cpu_memory: bool = True,
 ):
     try:
-        from diffusers import AutoencoderKLWan, DiffusionPipeline
+        from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
     except ImportError as exc:
         raise ImportError(
             "debug_denoise_moe.py requires a Diffusers build with Wan2.2 TI2V/I2V "
             "support. Install the current Diffusers main branch, for example: "
             "pip install git+https://github.com/huggingface/diffusers.git"
         ) from exc
-
-    try:
-        from diffusers import WanImageToVideoPipeline
-    except ImportError:
-        WanImageToVideoPipeline = None
-
-    try:
-        from diffusers import UniPCMultistepScheduler
-    except ImportError:
-        UniPCMultistepScheduler = None
 
     vae_torch_dtype = parse_torch_dtype(vae_dtype)
     loading_kwargs = {"low_cpu_mem_usage": low_cpu_memory}
@@ -253,62 +283,18 @@ def load_wan_ti2v_pipe(
         else:
             raise
 
-    first_exc = None
-    if WanImageToVideoPipeline is not None:
-        try:
-            pipe = WanImageToVideoPipeline.from_pretrained(
-                model_id,
-                vae=vae,
-                torch_dtype=torch.bfloat16,
-                **loading_kwargs,
-            )
-        except Exception as exc:
-            first_exc = exc
-            pipe = None
-    else:
-        pipe = None
-
-    if pipe is None:
-        try:
-            pipe = DiffusionPipeline.from_pretrained(
-                model_id,
-                vae=vae,
-                torch_dtype=torch.bfloat16,
-                **loading_kwargs,
-            )
-        except Exception as fallback_exc:
-            raise RuntimeError(
-                "Could not load Wan2.2 TI2V/I2V pipeline. This usually means the "
-                "installed Diffusers version does not expose WanImageToVideoPipeline "
-                "or the checkpoint components. Install Diffusers from main branch."
-            ) from (first_exc or fallback_exc)
-
-    if not hasattr(pipe, "prepare_latents"):
-        raise RuntimeError(
-            "Loaded pipeline does not expose prepare_latents; install a Diffusers "
-            "version with official Wan TI2V/I2V support."
-        )
-
-    scheduler_source = "checkpoint_config"
-    if flow_shift is not None:
-        if UniPCMultistepScheduler is None:
-            raise RuntimeError(
-                "--flow-shift was provided, but this Diffusers build does not expose "
-                "UniPCMultistepScheduler for scheduler override."
-            )
-        pipe.scheduler = UniPCMultistepScheduler.from_config(
-            pipe.scheduler.config, flow_shift=flow_shift
-        )
-        scheduler_source = "cli_override"
-
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        model_id,
+        vae=vae,
+        torch_dtype=torch.bfloat16,
+        **loading_kwargs,
+    )
     dev = _resolve_cuda_device(device)
     vae_dev = resolve_vae_device(device, vae_device)
     if dev.type == "cuda":
         _component_to(getattr(pipe, "transformer", None), dev)
-        _component_to(getattr(pipe, "transformer_2", None), dev)
         _component_to(getattr(pipe, "vae", None), vae_dev, dtype=vae_torch_dtype)
         _component_to(getattr(pipe, "text_encoder", None), torch.device("cpu"))
-        _component_to(getattr(pipe, "image_encoder", None), torch.device("cpu"))
     else:
         if hasattr(pipe, "to"):
             pipe.to(dev)
@@ -318,7 +304,7 @@ def load_wan_ti2v_pipe(
         pipe.vae.enable_slicing()
 
     pipe._low_memory_text_encoder = low_cpu_memory
-    pipe._scheduler_source = scheduler_source
+    validate_wan22_ti2v5b_pipeline(pipe)
     return pipe
 
 
@@ -397,25 +383,7 @@ def encode_prompt_official(
     return prompt_embeds, negative_embeds
 
 
-def encode_image_embeds_official(pipe, frame_bgr: np.ndarray, height: int, width: int):
-    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "transformer_2", None)
-    image_dim = getattr(getattr(transformer, "config", None), "image_dim", None)
-    if image_dim is None or not hasattr(pipe, "encode_image"):
-        return None
-
-    image = _bgr_to_pil(frame_bgr)
-    image_embeds = pipe.encode_image(
-        image=image,
-        device=torch.device("cpu"),
-        num_videos_per_prompt=1,
-        output_hidden_states=False,
-    )
-    if isinstance(image_embeds, tuple):
-        image_embeds = image_embeds[0]
-    return image_embeds.to(device=_pipe_device(pipe), dtype=_transformer_dtype(pipe))
-
-
-def prepare_ti2v_condition_official(
+def prepare_wan22_first_frame_condition(
     pipe,
     first_frame_bgr: np.ndarray,
     noisy_latents: torch.Tensor,
@@ -445,16 +413,13 @@ def prepare_ti2v_condition_official(
         generator=generator,
         latents=noisy_latents.to(device=vae_device, dtype=torch.float32),
     )
-    expand_timesteps = bool(getattr(getattr(pipe, "config", None), "expand_timesteps", False))
-    if len(outputs) == 3:
-        prepared_latents, condition, first_frame_mask = outputs
-        expand_timesteps = True
-        first_frame_mask = first_frame_mask.to(device=transformer_device, dtype=dtype)
-    elif len(outputs) == 2:
-        prepared_latents, condition = outputs
-        first_frame_mask = None
-    else:
-        raise ValueError(f"Unexpected prepare_latents return length: {len(outputs)}")
+    if len(outputs) != 3:
+        raise ValueError(
+            "Wan2.2-TI2V-5B official expand_timesteps path must return "
+            f"(latents, condition, first_frame_mask), got {len(outputs)} values"
+        )
+    prepared_latents, condition, first_frame_mask = outputs
+    first_frame_mask = first_frame_mask.to(device=transformer_device, dtype=dtype)
 
     prepared_latents = prepared_latents.to(device=transformer_device, dtype=dtype)
     condition = condition.to(device=transformer_device, dtype=dtype)
@@ -463,29 +428,20 @@ def prepare_ti2v_condition_official(
             "prepare_latents changed noisy latent shape: "
             f"input={tuple(noisy_latents.shape)} output={tuple(prepared_latents.shape)}"
         )
-    if expand_timesteps and first_frame_mask is None:
-        raise ValueError("expand_timesteps=True requires first_frame_mask")
+    try:
+        torch.broadcast_shapes(first_frame_mask.shape, prepared_latents.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Wan2.2-TI2V first_frame_mask must broadcast to latent shape: "
+            f"mask={tuple(first_frame_mask.shape)} latents={tuple(prepared_latents.shape)}"
+        ) from exc
     clear_vae_internal_cache(pipe)
     release_memory()
-    return {
-        "latents": prepared_latents,
-        "condition": condition,
-        "first_frame_mask": first_frame_mask,
-        "expand_timesteps": expand_timesteps,
-    }
+    return prepared_latents, condition, first_frame_mask
 
 
-def scheduler_step_official(pipe, noise_pred, timestep, latents, timestep_next):
-    params = inspect.signature(pipe.scheduler.step).parameters
-    if "timestep_back" in params:
-        return pipe.scheduler.step(
-            noise_pred, timestep, latents, timestep_back=timestep_next
-        ).prev_sample
-    try:
-        out = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)
-        return out[0]
-    except TypeError:
-        return pipe.scheduler.step(noise_pred, timestep, latents).prev_sample
+def scheduler_step_official(pipe, noise_pred, timestep, latents):
+    return pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
 
 def model_cache_context(model, name: str):
@@ -508,7 +464,6 @@ def _transformer_forward(
     latent_model_input,
     timestep_batch,
     prompt_embeds,
-    image_embeds,
     attention_kwargs,
     cache_name,
 ):
@@ -517,7 +472,6 @@ def _transformer_forward(
             hidden_states=latent_model_input,
             timestep=timestep_batch,
             encoder_hidden_states=prompt_embeds,
-            encoder_hidden_states_image=image_embeds,
             attention_kwargs=attention_kwargs,
             return_dict=False,
         )[0]
@@ -529,45 +483,25 @@ def denoise_with_ti2v_pipeline_internals(
     timesteps_run: torch.Tensor,
     condition: torch.Tensor,
     first_frame_mask: torch.Tensor,
-    expand_timesteps: bool,
     prompt_embeds: torch.Tensor,
     negative_prompt_embeds: torch.Tensor,
-    image_embeds: torch.Tensor,
     guidance_scale: float,
-    guidance_scale_2: float,
     attention_kwargs=None,
 ):
     transformer_dtype = _transformer_dtype(pipe)
-    boundary_ratio = getattr(getattr(pipe, "config", None), "boundary_ratio", None)
-    if boundary_ratio is not None and getattr(pipe, "transformer_2", None) is not None:
-        boundary_timestep = boundary_ratio * pipe.scheduler.config.num_train_timesteps
-    else:
-        boundary_timestep = None
+    model = pipe.transformer
 
     for i, timestep in enumerate(timesteps_run):
-        if boundary_timestep is None or timestep >= boundary_timestep:
-            model = pipe.transformer
-            step_guidance = guidance_scale
-        else:
-            model = pipe.transformer_2
-            step_guidance = guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
-
-        if expand_timesteps:
-            latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-            timestep_batch = _expanded_timestep(
-                model, first_frame_mask, timestep, latents.shape[0]
-            )
-        else:
-            latent_model_input = torch.cat([latents, condition], dim=1)
-            timestep_batch = timestep.expand(latents.shape[0]).to(latents.device)
-
+        latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+        timestep_batch = _expanded_timestep(
+            model, first_frame_mask, timestep, latents.shape[0]
+        )
         latent_model_input = latent_model_input.to(dtype=transformer_dtype)
         noise_pred = _transformer_forward(
             model,
             latent_model_input,
             timestep_batch,
             prompt_embeds,
-            image_embeds,
             attention_kwargs,
             "cond",
         )
@@ -577,27 +511,19 @@ def denoise_with_ti2v_pipeline_internals(
                 latent_model_input,
                 timestep_batch,
                 negative_prompt_embeds,
-                image_embeds,
                 attention_kwargs,
                 "uncond",
             )
-            noise_pred = noise_uncond + step_guidance * (noise_pred - noise_uncond)
+            noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
-        timestep_next = (
-            timesteps_run[i + 1]
-            if i + 1 < len(timesteps_run)
-            else torch.zeros_like(timestep)
-        )
-        latents = scheduler_step_official(pipe, noise_pred, timestep, latents, timestep_next)
+        latents = scheduler_step_official(pipe, noise_pred, timestep, latents)
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(
                 f"[ti2v denoise {i + 1:3d}/{len(timesteps_run)}] "
                 f"t={timestep.item():.1f} latent_norm={latents.norm().item():.1f}"
             )
 
-    if expand_timesteps:
-        latents = (1 - first_frame_mask) * condition + first_frame_mask * latents
-    return latents
+    return (1 - first_frame_mask) * condition + first_frame_mask * latents
 
 
 def set_denoise_start(pipe, n_steps: int, start_idx: int) -> torch.Tensor:
@@ -634,16 +560,16 @@ def run_debug(args):
         device=args.device,
         vae_device=args.vae_device,
         vae_dtype=args.vae_dtype,
-        flow_shift=args.flow_shift,
         low_cpu_memory=args.low_memory,
     )
+    validate_wan22_ti2v5b_pipeline(pipe)
     actual_model = "Wan2.2-TI2V-5B"
     print(
         f"[model] {actual_model} model_id={args.model_id} "
         f"transformer_device={_pipe_device(pipe)} transformer_dtype={_transformer_dtype(pipe)} "
         f"vae_device={_vae_device(pipe)} vae_dtype={_vae_dtype(pipe)}"
     )
-    sched_info = print_scheduler_info(pipe, args.flow_shift)
+    sched_info = print_scheduler_info(pipe)
 
     latents_clean = encode_video_official(pipe, frames)
     vae_frames = decode_latents_official(pipe, latents_clean)
@@ -653,18 +579,17 @@ def run_debug(args):
     release_memory()
     print(f"[baseline] VAE round-trip PSNR={vae_psnr:.2f} dB")
 
+    max_sequence_length = resolve_max_sequence_length(pipe, args.max_sequence_length)
+    print(f"[text] max_sequence_length={max_sequence_length}")
     prompt_embeds, negative_prompt_embeds = encode_prompt_official(
         pipe,
         args.prompt,
         args.negative_prompt,
         args.guidance_scale,
-        args.max_sequence_length,
+        max_sequence_length,
     )
-    image_embeds = encode_image_embeds_official(pipe, frames[0], args.height, args.width)
     if args.low_memory and getattr(pipe, "text_encoder", None) is not None:
         pipe.text_encoder = None
-    if args.low_memory and getattr(pipe, "image_encoder", None) is not None:
-        pipe.image_encoder = None
     release_memory()
 
     torch.manual_seed(args.seed)
@@ -674,7 +599,7 @@ def run_debug(args):
     video_latent_shape = list(latents_clean.shape)
     print(
         f"[latent] video={video_latent_shape} no_reference_slots=True "
-        f"guidance_scale={args.guidance_scale} guidance_scale_2={args.guidance_scale_2}"
+        f"guidance_scale={args.guidance_scale}"
     )
 
     summaries = []
@@ -703,7 +628,7 @@ def run_debug(args):
             noisy_latents = add_noise_at_timestep(pipe, latents_clean, base_noise, t_start)
 
         generator = torch.Generator(device="cpu").manual_seed(args.seed)
-        ti2v_condition = prepare_ti2v_condition_official(
+        noisy_latents, condition, first_frame_mask = prepare_wan22_first_frame_condition(
             pipe,
             frames[0],
             noisy_latents,
@@ -712,10 +637,6 @@ def run_debug(args):
             len(frames),
             generator,
         )
-        noisy_latents = ti2v_condition["latents"]
-        expand_timesteps = ti2v_condition["expand_timesteps"]
-        condition = ti2v_condition["condition"]
-        first_frame_mask = ti2v_condition["first_frame_mask"]
 
         noisy_frames = None
         noisy_psnr = None
@@ -733,12 +654,9 @@ def run_debug(args):
             timesteps_run,
             condition,
             first_frame_mask,
-            expand_timesteps,
             prompt_embeds,
             negative_prompt_embeds,
-            image_embeds,
             args.guidance_scale,
-            args.guidance_scale_2,
         )
         denoised_frames = decode_latents_official(pipe, denoised_latents)
         denoised_psnr, denoised_per_frame = mean_psnr(frames, denoised_frames)
@@ -756,8 +674,6 @@ def run_debug(args):
         summary = {
             "gamma": gamma,
             "guidance_scale": args.guidance_scale,
-            "guidance_scale_2": args.guidance_scale_2,
-            "expand_timesteps": expand_timesteps,
             "reference_latent_slots": 0,
             "video_latent_shape": str(video_latent_shape),
             "transformer_latent_shape": str(list(noisy_latents.shape)),
@@ -796,24 +712,22 @@ def run_debug(args):
         summaries.append(summary)
         if noisy_psnr is None:
             print(
-                f"[gamma={gamma:.3f}] expand_timesteps={expand_timesteps} "
-                f"denoised={denoised_psnr:.2f} dB noisy_psnr=skipped"
+                f"[gamma={gamma:.3f}] denoised={denoised_psnr:.2f} dB "
+                "noisy_psnr=skipped"
             )
         else:
             print(
-                f"[gamma={gamma:.3f}] expand_timesteps={expand_timesteps} "
-                f"noisy={noisy_psnr:.2f} dB denoised={denoised_psnr:.2f} dB "
+                f"[gamma={gamma:.3f}] noisy={noisy_psnr:.2f} dB "
+                f"denoised={denoised_psnr:.2f} dB "
                 f"gain={summary['recovery_gain']:+.2f} dB"
             )
         del noisy_latents, denoised_latents, noisy_frames, denoised_frames
-        del condition, first_frame_mask, ti2v_condition
+        del condition, first_frame_mask
         release_memory()
 
     csv_fields = [
         "gamma",
         "guidance_scale",
-        "guidance_scale_2",
-        "expand_timesteps",
         "reference_latent_slots",
         "video_latent_shape",
         "transformer_latent_shape",
@@ -856,14 +770,13 @@ def run_debug(args):
         "fps": fps,
         "seed": args.seed,
         "scheduler_steps": args.scheduler_steps,
-        "flow_shift_override": args.flow_shift,
         **sched_info,
         "transformer_device": str(_pipe_device(pipe)),
         "transformer_dtype": str(_transformer_dtype(pipe)),
         "vae_device": str(_vae_device(pipe)),
         "vae_dtype": str(_vae_dtype(pipe)),
         "guidance_scale": args.guidance_scale,
-        "guidance_scale_2": args.guidance_scale_2,
+        "max_sequence_length": max_sequence_length,
         "decode_noisy": args.decode_noisy,
         "video_latent_shape": video_latent_shape,
         "reference_latent_slots": 0,
@@ -915,17 +828,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Intuitive noise strengths: 0=no noise, 1=maximum noise.",
     )
     parser.add_argument("--scheduler-steps", type=int, default=100)
-    parser.add_argument(
-        "--flow-shift",
-        type=float,
-        default=None,
-        help="Override scheduler flow_shift. Default keeps the checkpoint scheduler_config.",
-    )
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument("--guidance-scale", type=float, default=1.0)
-    parser.add_argument("--guidance-scale-2", type=float, default=None)
-    parser.add_argument("--max-sequence-length", type=int, default=226)
+    parser.add_argument(
+        "--max-sequence-length",
+        type=int,
+        default=None,
+        help="Override text sequence length. Default reads pipeline config or uses 512.",
+    )
     parser.add_argument(
         "--decode-noisy",
         action="store_true",

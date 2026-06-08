@@ -1,5 +1,6 @@
 import json
 import os
+import inspect
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -59,7 +60,7 @@ class _FakeVAE:
         return _DecodeResult(sample)
 
 
-class _FakeScheduler:
+class UniPCMultistepScheduler:
     def __init__(self):
         self.timesteps = torch.tensor([999, 666, 333, 1])
         self.add_noise_calls = []
@@ -94,7 +95,11 @@ class _FakeScheduler:
 class _FakeTransformer:
     def __init__(self, in_channels=1):
         self.dtype = torch.float32
-        self.config = SimpleNamespace(in_channels=in_channels, patch_size=(1, 1, 1), image_dim=None)
+        self.config = SimpleNamespace(
+            in_channels=in_channels,
+            patch_size=(1, 2, 2),
+            max_text_seq_len=512,
+        )
         self._param = torch.nn.Parameter(torch.empty(0, dtype=torch.float32))
         self.calls = []
 
@@ -126,16 +131,14 @@ class _FakeVideoProcessor:
         return torch.zeros(1, 3, height, width)
 
 
-class _FakePipe:
+class WanImageToVideoPipeline:
     def __init__(self, expand_timesteps=True):
         self.vae = _FakeVAE()
-        self.transformer = _FakeTransformer(in_channels=1 if expand_timesteps else 3)
-        self.transformer_2 = None
-        self.scheduler = _FakeScheduler()
+        self.transformer = _FakeTransformer(in_channels=1)
+        self.scheduler = UniPCMultistepScheduler()
         self.text_encoder = _FakeTextEncoder()
-        self.image_encoder = None
         self.video_processor = _FakeVideoProcessor()
-        self.config = SimpleNamespace(expand_timesteps=expand_timesteps, boundary_ratio=None)
+        self.config = SimpleNamespace(expand_timesteps=expand_timesteps)
         self.prepare_latents_calls = []
         self.expand_timesteps = expand_timesteps
 
@@ -173,16 +176,33 @@ class _FakePipe:
             mask = torch.ones_like(latents)
             mask[:, :, :1] = 0.0
             return latents, condition, mask
-        condition = torch.full(
-            (latents.shape[0], 2, latents.shape[2], latents.shape[3], latents.shape[4]),
-            3.0,
-            device=device,
-            dtype=dtype,
-        )
         return latents, condition
 
 
+class _WrongPipeline(WanImageToVideoPipeline):
+    pass
+
+
 class TestDebugDenoiseMOE(unittest.TestCase):
+    def test_strict_script_has_no_generic_or_override_paths(self):
+        source = inspect.getsource(debug_denoise_moe)
+        self.assertNotIn("DiffusionPipeline.from_pretrained", source)
+        self.assertNotIn("--flow-shift", source)
+        self.assertNotIn("guidance_scale_2", source)
+        self.assertNotIn("transformer_2", source)
+        self.assertNotIn("encoder_hidden_states_image", source)
+        self.assertNotIn("torch.cat([latents, condition]", source)
+
+    def test_wrong_pipeline_class_fails_fast(self):
+        with self.assertRaisesRegex(TypeError, "requires WanImageToVideoPipeline"):
+            debug_denoise_moe.validate_wan22_ti2v5b_pipeline(_WrongPipeline())
+
+    def test_non_official_scheduler_fails_fast(self):
+        pipe = WanImageToVideoPipeline()
+        pipe.scheduler.config.flow_shift = 3.0
+        with self.assertRaisesRegex(ValueError, "official Wan2.2-TI2V-5B config"):
+            debug_denoise_moe.validate_wan22_ti2v5b_pipeline(pipe)
+
     def test_resolve_vae_device_auto_uses_second_cuda_when_available(self):
         with patch("debug_denoise_moe.torch.cuda.device_count", return_value=2):
             dev = debug_denoise_moe.resolve_vae_device("cuda", "auto")
@@ -210,12 +230,10 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             width=4,
             gammas=[0.0, 0.5],
             scheduler_steps=4,
-            flow_shift=None,
             prompt="",
             negative_prompt="bad",
             guidance_scale=2.0,
-            guidance_scale_2=3.0,
-            max_sequence_length=8,
+            max_sequence_length=None,
             decode_noisy=False,
             seed=42,
             output_dir=output_dir,
@@ -235,14 +253,13 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             device="cpu",
             vae_device="auto",
             vae_dtype="float32",
-            flow_shift=None,
             low_cpu_memory=True,
         )
         return args
 
     def test_expand_timesteps_uses_prepare_latents_mask_fusion_and_cfg(self):
         with tempfile.TemporaryDirectory() as output_dir:
-            pipe = _FakePipe(expand_timesteps=True)
+            pipe = WanImageToVideoPipeline(expand_timesteps=True)
             self._run(pipe, output_dir)
 
             self.assertEqual(len(pipe.prepare_latents_calls), 2)
@@ -255,7 +272,7 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             self.assertEqual(first_call["hidden_states"].shape[1], 1)
             self.assertTrue(torch.all(first_call["hidden_states"][:, :, :1] == 7.0))
             self.assertEqual(first_call["timestep"].ndim, 2)
-            self.assertIsNone(first_call["encoder_hidden_states_image"])
+            self.assertNotIn("encoder_hidden_states_image", first_call)
 
             cond_calls = [
                 call for call in pipe.transformer.calls
@@ -274,18 +291,17 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             with open(os.path.join(output_dir, "summary.json")) as handle:
                 summary = json.load(handle)
             self.assertEqual(summary["guidance_scale"], 2.0)
-            self.assertEqual(summary["guidance_scale_2"], 3.0)
+            self.assertEqual(summary["max_sequence_length"], 512)
             self.assertEqual(summary["reference_latent_slots"], 0)
             self.assertEqual(summary["vae_device"], "cpu")
             self.assertEqual(summary["vae_dtype"], "torch.float32")
             self.assertFalse(summary["decode_noisy"])
-            self.assertEqual(summary["scheduler_class"], "_FakeScheduler")
+            self.assertEqual(summary["scheduler_class"], "UniPCMultistepScheduler")
             self.assertEqual(summary["scheduler_source"], "checkpoint_config")
             self.assertEqual(summary["scheduler_flow_shift"], 5.0)
             self.assertEqual(summary["scheduler_prediction_type"], "flow_prediction")
             self.assertTrue(summary["scheduler_use_flow_sigmas"])
             run = summary["runs"][1]
-            self.assertTrue(run["expand_timesteps"])
             self.assertEqual(run["start_idx"], 2)
             self.assertEqual(run["denoise_steps"], 2)
             self.assertEqual(run["timesteps_head"], [999.0, 666.0, 333.0, 1.0])
@@ -293,20 +309,10 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             self.assertIsNone(run["noisy_psnr"])
             self.assertIsNone(run["recovery_gain"])
 
-    def test_non_expand_timesteps_concats_latents_and_condition(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            pipe = _FakePipe(expand_timesteps=False)
-            self._run(pipe, output_dir)
-
-            self.assertEqual(len(pipe.prepare_latents_calls), 2)
-            self.assertTrue(pipe.transformer.calls)
-            first_call = pipe.transformer.calls[0]
-            self.assertEqual(first_call["hidden_states"].shape[1], 3)
-            self.assertEqual(first_call["timestep"].ndim, 1)
-
-            with open(os.path.join(output_dir, "summary.json")) as handle:
-                summary = json.load(handle)
-            self.assertFalse(summary["runs"][1]["expand_timesteps"])
+    def test_non_expand_timesteps_fails_fast(self):
+        pipe = WanImageToVideoPipeline(expand_timesteps=False)
+        with self.assertRaisesRegex(ValueError, "expand_timesteps=True"):
+            debug_denoise_moe.validate_wan22_ti2v5b_pipeline(pipe)
 
 
 if __name__ == "__main__":
