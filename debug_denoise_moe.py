@@ -48,6 +48,25 @@ def release_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def clear_vae_internal_cache(pipe) -> None:
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        return
+    for name in ("clear_cache", "_clear_cache", "clear_context_parallel_cache"):
+        fn = getattr(vae, name, None)
+        if callable(fn):
+            try:
+                fn()
+            except TypeError:
+                pass
+    for attr in ("_feat_map", "_features", "_cache"):
+        if hasattr(vae, attr):
+            try:
+                setattr(vae, attr, None)
+            except Exception:
+                pass
+
+
 def _pipe_device(pipe) -> torch.device:
     for attr in ("transformer", "transformer_2"):
         mod = getattr(pipe, attr, None)
@@ -252,7 +271,10 @@ def encode_video_official(pipe, frames_bgr: list) -> torch.Tensor:
         latents = _retrieve_latents_argmax(pipe.vae.encode(tensor))
     mean, std = _vae_norm(pipe, latents.device)
     latents = ((latents.float() - mean) * std).to(_transformer_dtype(pipe))
-    return latents.to(device=_pipe_device(pipe))
+    latents = latents.to(device=_pipe_device(pipe))
+    clear_vae_internal_cache(pipe)
+    release_memory()
+    return latents
 
 
 def decode_latents_official(pipe, latents: torch.Tensor) -> list:
@@ -262,7 +284,11 @@ def decode_latents_official(pipe, latents: torch.Tensor) -> list:
     latents = (latents.float() / std + mean).to(device=vae_dev, dtype=vae_dtype)
     with torch.no_grad():
         decoded = pipe.vae.decode(latents).sample
-    return _tensor_to_frames(decoded)
+    frames = _tensor_to_frames(decoded)
+    del decoded, latents
+    clear_vae_internal_cache(pipe)
+    release_memory()
+    return frames
 
 
 def encode_prompt_official(
@@ -380,6 +406,8 @@ def prepare_ti2v_condition_official(
         )
     if expand_timesteps and first_frame_mask is None:
         raise ValueError("expand_timesteps=True requires first_frame_mask")
+    clear_vae_internal_cache(pipe)
+    release_memory()
     return {
         "latents": prepared_latents,
         "condition": condition,
@@ -619,9 +647,15 @@ def run_debug(args):
         condition = ti2v_condition["condition"]
         first_frame_mask = ti2v_condition["first_frame_mask"]
 
-        noisy_frames = decode_latents_official(pipe, noisy_latents)
-        noisy_psnr, noisy_per_frame = mean_psnr(frames, noisy_frames)
-        save_video(noisy_frames, os.path.join(gamma_dir, "noisy.mp4"), fps)
+        noisy_frames = None
+        noisy_psnr = None
+        noisy_per_frame = []
+        if args.decode_noisy:
+            noisy_frames = decode_latents_official(pipe, noisy_latents)
+            noisy_psnr, noisy_per_frame = mean_psnr(frames, noisy_frames)
+            save_video(noisy_frames, os.path.join(gamma_dir, "noisy.mp4"), fps)
+        else:
+            print("[decode] skipping noisy.mp4 to keep VAE memory for denoising")
 
         denoised_latents = denoise_with_ti2v_pipeline_internals(
             pipe,
@@ -640,13 +674,14 @@ def run_debug(args):
         denoised_psnr, denoised_per_frame = mean_psnr(frames, denoised_frames)
         save_video(denoised_frames, os.path.join(gamma_dir, "denoised.mp4"), fps)
         save_frames(denoised_frames, os.path.join(gamma_dir, "denoised_frames"))
-        save_comparison(
-            frames,
-            noisy_frames,
-            denoised_frames,
-            os.path.join(gamma_dir, "compare.mp4"),
-            fps,
-        )
+        if noisy_frames is not None:
+            save_comparison(
+                frames,
+                noisy_frames,
+                denoised_frames,
+                os.path.join(gamma_dir, "compare.mp4"),
+                fps,
+            )
 
         summary = {
             "gamma": gamma,
@@ -663,7 +698,9 @@ def run_debug(args):
             "vae_psnr": vae_psnr,
             "noisy_psnr": noisy_psnr,
             "denoised_psnr": denoised_psnr,
-            "recovery_gain": denoised_psnr - noisy_psnr,
+            "recovery_gain": (
+                denoised_psnr - noisy_psnr if noisy_psnr is not None else None
+            ),
             "gap_to_vae": vae_psnr - denoised_psnr,
             "noisy_latent_mse": float(
                 torch.mean((noisy_latents.float() - latents_clean.float()) ** 2).item()
@@ -671,16 +708,23 @@ def run_debug(args):
             "denoised_latent_mse": float(
                 torch.mean((denoised_latents.float() - latents_clean.float()) ** 2).item()
             ),
-            "recovered": denoised_psnr > noisy_psnr,
+            "recovered": denoised_psnr > noisy_psnr if noisy_psnr is not None else None,
             "noisy_psnr_per_frame": noisy_per_frame,
             "denoised_psnr_per_frame": denoised_per_frame,
+            "decode_noisy": args.decode_noisy,
         }
         summaries.append(summary)
-        print(
-            f"[gamma={gamma:.3f}] expand_timesteps={expand_timesteps} "
-            f"noisy={noisy_psnr:.2f} dB denoised={denoised_psnr:.2f} dB "
-            f"gain={summary['recovery_gain']:+.2f} dB"
-        )
+        if noisy_psnr is None:
+            print(
+                f"[gamma={gamma:.3f}] expand_timesteps={expand_timesteps} "
+                f"denoised={denoised_psnr:.2f} dB noisy_psnr=skipped"
+            )
+        else:
+            print(
+                f"[gamma={gamma:.3f}] expand_timesteps={expand_timesteps} "
+                f"noisy={noisy_psnr:.2f} dB denoised={denoised_psnr:.2f} dB "
+                f"gain={summary['recovery_gain']:+.2f} dB"
+            )
         del noisy_latents, denoised_latents, noisy_frames, denoised_frames
         del condition, first_frame_mask, ti2v_condition
         release_memory()
@@ -705,6 +749,7 @@ def run_debug(args):
         "noisy_latent_mse",
         "denoised_latent_mse",
         "recovered",
+        "decode_noisy",
     ]
     with open(os.path.join(args.output_dir, "summary.csv"), "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=csv_fields)
@@ -728,6 +773,7 @@ def run_debug(args):
         "vae_dtype": str(_vae_dtype(pipe)),
         "guidance_scale": args.guidance_scale,
         "guidance_scale_2": args.guidance_scale_2,
+        "decode_noisy": args.decode_noisy,
         "video_latent_shape": video_latent_shape,
         "reference_latent_slots": 0,
         "vae_psnr": json_metric(vae_psnr),
@@ -784,6 +830,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--guidance-scale-2", type=float, default=None)
     parser.add_argument("--max-sequence-length", type=int, default=226)
+    parser.add_argument(
+        "--decode-noisy",
+        action="store_true",
+        help="Decode/save noisy.mp4 and noisy PSNR. Disabled by default to avoid VAE OOM.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="outputs/debug_denoise_moe")
     parser.add_argument(

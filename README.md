@@ -170,7 +170,9 @@ python debug_denoise_moe.py \
 model, not the A14B MoE variant; the script name is kept as a convenient debug
 label. On a two-GPU 15 GiB T4 notebook, keep the default `--vae-device auto`;
 it places the transformer on `cuda:0` and the VAE on `cuda:1` to avoid VAE
-encode OOM during the clean-video and first-frame condition passes.
+encode OOM during the clean-video and first-frame condition passes. The script
+also skips intermediate `noisy.mp4` decoding by default to avoid another VAE
+memory spike; pass `--decode-noisy` only when you need that debug video.
 
 ## File Structure
 

@@ -208,6 +208,7 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             guidance_scale=2.0,
             guidance_scale_2=3.0,
             max_sequence_length=8,
+            decode_noisy=False,
             seed=42,
             output_dir=output_dir,
             low_memory=True,
@@ -269,10 +270,13 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             self.assertEqual(summary["reference_latent_slots"], 0)
             self.assertEqual(summary["vae_device"], "cpu")
             self.assertEqual(summary["vae_dtype"], "torch.float32")
+            self.assertFalse(summary["decode_noisy"])
             run = summary["runs"][1]
             self.assertTrue(run["expand_timesteps"])
             self.assertEqual(run["start_idx"], 2)
             self.assertEqual(run["denoise_steps"], 2)
+            self.assertIsNone(run["noisy_psnr"])
+            self.assertIsNone(run["recovery_gain"])
 
     def test_non_expand_timesteps_concats_latents_and_condition(self):
         with tempfile.TemporaryDirectory() as output_dir:
