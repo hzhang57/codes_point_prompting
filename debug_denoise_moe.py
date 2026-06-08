@@ -104,6 +104,60 @@ def _vae_norm(pipe, device) -> tuple:
     return mean, std
 
 
+def _config_value(config, name, default=None):
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def scheduler_info(pipe) -> dict:
+    config = getattr(getattr(pipe, "scheduler", None), "config", None)
+    return {
+        "scheduler_class": pipe.scheduler.__class__.__name__,
+        "scheduler_config_class": _config_value(config, "_class_name"),
+        "scheduler_flow_shift": _config_value(config, "flow_shift"),
+        "scheduler_prediction_type": _config_value(config, "prediction_type"),
+        "scheduler_use_flow_sigmas": _config_value(config, "use_flow_sigmas"),
+        "scheduler_timestep_spacing": _config_value(config, "timestep_spacing"),
+        "scheduler_solver_order": _config_value(config, "solver_order"),
+        "scheduler_solver_type": _config_value(config, "solver_type"),
+        "scheduler_num_train_timesteps": _config_value(config, "num_train_timesteps"),
+    }
+
+
+def tensor_head_tail(tensor: torch.Tensor, count: int = 5) -> tuple:
+    values = [float(x) for x in tensor.detach().float().cpu().tolist()]
+    return values[:count], values[-count:]
+
+
+def print_scheduler_info(pipe, flow_shift_override) -> dict:
+    info = scheduler_info(pipe)
+    source = getattr(
+        pipe,
+        "_scheduler_source",
+        "cli_override" if flow_shift_override is not None else "checkpoint_config",
+    )
+    print(
+        "[scheduler] "
+        f"class={info['scheduler_class']} source={source} "
+        f"flow_shift={info['scheduler_flow_shift']} "
+        f"prediction_type={info['scheduler_prediction_type']} "
+        f"use_flow_sigmas={info['scheduler_use_flow_sigmas']} "
+        f"timestep_spacing={info['scheduler_timestep_spacing']} "
+        f"solver_order={info['scheduler_solver_order']} "
+        f"solver_type={info['scheduler_solver_type']} "
+        f"num_train_timesteps={info['scheduler_num_train_timesteps']}"
+    )
+    if info["scheduler_class"] != "UniPCMultistepScheduler":
+        print(
+            "[scheduler warning] Official Wan2.2-TI2V-5B-Diffusers scheduler_config "
+            "uses UniPCMultistepScheduler; loaded scheduler differs."
+        )
+    return {**info, "scheduler_source": source}
+
+
 def _retrieve_latents_argmax(encoder_output):
     if hasattr(encoder_output, "latent_dist"):
         dist = encoder_output.latent_dist
@@ -156,7 +210,7 @@ def load_wan_ti2v_pipe(
     device: str = "cuda",
     vae_device: str = "auto",
     vae_dtype: str = "float32",
-    flow_shift: float = 3.0,
+    flow_shift: float = None,
     low_cpu_memory: bool = True,
 ):
     try:
@@ -235,13 +289,17 @@ def load_wan_ti2v_pipe(
             "version with official Wan TI2V/I2V support."
         )
 
-    if UniPCMultistepScheduler is not None:
-        try:
-            pipe.scheduler = UniPCMultistepScheduler.from_config(
-                pipe.scheduler.config, flow_shift=flow_shift
+    scheduler_source = "checkpoint_config"
+    if flow_shift is not None:
+        if UniPCMultistepScheduler is None:
+            raise RuntimeError(
+                "--flow-shift was provided, but this Diffusers build does not expose "
+                "UniPCMultistepScheduler for scheduler override."
             )
-        except TypeError:
-            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe.scheduler = UniPCMultistepScheduler.from_config(
+            pipe.scheduler.config, flow_shift=flow_shift
+        )
+        scheduler_source = "cli_override"
 
     dev = _resolve_cuda_device(device)
     vae_dev = resolve_vae_device(device, vae_device)
@@ -260,6 +318,7 @@ def load_wan_ti2v_pipe(
         pipe.vae.enable_slicing()
 
     pipe._low_memory_text_encoder = low_cpu_memory
+    pipe._scheduler_source = scheduler_source
     return pipe
 
 
@@ -584,6 +643,7 @@ def run_debug(args):
         f"transformer_device={_pipe_device(pipe)} transformer_dtype={_transformer_dtype(pipe)} "
         f"vae_device={_vae_device(pipe)} vae_dtype={_vae_dtype(pipe)}"
     )
+    sched_info = print_scheduler_info(pipe, args.flow_shift)
 
     latents_clean = encode_video_official(pipe, frames)
     vae_frames = decode_latents_official(pipe, latents_clean)
@@ -627,8 +687,18 @@ def run_debug(args):
         timesteps_run = set_denoise_start(pipe, args.scheduler_steps, start_idx)
         t_start = pipe.scheduler.timesteps[start_idx]
         if gamma == 0.0:
-            noisy_latents = latents_clean.clone()
             timesteps_run = timesteps_run[:0]
+        all_head, all_tail = tensor_head_tail(pipe.scheduler.timesteps)
+        run_head, run_tail = tensor_head_tail(timesteps_run)
+        print(
+            f"[scheduler gamma={gamma:.3f}] steps={args.scheduler_steps} "
+            f"start_idx={start_idx} t_start={float(t_start.item()):.1f} "
+            f"denoise_steps={len(timesteps_run)} "
+            f"timesteps_head={all_head} timesteps_tail={all_tail} "
+            f"run_head={run_head} run_tail={run_tail}"
+        )
+        if gamma == 0.0:
+            noisy_latents = latents_clean.clone()
         else:
             noisy_latents = add_noise_at_timestep(pipe, latents_clean, base_noise, t_start)
 
@@ -695,6 +765,16 @@ def run_debug(args):
             "start_idx": start_idx,
             "t_start": float(t_start.item()),
             "denoise_steps": len(timesteps_run),
+            "scheduler_class": sched_info["scheduler_class"],
+            "scheduler_source": sched_info["scheduler_source"],
+            "scheduler_flow_shift": sched_info["scheduler_flow_shift"],
+            "scheduler_prediction_type": sched_info["scheduler_prediction_type"],
+            "scheduler_use_flow_sigmas": sched_info["scheduler_use_flow_sigmas"],
+            "scheduler_timestep_spacing": sched_info["scheduler_timestep_spacing"],
+            "timesteps_head": all_head,
+            "timesteps_tail": all_tail,
+            "timesteps_run_head": run_head,
+            "timesteps_run_tail": run_tail,
             "vae_psnr": vae_psnr,
             "noisy_psnr": noisy_psnr,
             "denoised_psnr": denoised_psnr,
@@ -741,6 +821,16 @@ def run_debug(args):
         "start_idx",
         "t_start",
         "denoise_steps",
+        "scheduler_class",
+        "scheduler_source",
+        "scheduler_flow_shift",
+        "scheduler_prediction_type",
+        "scheduler_use_flow_sigmas",
+        "scheduler_timestep_spacing",
+        "timesteps_head",
+        "timesteps_tail",
+        "timesteps_run_head",
+        "timesteps_run_tail",
         "vae_psnr",
         "noisy_psnr",
         "denoised_psnr",
@@ -766,7 +856,8 @@ def run_debug(args):
         "fps": fps,
         "seed": args.seed,
         "scheduler_steps": args.scheduler_steps,
-        "flow_shift": args.flow_shift,
+        "flow_shift_override": args.flow_shift,
+        **sched_info,
         "transformer_device": str(_pipe_device(pipe)),
         "transformer_dtype": str(_transformer_dtype(pipe)),
         "vae_device": str(_vae_device(pipe)),
@@ -824,7 +915,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Intuitive noise strengths: 0=no noise, 1=maximum noise.",
     )
     parser.add_argument("--scheduler-steps", type=int, default=100)
-    parser.add_argument("--flow-shift", type=float, default=3.0)
+    parser.add_argument(
+        "--flow-shift",
+        type=float,
+        default=None,
+        help="Override scheduler flow_shift. Default keeps the checkpoint scheduler_config.",
+    )
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument("--guidance-scale", type=float, default=1.0)

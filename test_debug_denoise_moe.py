@@ -66,7 +66,15 @@ class _FakeScheduler:
         self.step_calls = []
         self.begin_index = None
         self.order = 1
-        self.config = SimpleNamespace(num_train_timesteps=1000)
+        self.config = SimpleNamespace(
+            flow_shift=5.0,
+            num_train_timesteps=1000,
+            prediction_type="flow_prediction",
+            use_flow_sigmas=True,
+            timestep_spacing="linspace",
+            solver_order=2,
+            solver_type="bh2",
+        )
 
     def set_timesteps(self, n_steps, device=None):
         self.timesteps = torch.linspace(999, 1, n_steps, device=device).long()
@@ -202,7 +210,7 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             width=4,
             gammas=[0.0, 0.5],
             scheduler_steps=4,
-            flow_shift=3.0,
+            flow_shift=None,
             prompt="",
             negative_prompt="bad",
             guidance_scale=2.0,
@@ -227,7 +235,7 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             device="cpu",
             vae_device="auto",
             vae_dtype="float32",
-            flow_shift=3.0,
+            flow_shift=None,
             low_cpu_memory=True,
         )
         return args
@@ -271,10 +279,17 @@ class TestDebugDenoiseMOE(unittest.TestCase):
             self.assertEqual(summary["vae_device"], "cpu")
             self.assertEqual(summary["vae_dtype"], "torch.float32")
             self.assertFalse(summary["decode_noisy"])
+            self.assertEqual(summary["scheduler_class"], "_FakeScheduler")
+            self.assertEqual(summary["scheduler_source"], "checkpoint_config")
+            self.assertEqual(summary["scheduler_flow_shift"], 5.0)
+            self.assertEqual(summary["scheduler_prediction_type"], "flow_prediction")
+            self.assertTrue(summary["scheduler_use_flow_sigmas"])
             run = summary["runs"][1]
             self.assertTrue(run["expand_timesteps"])
             self.assertEqual(run["start_idx"], 2)
             self.assertEqual(run["denoise_steps"], 2)
+            self.assertEqual(run["timesteps_head"], [999.0, 666.0, 333.0, 1.0])
+            self.assertEqual(run["timesteps_run_head"], [333.0, 1.0])
             self.assertIsNone(run["noisy_psnr"])
             self.assertIsNone(run["recovery_gain"])
 
