@@ -1,16 +1,13 @@
 """
-Wan2.2 TI2V/I2V SDEdit reconstruction experiment.
+Wan2.2-TI2V-5B 的 SDEdit 视频重建实验。
 
-This mirrors debug_denoise.py outputs, but uses the official Wan
-Image-to-Video latent condition path instead of VACE reference slots:
-prepare_latents(image, latents=...), expand_timesteps mask fusion, CFG, and
-the checkpoint's official scheduler.
+脚本先把干净视频编码成 latent，再按 gamma 加噪，最后使用首帧作为 I2V 条件
+进行去噪。条件注入、mask 融合和 scheduler 都严格遵循 Diffusers 官方流程。
 
-The default model is Wan-AI/Wan2.2-TI2V-5B-Diffusers. Despite this file name,
-that checkpoint is a dense 5B TI2V model; the explicitly MoE Wan2.2 checkpoints
-are the A14B series.
+注意：虽然文件名包含 moe，但默认的 TI2V-5B 是 dense 5B 模型；显式 MoE
+模型是 Wan2.2 A14B 系列。
 
-Example:
+示例：
   python debug_denoise_moe.py --video input.mp4 --max-frames 9 --gammas 0.5
 """
 
@@ -37,6 +34,8 @@ from debug_denoise import (
 from model_adapter import _frames_to_tensor, _tensor_to_frames, noise_strength_to_start_idx
 
 
+# 这些值来自 Wan-AI/Wan2.2-TI2V-5B-Diffusers 的官方 checkpoint 配置。
+# 启动时会逐项校验，避免脚本在错误 scheduler 上“看似正常”地运行。
 DEFAULT_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 OFFICIAL_SCHEDULER_CLASS = "UniPCMultistepScheduler"
 OFFICIAL_FLOW_SHIFT = 5.0
@@ -44,12 +43,18 @@ OFFICIAL_MAX_SEQUENCE_LENGTH = 512
 
 
 def release_memory() -> None:
+    """释放 Python 对象和 PyTorch CUDA 缓存，降低双 T4 上的显存峰值。"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
 def clear_vae_internal_cache(pipe) -> None:
+    """清理 Wan VAE 可能保留的时序 feature cache。
+
+    Wan VAE 会逐帧编码/解码，并可能在模块内部缓存中间特征。若不主动释放，
+    下一次 VAE decode 可能因为这些残留特征而 OOM。
+    """
     vae = getattr(pipe, "vae", None)
     if vae is None:
         return
@@ -69,6 +74,7 @@ def clear_vae_internal_cache(pipe) -> None:
 
 
 def _pipe_device(pipe) -> torch.device:
+    """返回 transformer 所在设备，也就是去噪主计算设备。"""
     transformer = getattr(pipe, "transformer", None)
     if transformer is not None:
         try:
@@ -82,18 +88,22 @@ def _pipe_device(pipe) -> torch.device:
 
 
 def _transformer_dtype(pipe) -> torch.dtype:
+    """返回 transformer 的计算精度，通常为 bfloat16。"""
     return getattr(pipe.transformer, "dtype", torch.float32)
 
 
 def _vae_device(pipe) -> torch.device:
+    """返回 VAE 所在设备；双卡模式下通常是 cuda:1。"""
     return next(pipe.vae.parameters()).device
 
 
 def _vae_dtype(pipe) -> torch.dtype:
+    """返回 VAE 的计算精度，默认 float32 以保证重建质量。"""
     return next(pipe.vae.parameters()).dtype
 
 
 def _vae_norm(pipe, device) -> tuple:
+    """构造官方 Wan VAE latent 的归一化均值和缩放系数。"""
     mean = torch.tensor(
         pipe.vae.config.latents_mean, dtype=torch.float32, device=device
     ).view(1, pipe.vae.config.z_dim, 1, 1, 1)
@@ -104,6 +114,7 @@ def _vae_norm(pipe, device) -> tuple:
 
 
 def _config_value(config, name, default=None):
+    """兼容 dict 和 Diffusers FrozenDict 两种配置读取方式。"""
     if config is None:
         return default
     if isinstance(config, dict):
@@ -112,6 +123,7 @@ def _config_value(config, name, default=None):
 
 
 def scheduler_info(pipe) -> dict:
+    """收集会影响加噪与去噪轨迹的关键 scheduler 配置。"""
     config = getattr(getattr(pipe, "scheduler", None), "config", None)
     return {
         "scheduler_class": pipe.scheduler.__class__.__name__,
@@ -127,11 +139,13 @@ def scheduler_info(pipe) -> dict:
 
 
 def tensor_head_tail(tensor: torch.Tensor, count: int = 5) -> tuple:
+    """只保留 timestep 序列的开头和结尾，方便写日志而不刷屏。"""
     values = [float(x) for x in tensor.detach().float().cpu().tolist()]
     return values[:count], values[-count:]
 
 
 def print_scheduler_info(pipe) -> dict:
+    """打印实际加载的 scheduler，便于确认当前运行与官方配置一致。"""
     info = scheduler_info(pipe)
     print(
         "[scheduler] "
@@ -148,6 +162,11 @@ def print_scheduler_info(pipe) -> dict:
 
 
 def validate_wan22_ti2v5b_pipeline(pipe) -> None:
+    """对官方 Wan2.2-TI2V-5B pipeline 做启动前的强校验。
+
+    本脚本只支持该模型的 expand_timesteps 条件路径。发现 pipeline、scheduler
+    或 patch size 不一致时立即报错，避免得到无法解释的实验结果。
+    """
     if pipe.__class__.__name__ != "WanImageToVideoPipeline":
         raise TypeError(
             "debug_denoise_moe.py requires WanImageToVideoPipeline, "
@@ -161,6 +180,7 @@ def validate_wan22_ti2v5b_pipeline(pipe) -> None:
         raise ValueError("Wan2.2-TI2V-5B requires pipe.config.expand_timesteps=True")
 
     info = scheduler_info(pipe)
+    # TI2V-5B checkpoint 的官方 scheduler 配置。这里不允许静默替换。
     expected = {
         "scheduler_class": OFFICIAL_SCHEDULER_CLASS,
         "scheduler_flow_shift": OFFICIAL_FLOW_SHIFT,
@@ -188,6 +208,7 @@ def validate_wan22_ti2v5b_pipeline(pipe) -> None:
 
 
 def resolve_max_sequence_length(pipe, requested) -> int:
+    """优先使用命令行值，其次读取模型配置，最后回退到官方默认 512。"""
     if requested is not None:
         return int(requested)
     for config in (getattr(pipe, "config", None), getattr(pipe.transformer, "config", None)):
@@ -200,6 +221,7 @@ def resolve_max_sequence_length(pipe, requested) -> int:
 
 
 def _retrieve_latents_argmax(encoder_output):
+    """从不同版本 Diffusers 的 VAE encode 返回值中取确定性 latent。"""
     if hasattr(encoder_output, "latent_dist"):
         dist = encoder_output.latent_dist
         if hasattr(dist, "mode"):
@@ -211,15 +233,18 @@ def _retrieve_latents_argmax(encoder_output):
 
 
 def _bgr_to_pil(frame_bgr: np.ndarray) -> Image.Image:
+    """OpenCV BGR 图像转为 Diffusers 常用的 RGB PIL 图像。"""
     return Image.fromarray(frame_bgr[..., ::-1].copy())
 
 
 def _component_to(component, *args, **kwargs) -> None:
+    """组件存在且支持 `.to()` 时才移动设备或切换 dtype。"""
     if component is not None and hasattr(component, "to"):
         component.to(*args, **kwargs)
 
 
 def _resolve_cuda_device(device: str) -> torch.device:
+    """把模糊的 `cuda` 显式解析为 `cuda:0`。"""
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:
         return torch.device("cuda:0")
@@ -227,6 +252,7 @@ def _resolve_cuda_device(device: str) -> torch.device:
 
 
 def resolve_vae_device(device: str, vae_device: str) -> torch.device:
+    """自动把 VAE 放到另一张 GPU，避免和 5B transformer 抢显存。"""
     main_dev = _resolve_cuda_device(device)
     if vae_device == "auto":
         if main_dev.type == "cuda" and torch.cuda.device_count() > 1:
@@ -236,6 +262,7 @@ def resolve_vae_device(device: str, vae_device: str) -> torch.device:
 
 
 def parse_torch_dtype(dtype_name: str) -> torch.dtype:
+    """把便于命令行输入的 dtype 名称转换成 torch.dtype。"""
     name = dtype_name.lower()
     if name in ("float32", "fp32"):
         return torch.float32
@@ -253,6 +280,11 @@ def load_wan_ti2v_pipe(
     vae_dtype: str = "float32",
     low_cpu_memory: bool = True,
 ):
+    """加载官方 WanImageToVideoPipeline，并按双卡调试策略放置组件。
+
+    transformer 是主要去噪网络，默认放在 `--device`；VAE 负责视频和首帧条件
+    的编码/解码，默认 `--vae-device auto` 会在双 GPU 环境放到另一张卡。
+    """
     try:
         from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
     except ImportError as exc:
@@ -262,6 +294,7 @@ def load_wan_ti2v_pipe(
             "pip install git+https://github.com/huggingface/diffusers.git"
         ) from exc
 
+    # VAE 单独加载为用户指定精度；默认 float32，重建 PSNR 通常更稳。
     vae_torch_dtype = parse_torch_dtype(vae_dtype)
     loading_kwargs = {"low_cpu_mem_usage": low_cpu_memory}
     try:
@@ -283,12 +316,16 @@ def load_wan_ti2v_pipe(
         else:
             raise
 
+    # 这里故意不使用 DiffusionPipeline fallback：该 checkpoint 的 model_index
+    # 可能指向 T2V pipeline，而本脚本必须使用 I2V 的 prepare_latents(image, ...).
     pipe = WanImageToVideoPipeline.from_pretrained(
         model_id,
         vae=vae,
         torch_dtype=torch.bfloat16,
         **loading_kwargs,
     )
+    # 双 T4 15GB 时，transformer 和 VAE 放在同一张卡很容易 OOM。
+    # 因此默认 transformer -> cuda:0，VAE -> cuda:1。
     dev = _resolve_cuda_device(device)
     vae_dev = resolve_vae_device(device, vae_device)
     if dev.type == "cuda":
@@ -300,6 +337,7 @@ def load_wan_ti2v_pipe(
             pipe.to(dev)
         _component_to(getattr(pipe, "vae", None), vae_dev, dtype=vae_torch_dtype)
 
+    # VAE slicing 会降低单次 decode/encode 的峰值显存，代价是稍慢。
     if hasattr(pipe.vae, "enable_slicing"):
         pipe.vae.enable_slicing()
 
@@ -309,9 +347,11 @@ def load_wan_ti2v_pipe(
 
 
 def encode_video_official(pipe, frames_bgr: list) -> torch.Tensor:
+    """把完整视频编码为 Wan latent，作为 SDEdit 的干净起点。"""
     vae_dev = _vae_device(pipe)
     vae_dtype = _vae_dtype(pipe)
     tensor = _frames_to_tensor(frames_bgr, vae_dev, vae_dtype)
+    # VAE encode 产生未标准化 latent；Wan pipeline 使用 (latent - mean) * std。
     with torch.no_grad():
         latents = _retrieve_latents_argmax(pipe.vae.encode(tensor))
     mean, std = _vae_norm(pipe, latents.device)
@@ -323,9 +363,11 @@ def encode_video_official(pipe, frames_bgr: list) -> torch.Tensor:
 
 
 def decode_latents_official(pipe, latents: torch.Tensor) -> list:
+    """把 Wan latent 解码回 BGR 帧，用于保存 MP4/PNG 和计算 PSNR。"""
     vae_dev = _vae_device(pipe)
     vae_dtype = _vae_dtype(pipe)
     mean, std = _vae_norm(pipe, latents.device)
+    # 解码前要撤销 encode 阶段的 Wan latent 标准化。
     latents = (latents.float() / std + mean).to(device=vae_dev, dtype=vae_dtype)
     with torch.no_grad():
         decoded = pipe.vae.decode(latents).sample
@@ -343,8 +385,10 @@ def encode_prompt_official(
     guidance_scale: float,
     max_sequence_length: int,
 ):
+    """编码文本 prompt；低内存模式下优先让 T5 留在 CPU。"""
     device = _pipe_device(pipe)
     dtype = _transformer_dtype(pipe)
+    # 如果没有启用低内存路径，直接用 pipeline 官方 encode_prompt。
     if hasattr(pipe, "encode_prompt") and not getattr(pipe, "_low_memory_text_encoder", False):
         prompt_embeds, negative_embeds = pipe.encode_prompt(
             prompt=prompt,
@@ -364,6 +408,7 @@ def encode_prompt_official(
     if not hasattr(pipe, "_get_t5_prompt_embeds"):
         raise RuntimeError("Pipeline does not expose encode_prompt or _get_t5_prompt_embeds")
 
+    # 低内存路径：只在 CPU 上跑 T5，然后把 prompt embeds 搬到 transformer 设备。
     prompt_embeds = pipe._get_t5_prompt_embeds(
         prompt=prompt,
         num_videos_per_prompt=1,
@@ -392,15 +437,25 @@ def prepare_wan22_first_frame_condition(
     num_frames: int,
     generator,
 ):
+    """用官方 I2V `prepare_latents` 构造首帧条件和 mask。
+
+    Wan2.2-TI2V-5B 的 expand_timesteps 路径会返回三件东西：
+    - prepared_latents: 与输入 noisy_latents 同形状，作为真正去噪状态
+    - condition: 首帧条件 latent
+    - first_frame_mask: 哪些位置使用 condition，哪些位置使用当前 noisy latent
+    """
     transformer_device = _pipe_device(pipe)
     vae_device = _vae_device(pipe)
     dtype = _transformer_dtype(pipe)
+    # 官方 pipeline 先把首帧按目标分辨率预处理成 image tensor，再交给 VAE。
     image = _bgr_to_pil(first_frame_bgr)
     if not hasattr(pipe, "video_processor"):
         raise RuntimeError("Pipeline does not expose video_processor for image preprocessing")
     image = pipe.video_processor.preprocess(image, height=height, width=width)
     image = image.to(device=vae_device, dtype=torch.float32)
 
+    # 关键点：这里显式传入 latents=noisy_latents。
+    # 这表示“从我们加噪后的 SDEdit 状态开始”，同时使用首帧作为 I2V 条件。
     outputs = pipe.prepare_latents(
         image,
         batch_size=1,
@@ -441,16 +496,23 @@ def prepare_wan22_first_frame_condition(
 
 
 def scheduler_step_official(pipe, noise_pred, timestep, latents):
+    """执行官方 Diffusers scheduler step。"""
     return pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
 
 def model_cache_context(model, name: str):
+    """兼容支持 cache_context 的 transformer；不支持时就是普通 no-op。"""
     if hasattr(model, "cache_context"):
         return model.cache_context(name)
     return nullcontext()
 
 
 def _expanded_timestep(model, first_frame_mask, timestep, batch_size):
+    """把单个 timestep 展开到 token/patch 级别。
+
+    Wan2.2-TI2V-5B 的官方 I2V 路径会让首帧条件 token 和待生成 token 使用
+    不同的 timestep mask。这里按 transformer patch_size 对 mask 下采样。
+    """
     patch_size = getattr(getattr(model, "config", None), "patch_size", (1, 2, 2))
     patch_h = int(patch_size[1]) if len(patch_size) > 1 else 2
     patch_w = int(patch_size[2]) if len(patch_size) > 2 else 2
@@ -467,6 +529,7 @@ def _transformer_forward(
     attention_kwargs,
     cache_name,
 ):
+    """调用 Wan transformer，返回预测的 flow/noise。"""
     with torch.no_grad(), model_cache_context(model, cache_name):
         return model(
             hidden_states=latent_model_input,
@@ -488,10 +551,12 @@ def denoise_with_ti2v_pipeline_internals(
     guidance_scale: float,
     attention_kwargs=None,
 ):
+    """执行 Wan2.2-TI2V-5B 的官方 expand_timesteps 去噪循环。"""
     transformer_dtype = _transformer_dtype(pipe)
     model = pipe.transformer
 
     for i, timestep in enumerate(timesteps_run):
+        # 官方 mask fusion：首帧区域固定使用 condition，其余区域使用当前 latent。
         latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
         timestep_batch = _expanded_timestep(
             model, first_frame_mask, timestep, latents.shape[0]
@@ -505,6 +570,7 @@ def denoise_with_ti2v_pipeline_internals(
             attention_kwargs,
             "cond",
         )
+        # CFG：当 guidance_scale > 1 时，额外跑一次 negative prompt 分支。
         if negative_prompt_embeds is not None:
             noise_uncond = _transformer_forward(
                 model,
@@ -516,6 +582,7 @@ def denoise_with_ti2v_pipeline_internals(
             )
             noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
+        # scheduler 根据 transformer 预测值，把 latent 从当前 timestep 推到下一步。
         latents = scheduler_step_official(pipe, noise_pred, timestep, latents)
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(
@@ -523,10 +590,12 @@ def denoise_with_ti2v_pipeline_internals(
                 f"t={timestep.item():.1f} latent_norm={latents.norm().item():.1f}"
             )
 
+    # 最终再融合一次，确保解码前首帧条件区域保持官方 I2V 约束。
     return (1 - first_frame_mask) * condition + first_frame_mask * latents
 
 
 def set_denoise_start(pipe, n_steps: int, start_idx: int) -> torch.Tensor:
+    """设置 scheduler timesteps，并返回本次 gamma 实际要跑的后半段。"""
     pipe.scheduler.set_timesteps(n_steps, device=_pipe_device(pipe))
     timesteps = pipe.scheduler.timesteps
     start_idx = max(0, min(int(start_idx), len(timesteps) - 1))
@@ -536,12 +605,14 @@ def set_denoise_start(pipe, n_steps: int, start_idx: int) -> torch.Tensor:
 
 
 def add_noise_at_timestep(pipe, latents, noise, timestep):
+    """在指定 timestep 上把干净 latent 加噪，得到 SDEdit 起点。"""
     if timestep.ndim == 0:
         timestep = timestep.unsqueeze(0)
     return pipe.scheduler.add_noise(latents, noise, timestep.to(device=latents.device))
 
 
 def run_debug(args):
+    """主实验入口：读取视频、编码 latent、逐个 gamma 加噪并重建。"""
     if args.max_frames < 1:
         raise ValueError("--max-frames must be positive")
     if len(set(args.gammas)) != len(args.gammas):
@@ -549,12 +620,14 @@ def run_debug(args):
     for gamma in args.gammas:
         noise_strength_to_start_idx(gamma, args.scheduler_steps)
 
+    # 1. 读入视频，并裁剪到 Wan temporal VAE 支持的 T=4k+1 帧数。
     os.makedirs(args.output_dir, exist_ok=True)
     frames, fps = load_video(args.video, args.max_frames, args.width, args.height)
     print(f"[input] {len(frames)} frames, {args.width}x{args.height}, {fps:.2f} fps")
     save_video(frames, os.path.join(args.output_dir, "original.mp4"), fps)
     save_frames(frames, os.path.join(args.output_dir, "original_frames"))
 
+    # 2. 加载并校验官方 Wan2.2-TI2V-5B I2V pipeline。
     pipe = load_wan_ti2v_pipe(
         args.model_id,
         device=args.device,
@@ -571,6 +644,7 @@ def run_debug(args):
     )
     sched_info = print_scheduler_info(pipe)
 
+    # 3. VAE round-trip：检查仅 VAE 编解码造成的基础损失。
     latents_clean = encode_video_official(pipe, frames)
     vae_frames = decode_latents_official(pipe, latents_clean)
     vae_psnr, vae_per_frame = mean_psnr(frames, vae_frames)
@@ -579,6 +653,7 @@ def run_debug(args):
     release_memory()
     print(f"[baseline] VAE round-trip PSNR={vae_psnr:.2f} dB")
 
+    # 4. 文本条件只编码一次，之后每个 gamma 共用同一份 prompt embeds。
     max_sequence_length = resolve_max_sequence_length(pipe, args.max_sequence_length)
     print(f"[text] max_sequence_length={max_sequence_length}")
     prompt_embeds, negative_prompt_embeds = encode_prompt_official(
@@ -592,6 +667,7 @@ def run_debug(args):
         pipe.text_encoder = None
     release_memory()
 
+    # 5. 固定同一份基础噪声，保证不同 gamma 间可比较。
     torch.manual_seed(args.seed)
     base_noise = torch.randn_like(latents_clean)
     torch.save(base_noise.detach().cpu(), os.path.join(args.output_dir, "noise.pt"))
@@ -604,6 +680,8 @@ def run_debug(args):
 
     summaries = []
     for gamma in args.gammas:
+        # 6. gamma 决定从 scheduler 的哪个 timestep 开始：
+        #    gamma 越大，start_idx 越靠前，噪声越强，去噪步数越多。
         print(f"\n[gamma={gamma:.3f}] starting")
         gamma_dir = os.path.join(args.output_dir, gamma_dir_name(gamma))
         os.makedirs(gamma_dir, exist_ok=True)
@@ -627,6 +705,7 @@ def run_debug(args):
         else:
             noisy_latents = add_noise_at_timestep(pipe, latents_clean, base_noise, t_start)
 
+        # 7. 使用首帧作为官方 I2V 条件；注意这不是 VACE reference slot。
         generator = torch.Generator(device="cpu").manual_seed(args.seed)
         noisy_latents, condition, first_frame_mask = prepare_wan22_first_frame_condition(
             pipe,
@@ -638,6 +717,7 @@ def run_debug(args):
             generator,
         )
 
+        # noisy.mp4 只是调试中间产物，默认跳过以降低 VAE decode 显存峰值。
         noisy_frames = None
         noisy_psnr = None
         noisy_per_frame = []
@@ -648,6 +728,7 @@ def run_debug(args):
         else:
             print("[decode] skipping noisy.mp4 to keep VAE memory for denoising")
 
+        # 8. 真正的去噪循环：每步都用首帧 condition/mask 约束 latent。
         denoised_latents = denoise_with_ti2v_pipeline_internals(
             pipe,
             noisy_latents.clone(),
@@ -671,6 +752,7 @@ def run_debug(args):
                 fps,
             )
 
+        # 9. 每个 gamma 的指标都落盘，便于之后横向比较。
         summary = {
             "gamma": gamma,
             "guidance_scale": args.guidance_scale,
@@ -725,6 +807,7 @@ def run_debug(args):
         del condition, first_frame_mask
         release_memory()
 
+    # 10. 写聚合结果：CSV 适合快速扫表，JSON 保留完整 per-frame/per-run 信息。
     csv_fields = [
         "gamma",
         "guidance_scale",
@@ -802,6 +885,7 @@ def run_debug(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """命令行参数定义。默认值面向双 T4 低显存环境。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", required=True)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
