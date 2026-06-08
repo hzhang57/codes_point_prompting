@@ -1,12 +1,16 @@
 # Point Prompting: Counterfactual Tracking with Video Diffusion Models
 
-**v2.1** — 2026-05-27
+**v2.2** — 2026-06-08
 
 An unofficial third-party implementation of [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://openreview.net/forum?id=6FFQ007qLX) (ICLR 2026 Poster).
 
 ## Changelog
 
-### Current
+### v2.2 (2026-06-08)
+- Add Wan2.2-TI2V-5B debug reconstruction via `debug_denoise_moe.py`
+- Use the official Wan TI2V/I2V condition path: `prepare_latents(image, latents=...)`
+- Keep the Wan2.2-TI2V-5B checkpoint scheduler config by default (`UniPCMultistepScheduler`, `flow_shift=5.0`) and log scheduler/timestep details to outputs
+- Add dual-T4 memory handling for Wan2.2-TI2V-5B: transformer on `cuda:0`, VAE on `cuda:1`, and skip intermediate noisy decode by default
 - Define `gamma` as intuitive noise strength (`0` = none, `1` = maximum)
 - Add multi-strength SDEdit reconstruction experiment with denoised MP4 output
 
