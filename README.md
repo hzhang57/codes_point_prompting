@@ -153,6 +153,23 @@ CFG, transformer calls, and scheduler steps, use:
 python debug_denoise_vace.py --video input.mp4 --max-frames 9 --gammas 0.5
 ```
 
+To run the same reconstruction check with the official Wan2.2 TI2V/I2V
+conditioning path, use:
+
+```bash
+python debug_denoise_moe.py \
+  --video input.mp4 \
+  --max-frames 9 \
+  --width 832 \
+  --height 480 \
+  --gammas 0.5
+```
+
+`debug_denoise_moe.py` defaults to
+`Wan-AI/Wan2.2-TI2V-5B-Diffusers`. The checkpoint is the dense Wan2.2 TI2V-5B
+model, not the A14B MoE variant; the script name is kept as a convenient debug
+label.
+
 ## File Structure
 
 ```
