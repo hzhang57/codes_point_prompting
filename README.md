@@ -1,44 +1,44 @@
-# Point Prompting with Wan2.2-TI2V-5B
+# 基于 Wan2.2-TI2V-5B 的 Point Prompting
+
+[English README](README_EN.md)
 
 **v3.0** — 2026-06-09
 
-An unofficial implementation of counterfactual point prompting using only
-`Wan-AI/Wan2.2-TI2V-5B-Diffusers`.
+本项目是反事实 Point Prompting 点跟踪算法的非官方实现，目前仅支持
+`Wan-AI/Wan2.2-TI2V-5B-Diffusers`。
 
-Version 3.0 removes the previous model backends and compatibility layers. The
-repository now has one model path, one scheduler contract, and one official
-first-frame conditioning flow.
+从 v3.0 开始，仓库删除了其他模型后端和兼容层，只保留一条模型链路、一套
+scheduler 约束，以及一种官方首帧条件注入流程。
 
-## Pipeline
+## 算法流程
 
-For each query point:
+对于每个查询点：
 
-1. Suppress naturally red regions in the input video.
-2. Draw a red marker on frame 0.
-3. Encode the edited video and add SDEdit noise at strength `gamma`.
-4. Build two official TI2V first-frame conditions with
-   `prepare_latents(image, latents=...)`:
-   - positive: marked frame 0
-   - negative: original frame 0
-5. Apply counterfactual guidance at every denoising step:
+1. 抑制输入视频中原本存在的红色区域，减少红点检测干扰。
+2. 在第 0 帧查询点位置绘制红色标记。
+3. 编码编辑后的视频，并按照 `gamma` 在 latent 空间执行 SDEdit 加噪。
+4. 通过官方 `prepare_latents(image, latents=...)` 分别构造两个 TI2V 首帧条件：
+   - 正条件：带红点的第 0 帧
+   - 负条件：不带红点的原始第 0 帧
+5. 在每个去噪步骤应用反事实引导：
 
    ```python
    v_guided = (lam + 1) * v_marked - lam * v_original
    ```
 
-6. Decode the generated video and detect the propagated marker.
-7. Optionally run a second conservative TI2V SDEdit refinement pass.
+6. 解码生成视频，并逐帧检测传播后的红点。
+7. 可选执行第二次更保守的 TI2V SDEdit refinement。
 
-## Model Contract
+## 模型约束
 
-The only supported checkpoint is:
+唯一支持的 checkpoint：
 
 ```text
 Wan-AI/Wan2.2-TI2V-5B-Diffusers
 ```
 
-The pipeline must be `WanImageToVideoPipeline` with
-`expand_timesteps=True`. The checkpoint scheduler is validated at startup:
+Pipeline 必须是启用 `expand_timesteps=True` 的
+`WanImageToVideoPipeline`。程序启动时会强校验 checkpoint scheduler：
 
 ```text
 class=UniPCMultistepScheduler
@@ -48,18 +48,18 @@ use_flow_sigmas=True
 timestep_spacing=linspace
 ```
 
-Wan2.2-TI2V-5B is a dense 5B model. The `moe` suffix in script names is kept
-for compatibility with the established commands.
+Wan2.2-TI2V-5B 实际是 dense 5B 模型。脚本名称中的 `moe` 后缀仅为兼容已有
+运行命令而保留。
 
-## Installation
+## 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Use a current Diffusers build that includes Wan2.2 TI2V/I2V support.
+需要使用包含 Wan2.2 TI2V/I2V 支持的较新版本 Diffusers。
 
-## Point Prompting Demo
+## Point Prompting 演示
 
 ```bash
 python demo_moe.py \
@@ -72,34 +72,34 @@ python demo_moe.py \
   --save-generated
 ```
 
-`--output` is resolved relative to the current working directory. Debug files
-and `summary.json` are written under `outputs/demo_moe` by default.
+`--output` 路径相对于当前命令运行目录解析。调试文件和 `summary.json` 默认写入
+`outputs/demo_moe`。
 
-Multiple points are supported:
+支持同时输入多个点：
 
 ```bash
 python demo_moe.py --video input.mp4 --points "900,535" "1157,635"
 ```
 
-### Resolution And Dual T4
+### 分辨率与双 T4
 
-The official 720P sizes are:
+Wan2.2-TI2V-5B 官方 720P 分辨率：
 
-- landscape: `1280x704`
-- portrait: `704x1280`
+- 横屏：`1280x704`
+- 竖屏：`704x1280`
 
-Official 720P generally requires more memory than a 15 GiB T4 provides. The
-default `--resolution-preset t4` uses `832x480` or `480x832`. On two GPUs, the
-transformer is placed on `cuda:0` and the VAE on `cuda:1`; `--vae-dtype auto`
-uses float16 on CUDA.
+官方 720P 通常超过单张 15 GiB T4 的显存能力。默认
+`--resolution-preset t4` 使用 `832x480` 或 `480x832`。双卡环境下，
+transformer 放在 `cuda:0`，VAE 放在 `cuda:1`；`--vae-dtype auto` 在 CUDA
+环境自动使用 float16。
 
-Use official resolution explicitly:
+显式使用官方分辨率：
 
 ```bash
 python demo_moe.py --video input.mp4 --points "900,535" --resolution-preset official
 ```
 
-If the T4 preset still runs out of memory:
+如果 T4 默认预设仍然 OOM，可以进一步降低分辨率：
 
 ```bash
 python demo_moe.py \
@@ -112,10 +112,10 @@ python demo_moe.py \
   --vae-dtype float16
 ```
 
-## Reconstruction Debug
+## 去噪重建调试
 
-Use the reconstruction script to scan SDEdit noise strengths while preserving
-the official TI2V first-frame condition and scheduler:
+使用重建脚本扫描不同 SDEdit 噪声强度，同时保持官方 TI2V 首帧条件和
+scheduler：
 
 ```bash
 python debug_denoise_moe.py \
@@ -126,37 +126,34 @@ python debug_denoise_moe.py \
   --gammas 0.5
 ```
 
-Outputs include VAE round-trip reconstruction, denoised videos, timestep logs,
-PSNR metrics, and JSON/CSV summaries under `outputs/debug_denoise_moe`.
+输出包含 VAE round-trip 重建视频、去噪视频、timestep 日志、PSNR 指标，以及
+JSON/CSV 汇总文件，默认保存到 `outputs/debug_denoise_moe`。
 
-## Main Files
+## 主要文件
 
 ```text
-demo_moe.py             Wan2.2-TI2V-5B point prompting CLI
-debug_denoise_moe.py    Wan2.2-TI2V-5B reconstruction debugger
-marker.py               Red marker insertion and detection
-color_rebalance.py      Natural-red suppression
-distillation.py         Model-independent student tracker training tools
-eval_tapvid.py          Model-independent TAP-Vid metrics and evaluation
+demo_moe.py             Wan2.2-TI2V-5B Point Prompting 命令行入口
+debug_denoise_moe.py    Wan2.2-TI2V-5B 重建调试工具
+marker.py               红点插入与检测
+color_rebalance.py      自然红色抑制
+distillation.py         模型无关的学生跟踪器训练工具
+eval_tapvid.py          模型无关的 TAP-Vid 指标与评估工具
 ```
 
-## Changelog
+## 更新记录
 
 ### v3.0 — 2026-06-09
 
-- Make Wan2.2-TI2V-5B the only supported model.
-- Remove previous model implementations, compatibility adapters, and tests.
-- Keep the checkpoint scheduler and official TI2V first-frame condition as
-  fail-fast contracts.
-- Add a dual-T4 resolution preset, float16 VAE auto mode, and clearer OOM
-  guidance.
+- 将 Wan2.2-TI2V-5B 设为唯一支持的模型。
+- 删除此前的模型实现、兼容适配层和对应测试。
+- 对 checkpoint scheduler 和官方 TI2V 首帧条件执行 fail-fast 强校验。
+- 新增双 T4 分辨率预设、float16 VAE 自动模式和更明确的 OOM 提示。
 
-### Historical Releases
+### 历史版本
 
-Earlier model experiments remain available in Git history and previous tags,
-but are not supported by the v3.0 working tree.
+早期模型实验仍可从 Git 历史和旧 tag 获取，但不属于 v3.0 工作树的支持范围。
 
-## Reference
+## 引用
 
 ```bibtex
 @inproceedings{shrivastava2026pointprompting,
