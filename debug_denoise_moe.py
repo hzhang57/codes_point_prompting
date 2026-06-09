@@ -18,21 +18,10 @@ import json
 import os
 from contextlib import nullcontext
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
-
-from debug_denoise import (
-    gamma_dir_name,
-    json_metric,
-    load_video,
-    mean_psnr,
-    save_comparison,
-    save_frames,
-    save_video,
-)
-from model_adapter import _frames_to_tensor, _tensor_to_frames, noise_strength_to_start_idx
-
 
 # 这些值来自 Wan-AI/Wan2.2-TI2V-5B-Diffusers 的官方 checkpoint 配置。
 # 启动时会逐项校验，避免脚本在错误 scheduler 上“看似正常”地运行。
@@ -40,6 +29,122 @@ DEFAULT_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 OFFICIAL_SCHEDULER_CLASS = "UniPCMultistepScheduler"
 OFFICIAL_FLOW_SHIFT = 5.0
 OFFICIAL_MAX_SEQUENCE_LENGTH = 512
+
+
+def noise_strength_to_start_idx(noise_strength: float, n_steps: int) -> int:
+    """把直观噪声强度 [0, 1] 映射到降序 scheduler timestep 的起点。"""
+    if not 0.0 <= noise_strength <= 1.0:
+        raise ValueError(f"noise_strength must be in [0, 1], got {noise_strength}")
+    if n_steps < 1:
+        raise ValueError(f"n_steps must be positive, got {n_steps}")
+    return min(round((1.0 - noise_strength) * n_steps), n_steps - 1)
+
+
+def _frames_to_tensor(frames_bgr: list, device, dtype) -> torch.Tensor:
+    """BGR uint8 帧列表转为 (1, C, T, H, W)、值域 [-1, 1] 的张量。"""
+    tensor = torch.stack(
+        [
+            torch.from_numpy(frame[..., ::-1].copy()).permute(2, 0, 1).float()
+            / 127.5
+            - 1.0
+            for frame in frames_bgr
+        ]
+    )
+    return tensor.permute(1, 0, 2, 3).unsqueeze(0).to(device=device, dtype=dtype)
+
+
+def _tensor_to_frames(tensor: torch.Tensor) -> list:
+    """(1, C, T, H, W) 张量转回 BGR uint8 帧列表。"""
+    tensor = tensor.squeeze(0).permute(1, 0, 2, 3)
+    frames = []
+    for frame in tensor:
+        array = ((frame.permute(1, 2, 0).float().cpu().numpy() + 1.0) * 127.5)
+        frames.append(array.clip(0, 255).astype(np.uint8)[..., ::-1].copy())
+    return frames
+
+
+def psnr(a: np.ndarray, b: np.ndarray) -> float:
+    mse = np.mean((a.astype(np.float32) - b.astype(np.float32)) ** 2)
+    if mse == 0:
+        return float("inf")
+    return float(20 * np.log10(255.0 / np.sqrt(mse)))
+
+
+def mean_psnr(orig: list, reco: list) -> tuple:
+    if len(orig) != len(reco):
+        raise ValueError(f"Frame count mismatch: original={len(orig)}, result={len(reco)}")
+    for i, (a, b) in enumerate(zip(orig, reco)):
+        if a.shape != b.shape:
+            raise ValueError(f"Frame {i} shape mismatch: original={a.shape}, result={b.shape}")
+    values = [psnr(a, b) for a, b in zip(orig, reco)]
+    return float(np.mean(values)), values
+
+
+def save_frames(frames: list, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    for i, frame in enumerate(frames):
+        cv2.imwrite(os.path.join(output_dir, f"{i:03d}.png"), frame)
+
+
+def save_video(frames: list, path: str, fps: float) -> None:
+    if not frames:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        import imageio
+
+        imageio.mimsave(
+            path,
+            [frame[..., ::-1] for frame in frames],
+            fps=fps,
+            codec="libx264",
+            output_params=["-crf", "18", "-pix_fmt", "yuv420p"],
+        )
+    except Exception as exc:
+        print(f"[save] imageio failed ({exc}), fallback to cv2")
+        height, width = frames[0].shape[:2]
+        writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+        for frame in frames:
+            writer.write(frame)
+        writer.release()
+    print(f"[save] {path} ({len(frames)} frames, {fps:.2f} fps)")
+
+
+def save_comparison(orig: list, noisy: list, denoised: list, path: str, fps: float) -> None:
+    rows = [
+        np.concatenate([clean, noisy_frame, denoised_frame], axis=1)
+        for clean, noisy_frame, denoised_frame in zip(orig, noisy, denoised)
+    ]
+    save_video(rows, path, fps)
+
+
+def gamma_dir_name(gamma: float) -> str:
+    return f"gamma_{gamma:.3f}".rstrip("0").rstrip(".")
+
+
+def json_metric(value: float):
+    return value if np.isfinite(value) else None
+
+
+def load_video(path: str, max_frames: int, width: int, height: int) -> tuple:
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 8.0
+    frames = []
+    while len(frames) < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(cv2.resize(frame, (width, height)))
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"无法读取视频：{path}")
+    valid_count = ((len(frames) - 1) // 4) * 4 + 1
+    if valid_count != len(frames):
+        print(f"[input] 帧数 {len(frames)} 不满足 T=4k+1，裁剪到 {valid_count}")
+        frames = frames[:valid_count]
+    return frames, float(fps)
 
 
 def release_memory() -> None:

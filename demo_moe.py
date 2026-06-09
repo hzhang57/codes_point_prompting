@@ -1,9 +1,8 @@
 """
 Wan2.2-TI2V-5B 版本的 Point Prompting 演示脚本。
 
-这个脚本独立于原有 VACE demo：不使用 reference slot、control_hidden_states
-或 legacy image condition。首帧条件、加噪、去噪和 scheduler 均按官方
-WanImageToVideoPipeline 的 TI2V/I2V expand_timesteps 路径执行。
+这个脚本仅使用 WanImageToVideoPipeline 的官方 TI2V/I2V
+expand_timesteps 路径执行首帧条件、加噪、去噪和 scheduler。
 
 核心反事实引导公式：
     v_guided = (lam + 1) * v_marked - lam * v_original

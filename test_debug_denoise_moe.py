@@ -187,6 +187,8 @@ class TestDebugDenoiseMOE(unittest.TestCase):
     def test_strict_script_has_no_generic_or_override_paths(self):
         source = inspect.getsource(debug_denoise_moe)
         self.assertNotIn("DiffusionPipeline.from_pretrained", source)
+        self.assertNotIn("from debug_denoise import", source)
+        self.assertNotIn("from model_adapter import", source)
         self.assertNotIn("--flow-shift", source)
         self.assertNotIn("guidance_scale_2", source)
         self.assertNotIn("transformer_2", source)

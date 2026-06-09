@@ -1,164 +1,121 @@
-# Point Prompting: Counterfactual Tracking with Video Diffusion Models
+# Point Prompting with Wan2.2-TI2V-5B
 
-**v2.2** — 2026-06-08
+**v3.0** — 2026-06-09
 
-An unofficial third-party implementation of [*Point Prompting: Counterfactual Tracking with Video Diffusion Models*](https://openreview.net/forum?id=6FFQ007qLX) (ICLR 2026 Poster).
+An unofficial implementation of counterfactual point prompting using only
+`Wan-AI/Wan2.2-TI2V-5B-Diffusers`.
 
-## Changelog
+Version 3.0 removes the previous model backends and compatibility layers. The
+repository now has one model path, one scheduler contract, and one official
+first-frame conditioning flow.
 
-### v2.2 (2026-06-08)
-- Add Wan2.2-TI2V-5B debug reconstruction via `debug_denoise_moe.py`
-- Use the official Wan TI2V/I2V condition path: `prepare_latents(image, latents=...)`
-- Keep the Wan2.2-TI2V-5B checkpoint scheduler config by default (`UniPCMultistepScheduler`, `flow_shift=5.0`) and log scheduler/timestep details to outputs
-- Add dual-T4 memory handling for Wan2.2-TI2V-5B: transformer on `cuda:0`, VAE on `cuda:1`, and skip intermediate noisy decode by default
-- Define `gamma` as intuitive noise strength (`0` = none, `1` = maximum)
-- Add multi-strength SDEdit reconstruction experiment with denoised MP4 output
+## Pipeline
 
-### v2.1 (2026-05-27)
-- Switch Wan2.1-VACE-1.3B sampling to the official Diffusers `UniPCMultistepScheduler`
-- Use `flow_prediction` / flow sigmas from model config with default `flow_shift=3.0` for 480P
-- Add `--flow-shift` for 720P-style runs (`5.0`) and scheduler experiments
+For each query point:
 
-### v2.0 (2026-05-24)
-- Enable counterfactual guidance loop (paper Eq. 3): `v̂ = (λ+1)·v(c_edited) − λ·v(c_original)`
-- Fix VAE frame count handling: valid T = 4k+1; auto-clip input frames
-- Fix VAE tiling: `enable_slicing()` only — `enable_tiling()` causes checkerboard artifacts
-- Replace all MP4 debug saves with PNG sequences for reliable viewing on Kaggle
-- Add configurable refinement noise level
-- Debug per-step full-frame decode to verify denoising progress
+1. Suppress naturally red regions in the input video.
+2. Draw a red marker on frame 0.
+3. Encode the edited video and add SDEdit noise at strength `gamma`.
+4. Build two official TI2V first-frame conditions with
+   `prepare_latents(image, latents=...)`:
+   - positive: marked frame 0
+   - negative: original frame 0
+5. Apply counterfactual guidance at every denoising step:
 
-### v1.0 (2026-05-23)
-- Full pipeline: color rebalance → marker insert → SDEdit → marker detection → inpainting refinement
-- Video diffusion backbone via unified `ModelAdapter`
-- Dual-GPU support (2× T4 15 GiB)
-
-## Overview
-
-Insert a small red circular marker at a query point in frame 0, then use **counterfactual SDEdit** to regenerate the video so the marker propagates naturally through subsequent frames.
-
-**Pipeline (per query point):**
-
-1. **Color rebalancing** — suppress natural reds (HSV saturation cap) so they don't interfere with marker detection
-2. **Marker insertion** — draw a 2 px red circle at the query point in frame 0
-3. **Counterfactual SDEdit** — regenerate the video with the marked frame as positive condition and the original frame as negative:
+   ```python
+   v_guided = (lam + 1) * v_marked - lam * v_original
    ```
-   v̂ = (λ+1) · v(c_edited) − λ · v(c_original)
-   ```
-   Both conditions use the official VACE `reference_images` path. The demo
-   does not fall back to the legacy first-frame latent control.
-4. **Marker detection** — detect red marker centroid per frame via HSV thresholding
-5. **Inpainting refinement** (optional) — re-denoise a small patch around each detected position at lower noise level for sub-pixel accuracy
 
-## Requirements
+6. Decode the generated video and detect the propagated marker.
+7. Optionally run a second conservative TI2V SDEdit refinement pass.
 
-```
-torch>=2.1.0
-diffusers>=0.30.0
-transformers>=4.40.0
-accelerate>=0.30.0
-opencv-python>=4.9.0
-pillow>=10.0.0
-numpy>=1.24.0
-scipy>=1.10.0
+## Model Contract
+
+The only supported checkpoint is:
+
+```text
+Wan-AI/Wan2.2-TI2V-5B-Diffusers
 ```
 
-## Quick Start
+The pipeline must be `WanImageToVideoPipeline` with
+`expand_timesteps=True`. The checkpoint scheduler is validated at startup:
+
+```text
+class=UniPCMultistepScheduler
+flow_shift=5.0
+prediction_type=flow_prediction
+use_flow_sigmas=True
+timestep_spacing=linspace
+```
+
+Wan2.2-TI2V-5B is a dense 5B model. The `moe` suffix in script names is kept
+for compatibility with the established commands.
+
+## Installation
 
 ```bash
-python demo.py \
+pip install -r requirements.txt
+```
+
+Use a current Diffusers build that includes Wan2.2 TI2V/I2V support.
+
+## Point Prompting Demo
+
+```bash
+python demo_moe.py \
   --video input.mp4 \
-  --points "320,240" \
-  --model-id Wan-AI/Wan2.1-VACE-1.3B-diffusers \
-  --max-frames 81
+  --points "900,535" \
+  --gamma 0.5 \
+  --lam 8.0 \
+  --max-frames 9 \
+  --output tracked_moe.mp4 \
+  --save-generated
 ```
 
-Wan VACE uses a temporal VAE stride where valid input counts follow T = 4k+1. The default `--max-frames 81` matches the Wan2.1-VACE 480P workflow used by this repo.
-Model loading enables Diffusers `low_cpu_mem_usage` by default, which is
-required by current Wan VACE releases and reduces Kaggle host-memory usage.
+`--output` is resolved relative to the current working directory. Debug files
+and `summary.json` are written under `outputs/demo_moe` by default.
 
-## CLI Reference
-
-| Argument | Default | Description |
-|---|---|---|
-| `--video` | required | Input video path |
-| `--points` | required | Query point(s) as `x,y` in frame-0 pixel coords |
-| `--model-id` | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | HuggingFace model ID |
-| `--output` | `tracked.mp4` | Output video path |
-| `--gamma` | `0.5` | SDEdit noise strength: `0` = none, `1` = maximum |
-| `--lam` | `8.0` | Counterfactual guidance weight λ (paper default) |
-| `--scheduler-steps` | `100` | Total scheduler timesteps (paper default) |
-| `--flow-shift` | `3.0` | UniPC flow shift; use `5.0` for 720P-style Wan runs |
-| `--no-refine` | off | Skip inpainting refinement (faster) |
-| `--seed` | `42` | Random seed |
-| `--max-frames` | `81` | Max frames; must satisfy T = 4k+1 |
-| `--device` | `cuda` | Compute device |
-
-## PointPrompterConfig
-
-| Parameter | Default | Description |
-|---|---|---|
-| `gamma` | `0.5` | SDEdit noise strength: `0` = none, `1` = maximum |
-| `lam` | `8.0` | Counterfactual guidance weight (paper default) |
-| `scheduler_steps` | `100` | Total scheduler timesteps |
-| `marker_radius` | `6` | Red marker radius in pixels; pass `2` to reproduce the paper ablation setting |
-| `do_refine` | `True` | Enable inpainting refinement pass |
-| `refine_gamma` | `0.3` | Lower noise strength for conservative refinement |
-| `prompt` | `""` | Text prompt (paper uses empty string) |
-| `seed` | `None` | Random seed for reproducibility |
-| `model_width` | `832` | Max width fed to diffusion model |
-| `model_height` | `480` | Max height fed to diffusion model |
-| `model_stride` | `16` | Spatial alignment stride |
-
-## Wan VACE Scheduler
-
-This repo follows the official Wan2.1-VACE-1.3B Diffusers setup:
-
-```python
-UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=3.0)
-```
-
-The model config provides `prediction_type="flow_prediction"` and `use_flow_sigmas=True`. The default `flow_shift=3.0` targets 480P; pass `--flow-shift 5.0` for 720P-style settings.
-
-## SDEdit Reconstruction Check
-
-Use `debug_denoise.py` to scan noise strengths and verify that denoising recovers
-a clean input video:
+Multiple points are supported:
 
 ```bash
-python debug_denoise.py --video input.mp4 --max-frames 9
+python demo_moe.py --video input.mp4 --points "900,535" "1157,635"
 ```
 
-By default, the clean first frame is passed through VACE's official single
-`reference_images` path. The complete clean video is encoded independently,
-noised as the SDEdit state, and never supplied to the VACE control branch.
-The extra reference-time latent slot follows the official temporal layout. It
-does not contain the reference image latent; the SDEdit experiment uses a
-neutral zero `x0` for that slot before scheduler noise is applied.
+### Resolution And Dual T4
 
-Results are written under `outputs/debug_denoise/`. Each
-`gamma_<value>/denoised.mp4` is the fully denoised video; the same directory
-also contains `noisy.mp4`, denoised PNG frames, and a three-column
-`compare.mp4`. Aggregate PSNR and latent MSE results are saved in
-`summary.csv` and `summary.json`.
+The official 720P sizes are:
 
-The reconstruction script enables low-CPU-RAM mode by default: model loading
-uses `low_cpu_mem_usage`, T5 keeps its loaded dtype instead of expanding to
-float32, and T5 is released after prompt encoding. For a constrained notebook,
-start with one strength and fewer pixels:
+- landscape: `1280x704`
+- portrait: `704x1280`
+
+Official 720P generally requires more memory than a 15 GiB T4 provides. The
+default `--resolution-preset t4` uses `832x480` or `480x832`. On two GPUs, the
+transformer is placed on `cuda:0` and the VAE on `cuda:1`; `--vae-dtype auto`
+uses float16 on CUDA.
+
+Use official resolution explicitly:
 
 ```bash
-python debug_denoise.py --video input.mp4 --max-frames 5 --width 512 --height 288 --gammas 0.5 --conditioning-scale 1.0
+python demo_moe.py --video input.mp4 --points "900,535" --resolution-preset official
 ```
 
-To compare against Wan VACE's official pipeline internals for conditioning,
-CFG, transformer calls, and scheduler steps, use:
+If the T4 preset still runs out of memory:
 
 ```bash
-python debug_denoise_vace.py --video input.mp4 --max-frames 9 --gammas 0.5
+python demo_moe.py \
+  --video input.mp4 \
+  --points "900,535" \
+  --preprocess-width 720 \
+  --preprocess-height 416 \
+  --model-width 720 \
+  --model-height 416 \
+  --vae-dtype float16
 ```
 
-To run the same reconstruction check with the official Wan2.2 TI2V/I2V
-conditioning path, use:
+## Reconstruction Debug
+
+Use the reconstruction script to scan SDEdit noise strengths while preserving
+the official TI2V first-frame condition and scheduler:
 
 ```bash
 python debug_denoise_moe.py \
@@ -169,29 +126,35 @@ python debug_denoise_moe.py \
   --gammas 0.5
 ```
 
-`debug_denoise_moe.py` defaults to
-`Wan-AI/Wan2.2-TI2V-5B-Diffusers`. The checkpoint is the dense Wan2.2 TI2V-5B
-model, not the A14B MoE variant; the script name is kept as a convenient debug
-label. It keeps the checkpoint's official scheduler config by default
-(`UniPCMultistepScheduler`, `flow_shift=5.0` for this model). On a two-GPU
-15 GiB T4 notebook, keep the default `--vae-device auto`;
-it places the transformer on `cuda:0` and the VAE on `cuda:1` to avoid VAE
-encode OOM during the clean-video and first-frame condition passes. The script
-also skips intermediate `noisy.mp4` decoding by default to avoid another VAE
-memory spike; pass `--decode-noisy` only when you need that debug video.
+Outputs include VAE round-trip reconstruction, denoised videos, timestep logs,
+PSNR metrics, and JSON/CSV summaries under `outputs/debug_denoise_moe`.
 
-## File Structure
+## Main Files
 
+```text
+demo_moe.py             Wan2.2-TI2V-5B point prompting CLI
+debug_denoise_moe.py    Wan2.2-TI2V-5B reconstruction debugger
+marker.py               Red marker insertion and detection
+color_rebalance.py      Natural-red suppression
+distillation.py         Model-independent student tracker training tools
+eval_tapvid.py          Model-independent TAP-Vid metrics and evaluation
 ```
-├── demo.py            # CLI entry point and visualization
-├── tracker.py         # PointPrompter: full tracking pipeline
-├── sdedit.py          # Counterfactual SDEdit core loop
-├── marker.py          # Red marker insertion and detection
-├── color_rebalance.py # HSV saturation clamp for natural reds
-├── refinement.py      # Inpainting refinement pass
-├── model_adapter.py   # Wan VACE adapter + pipeline loader
-└── requirements.txt
-```
+
+## Changelog
+
+### v3.0 — 2026-06-09
+
+- Make Wan2.2-TI2V-5B the only supported model.
+- Remove previous model implementations, compatibility adapters, and tests.
+- Keep the checkpoint scheduler and official TI2V first-frame condition as
+  fail-fast contracts.
+- Add a dual-T4 resolution preset, float16 VAE auto mode, and clearer OOM
+  guidance.
+
+### Historical Releases
+
+Earlier model experiments remain available in Git history and previous tags,
+but are not supported by the v3.0 working tree.
 
 ## Reference
 
