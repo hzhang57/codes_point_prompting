@@ -81,6 +81,35 @@ python demo_moe.py \
 python demo_moe.py --video input.mp4 --points "900,535" "1157,635"
 ```
 
+### Kaggle T4 x 2 运行指令
+
+在 Kaggle Notebook 中选择双 T4 GPU，然后依次运行：
+
+```python
+!cd /kaggle/working
+!pip install ftfy
+!rm -rf /kaggle/working/*
+!git clone https://github.com/hzhang57/codes_point_prompting.git
+
+!python /kaggle/working/codes_point_prompting/demo_moe.py \
+  --video /kaggle/working/codes_point_prompting/input.mp4 \
+  --points "900,535" \
+  --gamma 0.5 \
+  --lam 8.0 \
+  --max-frames 30 \
+  --output tracked_moe.mp4 \
+  --save-generated
+```
+
+Notebook 中的 `!cd` 只对当前 shell 命令生效；这里运行脚本和读取视频均使用绝对
+路径，因此不会受到影响。Wan temporal VAE 要求帧数满足 `T=4k+1`，
+`--max-frames 30` 会自动裁剪为 29 帧。输出 `tracked_moe.mp4` 默认保存在
+Notebook 当前工作目录，可通过以下命令查找：
+
+```python
+!find /kaggle/working -name "tracked_moe.mp4" -print
+```
+
 ### 分辨率与双 T4
 
 Wan2.2-TI2V-5B 官方 720P 分辨率：

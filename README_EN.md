@@ -83,6 +83,36 @@ Multiple points are supported:
 python demo_moe.py --video input.mp4 --points "900,535" "1157,635"
 ```
 
+### Kaggle T4 x 2 Commands
+
+Select the dual-T4 accelerator in a Kaggle Notebook, then run:
+
+```python
+!cd /kaggle/working
+!pip install ftfy
+!rm -rf /kaggle/working/*
+!git clone https://github.com/hzhang57/codes_point_prompting.git
+
+!python /kaggle/working/codes_point_prompting/demo_moe.py \
+  --video /kaggle/working/codes_point_prompting/input.mp4 \
+  --points "900,535" \
+  --gamma 0.5 \
+  --lam 8.0 \
+  --max-frames 30 \
+  --output tracked_moe.mp4 \
+  --save-generated
+```
+
+In notebook cells, `!cd` only affects that shell command. The example uses
+absolute paths for the script and video, so later commands are unaffected. The
+Wan temporal VAE requires `T=4k+1`; `--max-frames 30` is automatically clipped
+to 29 frames. `tracked_moe.mp4` is written to the notebook's current working
+directory and can be located with:
+
+```python
+!find /kaggle/working -name "tracked_moe.mp4" -print
+```
+
 ### Resolution And Dual T4
 
 The official 720P sizes are:
