@@ -145,14 +145,16 @@ def build_confetti_grid(
     height: int,
     spacing: int,
     jitter: int,
-    hue_coding: str = "periodic",
+    hue_coding: str = "diagonal",
     seed: int = 42,
 ) -> List[GridPoint]:
     """生成周期编码的 confetti 网格。
 
-    periodic：hue_idx = gx % 6，同码字点 x 向至少相隔 6 格——这是连续性
-    消歧的安全距离保证。debruijn：相邻 3 点色相组合全局唯一，单点保证
-    弱于 periodic（序列里有同色连排），换取窗口重定位能力。
+    diagonal（推荐）：hue_idx = (gx + 3*gy) % 6，上下相邻行色相相差 90°，
+    即使明度档在生成中漂移失效，仅靠色相仍有 2 格的垂直安全距离。
+    periodic：hue_idx = gx % 6，同列各行色相相同，依赖明度档区分相邻行。
+    debruijn：相邻 3 点色相组合全局唯一，预留窗口重定位能力。
+    三种编码同码字最小间隔都是 2 行（2*spacing）。
     """
     rng = np.random.default_rng(seed)
     margin = max(spacing // 2, 8)
@@ -163,7 +165,12 @@ def build_confetti_grid(
     points: List[GridPoint] = []
     for gy, y0 in enumerate(ys):
         for gx, x0 in enumerate(xs):
-            hue_idx = seq[gx % len(seq)] if seq is not None else gx % len(HUE_CLASSES)
+            if seq is not None:
+                hue_idx = seq[gx % len(seq)]
+            elif hue_coding == "diagonal":
+                hue_idx = (gx + 3 * gy) % len(HUE_CLASSES)
+            else:
+                hue_idx = gx % len(HUE_CLASSES)
             val_idx = gy % len(VALUE_LEVELS)
             # 轻微随机抖动：破坏完美规则性，增强"颜料"而非"滤镜图案"的解释
             jx = float(rng.integers(-jitter, jitter + 1)) if jitter > 0 else 0.0
@@ -288,6 +295,85 @@ def _grid_neighbors(grid: List[GridPoint]) -> List[List[int]]:
     return neighbors
 
 
+def _two_means(values: List[float], init: List[float], iters: int = 8) -> List[float]:
+    """一维 2-means（Lloyd 迭代），用上一帧的中心做初始化以保持档位连贯。"""
+    c = [float(init[0]), float(init[1])]
+    arr = np.asarray(values, dtype=np.float64)
+    for _ in range(iters):
+        assign = np.abs(arr - c[0]) > np.abs(arr - c[1])
+        for k, sel in enumerate((~assign, assign)):
+            if sel.any():
+                c[k] = float(arr[sel].mean())
+    if c[0] < c[1]:  # 约定 c[0]=亮档
+        c = [c[1], c[0]]
+    return c
+
+
+def _circ_ema(old_hue: float, new_hue: float, alpha: float) -> float:
+    a_old = math.radians(old_hue * 2.0)
+    a_new = math.radians(new_hue * 2.0)
+    x = (1 - alpha) * math.cos(a_old) + alpha * math.cos(a_new)
+    y = (1 - alpha) * math.sin(a_old) + alpha * math.sin(a_new)
+    return (math.degrees(math.atan2(y, x)) % 360.0) / 2.0
+
+
+def _psnr(a: np.ndarray, b: np.ndarray) -> float:
+    mse = np.mean((a.astype(np.float32) - b.astype(np.float32)) ** 2)
+    if mse == 0:
+        return 99.0  # 上限值，保持 JSON 可序列化
+    return float(20 * np.log10(255.0 / np.sqrt(mse)))
+
+
+def _ssim_gray(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+
+    def blur(x):
+        return cv2.GaussianBlur(x, (11, 11), 1.5)
+
+    mu_a, mu_b = blur(a), blur(b)
+    var_a = blur(a * a) - mu_a * mu_a
+    var_b = blur(b * b) - mu_b * mu_b
+    cov = blur(a * b) - mu_a * mu_b
+    s = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / (
+        (mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2)
+    )
+    return float(s.mean())
+
+
+def compute_sync_metrics(
+    generated: List[np.ndarray], reference: List[np.ndarray]
+) -> List[dict]:
+    """逐帧同步性：生成帧 vs 输入帧的灰度 PSNR/SSIM。
+
+    量化"生成视频是否还在复刻输入运动"——同步性是反事实跟踪方法的地基。
+    预期不同步从某帧开始时，曲线会出现清晰下跌拐点（常与 latent chunk
+    边界对齐）。用灰度通道规避标记/去饱和带来的色度差异。
+    """
+    rows = []
+    for t in range(min(len(generated), len(reference))):
+        a = cv2.cvtColor(generated[t], cv2.COLOR_BGR2GRAY)
+        b = cv2.cvtColor(reference[t], cv2.COLOR_BGR2GRAY)
+        rows.append(
+            {"frame": t, "psnr": round(_psnr(a, b), 2), "ssim": round(_ssim_gray(a, b), 4)}
+        )
+    return rows
+
+
+def print_sync_metrics(rows: List[dict]) -> None:
+    print("\n同步性（生成 vs 输入，灰度）：")
+    for r in rows:
+        print(f"  t={r['frame']:02d} PSNR {r['psnr']:6.2f}dB  SSIM {r['ssim']:.4f}")
+    if len(rows) > 1:
+        drops = [rows[t - 1]["psnr"] - rows[t]["psnr"] for t in range(1, len(rows))]
+        worst = int(np.argmax(drops)) + 1
+        print(
+            f"  最大单帧 PSNR 跌幅：t={worst}（-{max(drops):.2f}dB）"
+            + ("  <- 疑似漂移拐点" if max(drops) > 1.5 else "")
+        )
+
+
 def track_confetti_sequence(
     frames: List[np.ndarray],
     grid: List[GridPoint],
@@ -295,12 +381,21 @@ def track_confetti_sequence(
     sat_thresh: int = 140,
     val_lo: int = 70,
     reject_deviation: Optional[float] = None,
+    hue_gate: float = 25.0,
+    hue_weight: float = 0.8,
+    val_penalty: float = 12.0,
 ) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
-    """钟表原理解码：码字（分针）给身份，上一帧位置（时针）消循环歧义。
+    """解码器 v2：钟表原理（码字=分针，上一帧位置=时针）+ 三项鲁棒化。
 
-    返回 tracks (N,T,2)、visible (N,T) 和逐帧统计。
+    相对 v1 的改动：
+      1. 明度档逐帧再标定（2-means 自适应），消除生成亮度衰减导致的码字集体翻转；
+      2. 软匹配：cost = 位置距离 + hue_weight*色相差 + 明度档不符惩罚，
+         色相差超过 hue_gate 才硬性排除；
+      3. 丢失轨迹随已匹配邻居的位移中值平流（兜底用全局中值），
+         标记重现时可在正确位置附近重捕获——拆掉"丢失即永久"的死亡螺旋。
     """
     n_pts, n_frames = len(grid), len(frames)
+    height, width = frames[0].shape[:2]
     tracks = np.zeros((n_pts, n_frames, 2), dtype=np.float64)
     visible = np.zeros((n_pts, n_frames), dtype=bool)
     stats: List[dict] = []
@@ -310,38 +405,68 @@ def track_confetti_sequence(
 
     dets0 = detect_confetti(frames[0], sat_thresh, val_lo)
     assigned0, decoder = match_frame0(dets0, grid, max_dist=search_radius * 0.5)
+    hue_centers = list(decoder.hue_centers)
+    level_means = [float(VALUE_LEVELS[0]), float(VALUE_LEVELS[1])]
+    v0 = [
+        [d.val for idx, d in assigned0.items() if grid[idx].val_idx == lv]
+        for lv in range(len(VALUE_LEVELS))
+    ]
+    for lv in range(len(VALUE_LEVELS)):
+        if v0[lv]:
+            level_means[lv] = float(np.mean(v0[lv]))
+
     last_pos = np.array([[p.x, p.y] for p in grid], dtype=np.float64)
     for idx, det in assigned0.items():
         last_pos[idx] = (det.x, det.y)
         visible[idx, 0] = True
     tracks[:, 0] = last_pos
-    stats.append({"frame": 0, "detections": len(dets0), "matched": len(assigned0)})
+    stats.append(
+        {
+            "frame": 0,
+            "detections": len(dets0),
+            "matched": len(assigned0),
+            "val_level_means": [round(c, 1) for c in level_means],
+        }
+    )
 
-    codewords = [p.codeword for p in grid]
     for t in range(1, n_frames):
         dets = detect_confetti(frames[t], sat_thresh, val_lo)
-        det_code = [decoder.classify(d) for d in dets]
 
-        # 候选对：码字一致且在搜索窗口内，按距离贪心做一对一分配
+        # 1) 明度档逐帧再标定：用上一帧中心初始化的 2-means
+        det_vals = [d.val for d in dets]
+        if len(det_vals) >= 4:
+            level_means = _two_means(det_vals, level_means)
+        det_levels = [
+            0 if abs(d.val - level_means[0]) <= abs(d.val - level_means[1]) else 1
+            for d in dets
+        ]
+
+        # 2) 软匹配：色相门限内按综合代价贪心一对一分配
         pairs = []
         for i in range(n_pts):
+            hx, hy = last_pos[i]
             for j, det in enumerate(dets):
-                if det_code[j] != codewords[i]:
+                dist = math.hypot(det.x - hx, det.y - hy)
+                if dist > search_radius:
                     continue
-                dist = math.hypot(det.x - last_pos[i, 0], det.y - last_pos[i, 1])
-                if dist <= search_radius:
-                    pairs.append((dist, i, j))
+                hue_d = _circular_hue_dist(det.hue, hue_centers[grid[i].hue_idx])
+                if hue_d > hue_gate:
+                    continue
+                cost = dist + hue_weight * hue_d
+                if det_levels[j] != grid[i].val_idx:
+                    cost += val_penalty
+                pairs.append((cost, i, j))
         pairs.sort(key=lambda p: p[0])
         used_tracks, used_dets = set(), set()
         matched: dict = {}
-        for dist, i, j in pairs:
+        for _cost, i, j in pairs:
             if i in used_tracks or j in used_dets:
                 continue
             used_tracks.add(i)
             used_dets.add(j)
             matched[i] = j
 
-        # 邻域位移中值滤波：和周围所有邻居都拧着的匹配基本是误检
+        # 邻域位移中值滤波：和周围邻居都拧着的匹配基本是误检
         disps = {
             i: np.array([dets[j].x - last_pos[i, 0], dets[j].y - last_pos[i, 1]])
             for i, j in matched.items()
@@ -356,12 +481,32 @@ def track_confetti_sequence(
                 rejected.add(i)
         for i in rejected:
             del matched[i]
+            del disps[i]
 
+        # 色相中心 EMA 跟随生成漂移
+        for c in range(len(HUE_CLASSES)):
+            hues = [dets[j].hue for i, j in matched.items() if grid[i].hue_idx == c]
+            if hues:
+                hue_centers[c] = _circ_ema(hue_centers[c], _circular_hue_mean(np.array(hues)), 0.3)
+
+        # 3) 更新：匹配点取检测位置；丢失点随邻居（兜底全局）位移中值平流
+        global_med = (
+            np.median(np.stack(list(disps.values())), axis=0)
+            if disps
+            else np.zeros(2)
+        )
+        advected = 0
         for i in range(n_pts):
             if i in matched:
                 det = dets[matched[i]]
                 last_pos[i] = (det.x, det.y)
                 visible[i, t] = True
+            else:
+                nb = [disps[k] for k in neighbors[i] if k in disps]
+                med = np.median(np.stack(nb), axis=0) if len(nb) >= 2 else global_med
+                last_pos[i, 0] = float(np.clip(last_pos[i, 0] + med[0], 0, width - 1))
+                last_pos[i, 1] = float(np.clip(last_pos[i, 1] + med[1], 0, height - 1))
+                advected += 1
             tracks[i, t] = last_pos[i]
         stats.append(
             {
@@ -369,6 +514,8 @@ def track_confetti_sequence(
                 "detections": len(dets),
                 "matched": len(matched),
                 "rejected_by_smoothness": len(rejected),
+                "advected": advected,
+                "val_level_means": [round(c, 1) for c in level_means],
             }
         )
     return tracks, visible, stats
@@ -425,21 +572,28 @@ def draw_confetti_trails(
 # --------------------------------------------------------------------------- #
 
 
-def load_video(path: str, max_frames: Optional[int] = None) -> Tuple[List[np.ndarray], float]:
+def load_video(
+    path: str, max_frames: Optional[int] = None, stride: int = 1
+) -> Tuple[List[np.ndarray], float]:
+    """读取视频，每 stride 帧取一帧；返回的 fps 已按 stride 折算。"""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 8.0
+    stride = max(1, int(stride))
     frames = []
+    idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frames.append(frame)
-        if max_frames is not None and len(frames) >= max_frames:
-            break
+        if idx % stride == 0:
+            frames.append(frame)
+            if max_frames is not None and len(frames) >= max_frames:
+                break
+        idx += 1
     cap.release()
-    return frames, float(fps)
+    return frames, float(fps) / stride
 
 
 def save_video(frames: List[np.ndarray], path: str, fps: float) -> None:
@@ -610,11 +764,14 @@ def run_demo(args) -> dict:
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"加载视频：{args.video}")
-    frames, fps = load_video(args.video, args.max_frames)
+    frames, fps = load_video(args.video, args.max_frames, args.frame_stride)
     if not frames:
         raise RuntimeError("无法从视频中读取任何帧")
     orig_w, orig_h = frames[0].shape[1], frames[0].shape[0]
-    print(f"  {len(frames)} 帧  分辨率 {orig_w}x{orig_h}  fps={fps:.2f}")
+    print(
+        f"  {len(frames)} 帧  分辨率 {orig_w}x{orig_h}  "
+        f"等效fps={fps:.2f}（stride={args.frame_stride}）"
+    )
     frames = trim_to_4k1(frames)
 
     model_w, model_h = pick_model_size(orig_w, orig_h, args.width, args.height)
@@ -633,9 +790,10 @@ def run_demo(args) -> dict:
         f"Confetti 网格：{n_cols}x{n_rows}={len(grid)} 点  间距 {args.spacing}px  "
         f"码字 {len(HUE_CLASSES)}色相x{len(VALUE_LEVELS)}明度  编码 {args.hue_coding}"
     )
-    same_code_gap = len(HUE_CLASSES) * args.spacing
+    same_code_gap = len(VALUE_LEVELS) * args.spacing
     print(
-        f"  同码字最小 x 间隔 ≈ {same_code_gap}px → 单帧位移 < {same_code_gap // 2}px 时身份无歧义"
+        f"  同码字最小间隔 ≈ {same_code_gap}px（垂直 2 行）→ "
+        f"单帧位移 < {same_code_gap // 2}px 时身份无歧义"
     )
 
     frame0_original = frames_desat[0]
@@ -669,6 +827,7 @@ def run_demo(args) -> dict:
         "model_size": f"{model_w}x{model_h}",
         "frames": len(frames_edited),
         "fps": fps,
+        "frame_stride": args.frame_stride,
         "spacing": args.spacing,
         "jitter": args.jitter,
         "marker_radius": args.marker_radius,
@@ -703,6 +862,9 @@ def run_demo(args) -> dict:
     if args.save_frames:
         save_frames(generated, os.path.join(args.output_dir, "generated_frames"))
 
+    sync_rows = compute_sync_metrics(generated, frames_edited)
+    print_sync_metrics(sync_rows)
+
     search_radius = args.search_radius or float(args.spacing)
     tracks, visible, frame_stats = track_confetti_sequence(
         generated,
@@ -727,14 +889,14 @@ def run_demo(args) -> dict:
     print("\n逐帧解码率（匹配点 / 网格点）：")
     for st in frame_stats:
         t = st["frame"]
+        extra = ""
+        if "rejected_by_smoothness" in st:
+            extra += f"  平滑剔除 {st['rejected_by_smoothness']}"
+        if "val_level_means" in st:
+            extra += f"  明度档 {st['val_level_means']}"
         print(
             f"  t={t:02d} 检出 {st['detections']:4d}  匹配 {st['matched']:4d}"
-            f"  比例 {per_frame_ratio[t]:.2%}"
-            + (
-                f"  平滑剔除 {st['rejected_by_smoothness']}"
-                if "rejected_by_smoothness" in st
-                else ""
-            )
+            f"  比例 {per_frame_ratio[t]:.2%}{extra}"
         )
     survival = visible[:, -1].mean() if visible.shape[1] else 0.0
     print(f"\n末帧存活率：{survival:.2%}  全程平均可见率：{visible.mean():.2%}")
@@ -767,6 +929,7 @@ def run_demo(args) -> dict:
                 "tracks": "tracks.npz",
             },
             "stage1": stage,
+            "sync_metrics": sync_rows,
             "frame_stats": frame_stats,
             "per_frame_visible_ratio": [float(x) for x in per_frame_ratio],
             "last_frame_survival": float(survival),
@@ -808,9 +971,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hue-coding",
-        default="periodic",
-        choices=["periodic", "debruijn"],
-        help="periodic 保证同码字点至少相隔 6 格；debruijn 预留窗口重定位能力",
+        default="diagonal",
+        choices=["diagonal", "periodic", "debruijn"],
+        help=(
+            "diagonal（默认）上下相邻行色相相差 90°，不依赖明度档稳定性；"
+            "periodic 同列同色相；debruijn 预留窗口重定位能力"
+        ),
     )
     # 解码参数
     parser.add_argument("--sat-thresh", type=int, default=140, help="检测饱和度阈值（0-255）")
@@ -829,6 +995,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-frames", type=int, default=9)
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="每 N 帧取一帧。60fps 输入建议 2-3，让运动幅度匹配模型先验",
+    )
     parser.add_argument("--width", type=int, default=None, help="自定义宽（须 32 对齐）")
     parser.add_argument("--height", type=int, default=None, help="自定义高（须 32 对齐）")
     parser.add_argument("--decode-noisy", action="store_true")
