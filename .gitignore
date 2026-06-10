@@ -7,3 +7,4 @@ tracked*.mp4
 generated*.mp4
 debug_*.png
 debug_*.mp4
+.venv*/
