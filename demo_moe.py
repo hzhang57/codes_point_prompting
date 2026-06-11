@@ -349,6 +349,11 @@ def encode_video_official(pipe, frames_bgr: list) -> torch.Tensor:
     mean, std = _vae_norm(pipe, latents.device)
     latents = ((latents.float() - mean) * std).to(_transformer_dtype(pipe))
     latents = latents.to(device=_pipe_device(pipe))
+    if not torch.isfinite(latents).all():
+        raise FloatingPointError(
+            "VAE encode 产生了 NaN/Inf latents——float16 VAE 激活溢出的典型症状。"
+            "请改用 --vae-dtype float32（显存不够时用 bfloat16）重试。"
+        )
     clear_vae_internal_cache(pipe)
     release_memory()
     return latents
@@ -451,6 +456,11 @@ def prepare_wan22_first_frame_condition(
             "Wan2.2-TI2V first_frame_mask must broadcast to latent shape: "
             f"mask={tuple(first_frame_mask.shape)} latents={tuple(prepared_latents.shape)}"
         ) from exc
+    if not torch.isfinite(condition).all():
+        raise FloatingPointError(
+            "首帧 condition 包含 NaN/Inf——VAE encode 溢出。"
+            "请改用 --vae-dtype float32（显存不够时用 bfloat16）。"
+        )
 
     clear_vae_internal_cache(pipe)
     release_memory()
@@ -569,8 +579,20 @@ def denoise_counterfactual_ti2v(
         v_original = _transformer_forward(
             model, input_original, timestep_batch, prompt_embeds, attention_kwargs, "original"
         )
+        if i == 0 and not (
+            torch.isfinite(v_marked).all() and torch.isfinite(v_original).all()
+        ):
+            raise FloatingPointError(
+                "transformer 首步输出包含 NaN/Inf（输入 latents/条件本身有限）："
+                "检查 transformer dtype 与扩散环境版本。"
+            )
         v_guided = (float(lam) + 1.0) * v_marked - float(lam) * v_original
         latents = scheduler_step_official(pipe, v_guided, timestep, latents)
+        if not torch.isfinite(latents).all():
+            raise FloatingPointError(
+                f"去噪第 {i + 1} 步出现 NaN/Inf latents（t={float(timestep):.1f}）。"
+                "若 encode/条件检查均已通过，怀疑 scheduler/transformer 数值问题。"
+            )
         if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(timesteps_run):
             print(
                 f"[ti2v point denoise {i + 1:3d}/{len(timesteps_run)}] "
