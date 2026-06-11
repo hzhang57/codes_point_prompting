@@ -734,6 +734,7 @@ def run_diffusion(args, frames_edited, frame0_marked, frame0_original, fps, debu
         vae_device=args.vae_device,
         vae_dtype=args.vae_dtype,
         low_cpu_memory=args.low_memory,
+        vae_tiling=args.vae_tiling,
     )
     sched_info = print_scheduler_info(pipe)
     max_sequence_length = resolve_max_sequence_length(pipe, None)
@@ -961,6 +962,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--vae-dtype",
         default="auto",
         choices=["auto", "float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+    )
+    parser.add_argument(
+        "--vae-tiling",
+        action="store_true",
+        help="VAE 空间分块，显著降低 fp32 decode 峰值显存（T4 + float32 时建议开启）",
     )
     # confetti 设计参数
     parser.add_argument("--spacing", type=int, default=48, help="点间距（px），密度消融的主旋钮")

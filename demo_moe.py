@@ -261,6 +261,7 @@ def load_wan_ti2v_pipe(
     vae_device: str = "auto",
     vae_dtype: str = "float32",
     low_cpu_memory: bool = True,
+    vae_tiling: bool = False,
 ):
     try:
         from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
@@ -309,6 +310,12 @@ def load_wan_ti2v_pipe(
 
     if hasattr(pipe.vae, "enable_slicing"):
         pipe.vae.enable_slicing()
+    if vae_tiling:
+        if hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+            print("[vae] spatial tiling enabled (lower peak memory, slight seam risk)")
+        else:
+            print("[vae] enable_tiling not available in this Diffusers build")
 
     pipe._low_memory_text_encoder = low_cpu_memory
     validate_wan22_ti2v5b_pipeline(pipe)
@@ -1043,6 +1050,7 @@ def run_demo(args) -> dict:
         vae_device=args.vae_device,
         vae_dtype=args.vae_dtype,
         low_cpu_memory=args.low_memory,
+        vae_tiling=args.vae_tiling,
     )
     validate_wan22_ti2v5b_pipeline(pipe)
     sched_info = print_scheduler_info(pipe)
@@ -1147,6 +1155,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
         help="VAE dtype. auto uses float16 on CUDA and float32 on CPU.",
+    )
+    parser.add_argument(
+        "--vae-tiling",
+        action="store_true",
+        help="Enable VAE spatial tiling to cut decode peak memory (for fp32 VAE on T4).",
     )
     parser.add_argument("--gamma", type=float, default=0.5)
     parser.add_argument("--lam", type=float, default=8.0)
