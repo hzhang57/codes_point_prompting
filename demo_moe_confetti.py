@@ -43,8 +43,8 @@ import math
 import os
 import sys
 import traceback
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -249,11 +249,13 @@ def match_frame0(
     dets: List[Detection], grid: List[GridPoint], max_dist: float
 ) -> Tuple[dict, CodewordDecoder]:
     """首帧：按位置最近邻把检测分配给已知网格点，并自标定码字分类器。"""
+    # assigned 的键是 grid 的列表位置（不是 GridPoint.index 全局编号），
+    # 这样子网格（分窗重铺后的活跃点列表）也能正确索引
     assigned: dict = {}
     if dets:
         det_xy = np.array([[d.x, d.y] for d in dets])
         used = set()
-        for p in grid:
+        for k, p in enumerate(grid):
             dist = np.hypot(det_xy[:, 0] - p.x, det_xy[:, 1] - p.y)
             order = np.argsort(dist)
             for j in order:
@@ -261,7 +263,7 @@ def match_frame0(
                     break
                 if int(j) not in used:
                     used.add(int(j))
-                    assigned[p.index] = dets[int(j)]
+                    assigned[k] = dets[int(j)]
                     break
 
     # 自标定：每个色相类 / 明度档的实测分布
@@ -280,7 +282,8 @@ def match_frame0(
 
 
 def _grid_neighbors(grid: List[GridPoint]) -> List[List[int]]:
-    by_cell = {(p.gx, p.gy): p.index for p in grid}
+    """8 邻域（按列表位置索引，子网格同样适用；缺席的邻居自然跳过）。"""
+    by_cell = {(p.gx, p.gy): k for k, p in enumerate(grid)}
     neighbors: List[List[int]] = []
     for p in grid:
         ns = []
@@ -365,11 +368,12 @@ def print_sync_metrics(rows: List[dict]) -> None:
     print("\n同步性（生成 vs 输入，灰度）：")
     for r in rows:
         print(f"  t={r['frame']:02d} PSNR {r['psnr']:6.2f}dB  SSIM {r['ssim']:.4f}")
-    if len(rows) > 1:
-        drops = [rows[t - 1]["psnr"] - rows[t]["psnr"] for t in range(1, len(rows))]
-        worst = int(np.argmax(drops)) + 1
+    # t=0 是硬条件帧，t=0->1 的下跌是"重绘质量"的机制性落差，不算漂移
+    if len(rows) > 2:
+        drops = [rows[t - 1]["psnr"] - rows[t]["psnr"] for t in range(2, len(rows))]
+        worst = int(np.argmax(drops)) + 2
         print(
-            f"  最大单帧 PSNR 跌幅：t={worst}（-{max(drops):.2f}dB）"
+            f"  最大单帧 PSNR 跌幅（t>=2）：t={worst}（-{max(drops):.2f}dB）"
             + ("  <- 疑似漂移拐点" if max(drops) > 1.5 else "")
         )
 
@@ -710,8 +714,8 @@ def self_test_decoder(frame_marked: np.ndarray, grid: List[GridPoint], args) -> 
     return report
 
 
-def run_diffusion(args, frames_edited, frame0_marked, frame0_original, fps, debug_dir):
-    """懒加载 demo_moe 管线：marked=铺点首帧，original=无点首帧，引擎不变。"""
+def load_pipeline(args):
+    """懒加载 demo_moe 管线（模型只加载一次，分窗模式下跨窗复用）。"""
     import torch  # noqa: F401
     from demo_moe import (
         cuda_preflight_error,
@@ -720,7 +724,6 @@ def run_diffusion(args, frames_edited, frame0_marked, frame0_original, fps, debu
         print_scheduler_info,
         release_memory,
         resolve_max_sequence_length,
-        run_counterfactual_sdedit,
     )
 
     device_error = cuda_preflight_error(args.device)
@@ -742,6 +745,14 @@ def run_diffusion(args, frames_edited, frame0_marked, frame0_original, fps, debu
     if args.low_memory and getattr(pipe, "text_encoder", None) is not None:
         pipe.text_encoder = None
     release_memory()
+    return pipe, prompt_embeds, sched_info
+
+
+def generate_sdedit(
+    pipe, prompt_embeds, args, frames_edited, frame0_marked, frame0_original, fps, seed, debug_dir
+):
+    """单次反事实 SDEdit：marked=铺点首帧，original=无点首帧，引擎不变。"""
+    from demo_moe import release_memory, run_counterfactual_sdedit
 
     generated, stage = run_counterfactual_sdedit(
         pipe,
@@ -752,13 +763,116 @@ def run_diffusion(args, frames_edited, frame0_marked, frame0_original, fps, debu
         lam=args.lam,
         scheduler_steps=args.scheduler_steps,
         prompt_embeds=prompt_embeds,
-        seed=args.seed,
+        seed=seed,
         decode_noisy=args.decode_noisy,
         debug_dir=debug_dir,
         fps=fps,
     )
     release_memory()
-    return generated, stage, sched_info
+    return generated, stage
+
+
+def reposition_grid(
+    grid: List[GridPoint], positions: np.ndarray, active: np.ndarray
+) -> List[GridPoint]:
+    """把网格点搬到当前解码位置（仅活跃点），码字/邻接关系保持不变。"""
+    return [
+        replace(p, x=float(positions[p.index, 0]), y=float(positions[p.index, 1]))
+        for p in grid
+        if active[p.index]
+    ]
+
+
+def run_windowed(
+    frames_desat: List[np.ndarray],
+    grid: List[GridPoint],
+    args,
+    generate_fn: Callable,
+) -> Tuple[List[np.ndarray], np.ndarray, np.ndarray, List[dict], List[dict]]:
+    """分窗重锚定：每 window 帧一个 SDEdit 窗口，窗口首帧 = 真实输入帧 +
+    在上一窗解码位置重铺的 confetti（硬条件）。
+
+    经验依据：所有 run 中 t=1..4（首个 latent chunk）都是质量最好的段，
+    悬崖永远从 t=5（第二个 chunk）开始。窗口取 5 帧（=1 chunk）时每一帧
+    都处于首帧条件的影响半径内；同步漂移每 window-1 帧被真实帧重置一次。
+    窗口边界共享 1 帧用于位置交接。
+    """
+    n_frames, n_pts = len(frames_desat), len(grid)
+    win = args.window
+    all_tracks = np.zeros((n_pts, n_frames, 2), dtype=np.float64)
+    all_visible = np.zeros((n_pts, n_frames), dtype=bool)
+    positions = np.array([[p.x, p.y] for p in grid], dtype=np.float64)
+    active = np.ones(n_pts, dtype=bool)
+    generated_full: List[np.ndarray] = []
+    window_summaries: List[dict] = []
+    frame_stats_all: List[dict] = []
+    search_radius = args.search_radius or float(args.spacing)
+
+    start, w = 0, 0
+    while start < n_frames - 1:
+        end = min(start + win, n_frames)
+        if (end - start - 1) % 4 != 0:
+            end = start + ((end - start - 1) // 4) * 4 + 1
+        if end - start < 5:
+            for p in grid:
+                all_tracks[p.index, start:n_frames] = positions[p.index]
+            print(f"[window] 尾部 {n_frames - start - 1} 帧不足最小窗口，丢弃")
+            break
+
+        sub = reposition_grid(grid, positions, active)
+        if len(sub) < 4:
+            print(f"[window {w}] 活跃点仅剩 {len(sub)}，提前结束")
+            for p in grid:
+                all_tracks[p.index, start:n_frames] = positions[p.index]
+            break
+
+        frame0_original = frames_desat[start]
+        frame0_marked = insert_confetti(frame0_original, sub, args.marker_radius)
+        frames_win = [frame0_marked] + list(frames_desat[start + 1 : end])
+        print(f"\n[window {w}] 帧 {start}..{end - 1}  活跃点 {len(sub)}/{n_pts}")
+        generated_win, stage = generate_fn(
+            frames_win, frame0_marked, frame0_original, args.seed + 1000 * w, f"window_{w:02d}"
+        )
+
+        tracks_win, visible_win, fstats = track_confetti_sequence(
+            generated_win,
+            sub,
+            search_radius=search_radius,
+            sat_thresh=args.sat_thresh,
+            val_lo=args.val_lo,
+        )
+        for k, p in enumerate(sub):
+            all_tracks[p.index, start:end] = tracks_win[k]
+            all_visible[p.index, start:end] = visible_win[k]
+            positions[p.index] = tracks_win[k, -1]
+        for p in grid:
+            if not active[p.index]:
+                all_tracks[p.index, start:end] = positions[p.index]
+
+        # 边界帧不可见的点：默认停用（无法可靠重铺）；--repaint-lost 则按
+        # 邻居平流估计的位置重铺，赌它能被生成重新"接住"
+        if not args.repaint_lost:
+            for k, p in enumerate(sub):
+                if not visible_win[k, -1]:
+                    active[p.index] = False
+
+        generated_full.extend(generated_win if w == 0 else generated_win[1:])
+        stage.update(
+            {"window": w, "frame_start": start, "frame_end": end - 1, "active_points": len(sub)}
+        )
+        window_summaries.append(stage)
+        for st in fstats:
+            st["window"] = w
+            st["frame"] += start
+        frame_stats_all.extend(fstats)
+        print(
+            f"[window {w}] 边界帧可见 {int(visible_win[:, -1].sum())}/{len(sub)}  "
+            f"下一窗活跃 {int(active.sum())}/{n_pts}"
+        )
+        start = end - 1
+        w += 1
+
+    return generated_full, all_tracks, all_visible, window_summaries, frame_stats_all
 
 
 def run_demo(args) -> dict:
@@ -851,29 +965,43 @@ def run_demo(args) -> dict:
         print("[preview-only] 跳过扩散生成。检查 inputs/frame0_pair.png 与自检指标。")
         return summary
 
-    generated, stage, sched_info = run_diffusion(
-        args,
-        frames_edited,
-        frame0_marked,
-        frame0_original,
-        fps,
-        debug_dir=os.path.join(args.output_dir, "stage1"),
-    )
+    pipe, prompt_embeds, sched_info = load_pipeline(args)
+
+    def generate_fn(frames_win, f0_marked, f0_original, seed, tag):
+        return generate_sdedit(
+            pipe, prompt_embeds, args, frames_win, f0_marked, f0_original,
+            fps, seed, os.path.join(args.output_dir, tag),
+        )
+
+    if args.window:
+        if args.window < 5 or (args.window - 1) % 4 != 0:
+            raise ValueError("--window 必须为 4k+1 且 >= 5（如 5、9、13）")
+        generated, tracks, visible, window_summaries, frame_stats = run_windowed(
+            frames_desat, grid, args, generate_fn
+        )
+        stage_summary = {"windows": window_summaries}
+        sync_reference = frames_desat  # 各窗首帧重铺过点，统一对无点参照
+    else:
+        generated, stage = generate_fn(
+            frames_edited, frame0_marked, frame0_original, args.seed, "stage1"
+        )
+        stage_summary = {"stage1": stage}
+        sync_reference = frames_edited
+        search_radius = args.search_radius or float(args.spacing)
+        tracks, visible, frame_stats = track_confetti_sequence(
+            generated,
+            grid,
+            search_radius=search_radius,
+            sat_thresh=args.sat_thresh,
+            val_lo=args.val_lo,
+        )
+
     save_video(generated, os.path.join(args.output_dir, "generated.mp4"), fps)
     if args.save_frames:
         save_frames(generated, os.path.join(args.output_dir, "generated_frames"))
 
-    sync_rows = compute_sync_metrics(generated, frames_edited)
+    sync_rows = compute_sync_metrics(generated, sync_reference)
     print_sync_metrics(sync_rows)
-
-    search_radius = args.search_radius or float(args.spacing)
-    tracks, visible, frame_stats = track_confetti_sequence(
-        generated,
-        grid,
-        search_radius=search_radius,
-        sat_thresh=args.sat_thresh,
-        val_lo=args.val_lo,
-    )
 
     # ---- 中间结果：追踪可视化 ----
     overlay = draw_confetti_tracks(generated, grid, tracks, visible)
@@ -895,6 +1023,8 @@ def run_demo(args) -> dict:
             extra += f"  平滑剔除 {st['rejected_by_smoothness']}"
         if "val_level_means" in st:
             extra += f"  明度档 {st['val_level_means']}"
+        if "window" in st:
+            extra += f"  [win {st['window']}]"
         print(
             f"  t={t:02d} 检出 {st['detections']:4d}  匹配 {st['matched']:4d}"
             f"  比例 {per_frame_ratio[t]:.2%}{extra}"
@@ -929,7 +1059,8 @@ def run_demo(args) -> dict:
                 "compare": "compare.mp4",
                 "tracks": "tracks.npz",
             },
-            "stage1": stage,
+            **stage_summary,
+            "window": args.window,
             "sync_metrics": sync_rows,
             "frame_stats": frame_stats,
             "per_frame_visible_ratio": [float(x) for x in per_frame_ratio],
@@ -1006,6 +1137,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="每 N 帧取一帧。60fps 输入建议 2-3，让运动幅度匹配模型先验",
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=0,
+        help=(
+            "分窗重锚定：每 N 帧一个 SDEdit 窗口（N=4k+1，建议 5），"
+            "窗口首帧用真实帧+解码位置重铺的 confetti 作硬条件。0=关闭"
+        ),
+    )
+    parser.add_argument(
+        "--repaint-lost",
+        action="store_true",
+        help="窗口边界不可见的点也按平流估计位置重铺（默认停用该点）",
     )
     parser.add_argument("--width", type=int, default=None, help="自定义宽（须 32 对齐）")
     parser.add_argument("--height", type=int, default=None, help="自定义高（须 32 对齐）")
